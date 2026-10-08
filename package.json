@@ -1,0 +1,25 @@
+{
+  "name": "scout-amazon-agent",
+  "version": "0.9.39",
+  "private": true,
+  "type": "module",
+  "description": "Local Amazon NL, AU, and US product discovery agent with SellerSprite and 1688 integration.",
+  "scripts": {
+    "start": "node server.mjs",
+    "start:1688": "node scripts/start-1688-dependency.mjs",
+    "inspect:mcp": "node scripts/inspect-sellsprite.mjs",
+    "check": "node --check app.js && node --check server.mjs && node --check lib/store-list.mjs && node --check lib/sellsprite-client.mjs && node --check lib/image-similarity.mjs && node --check lib/profit-model.mjs && node --check lib/title-piece-count.mjs && node --check lib/xlsx-export.mjs && node --check lib/export-file-store.mjs && node --check lib/1688-supplier-policy.mjs && node --check lib/1688-image-download.mjs && node --check lib/1688-procurement-client.mjs && node --check lib/persistence-store.mjs && node --check lib/run-folder-opener.mjs && node --check lib/amazon-store-client.mjs && node --check lib/amazon-connection-check.mjs && node --check lib/codex-mcp-config.mjs && node --check scripts/capture-cdp.mjs && node --check scripts/start-1688-dependency.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "cheerio": "^1.2.0",
+    "entities": "^4.5.0",
+    "fflate": "0.8.3",
+    "lucide": "0.468.0",
+    "read-excel-file": "9.3.10",
+    "sharp": "0.35.4",
+    "smol-toml": "1.8.0",
+    "undici": "^8.10.2"
+  }
+}

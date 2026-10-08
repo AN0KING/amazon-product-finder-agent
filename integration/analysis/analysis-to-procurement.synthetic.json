@@ -1,0 +1,1294 @@
+{
+  "schema_version": "1.0",
+  "package_type": "analysis_to_procurement",
+  "source_app": "amazon-product-finder-agent",
+  "batch_id": "synthetic-analysis-batch-20260909",
+  "synthetic": true,
+  "products": [
+    {
+      "product_id": "AU:B0SYNTH001",
+      "batch_id": "synthetic-analysis-batch-20260909",
+      "source_ids": {
+        "analysis_product_id": "AU:B0SYNTH001",
+        "analysis_run_id": "synthetic-analysis-batch-20260909",
+        "procurement_task_id": "synthetic-existing-procurement-task-001",
+        "analysis_export_task_id": "synthetic-existing-analysis-export-001",
+        "amazon_asins": [
+          "B0SYNTH001"
+        ],
+        "amazon_parent_asin": "B0SYNTH000",
+        "seller_ids": [
+          "SYNTHETIC_SELLER_A"
+        ]
+      },
+      "asin": "B0SYNTH001",
+      "parent_asin": "B0SYNTH000",
+      "variant": {
+        "source_asins": [
+          "B0SYNTH001"
+        ],
+        "parent_resolved": true,
+        "policy": "Original source ASIN identity; parent is a relation, not permission to merge variants."
+      },
+      "marketplace": "AU",
+      "language": "en-AU",
+      "currency": "AUD",
+      "title": "Synthetic Example 2 Pieces Storage Bags",
+      "translated_title_zh": null,
+      "stores": [
+        {
+          "seller_id": "SYNTHETIC_SELLER_A",
+          "name": "Synthetic AU Store",
+          "marketplace": "AU",
+          "url": null,
+          "imported_row_numbers": [],
+          "criteria_source": null,
+          "raw_criteria": null
+        }
+      ],
+      "source_store_criteria": [],
+      "reference_materials": {
+        "amazon_url": "https://www.amazon.com.au/dp/B0SYNTH001",
+        "image_urls": [
+          "https://example.invalid/synthetic-product.jpg"
+        ],
+        "role": "competitor_reference_only"
+      },
+      "amazon_observations": {
+        "current_price": 22.21,
+        "monthly_sales": 100,
+        "monthly_sales_source": null,
+        "rating": 4.5,
+        "reviews": 80,
+        "item_weight_kg": 0.12,
+        "collected_at": "2026-09-09T00:00:00.000Z",
+        "detail_status": "success",
+        "detail_error_code": null
+      },
+      "unit_basis": {
+        "sellable_unit": "one Amazon offer unit",
+        "piece_count": 2,
+        "units_per_set": 2,
+        "order_quantity": null,
+        "detected_piece_count": 2,
+        "piece_count_source": "synthetic_title",
+        "piece_count_evidence": "2 Pieces",
+        "reference_unit_cost_cny": 3,
+        "purchase_cost_already_piece_adjusted": true
+      },
+      "preliminary_profit": {
+        "status": "calculated_estimate",
+        "stage": "preliminary",
+        "formula_version": "profit-workbook-au-weight-only-fba-v8",
+        "input_formula_version": "profit-workbook-au-weight-only-fba-v8",
+        "inputs": {
+          "salePrice": 19.99,
+          "purchaseCostCny": 6,
+          "fulfillmentFee": 4.35,
+          "exchangeRate": 4.8,
+          "actualWeightKg": 0.12,
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 4,
+          "domesticFreightRateCnyPerKg": 5,
+          "airFreightRateCnyPerKg": 60,
+          "volumetricDivisor": 139,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "fulfillmentMode": "FBA",
+          "airFreightActualWeightOnly": true,
+          "dimensionsCm": null
+        },
+        "result": {
+          "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+          "salePrice": 19.99,
+          "purchaseCostCny": 6,
+          "exchangeRate": 4.8,
+          "fulfillmentMode": "FBA",
+          "fulfillmentFee": 4.35,
+          "rates": {
+            "commissionRate": 15,
+            "fxLossRate": 1.5,
+            "marketingRate": 10,
+            "managementRate": 6,
+            "returnsRate": 10,
+            "purchaseTaxRate": 4,
+            "domesticFreightRateCnyPerKg": 5,
+            "airFreightRateCnyPerKg": 60
+          },
+          "airFreight": {
+            "actualWeightKg": 0.12,
+            "volumetricWeightKg": null,
+            "dimensionalWeightLb": null,
+            "chargeableWeightKg": 0.12,
+            "airFreightCny": 7.199999999999999,
+            "airFreightRateCnyPerKg": 60,
+            "airFreightRateCnyPerGram": 0.06,
+            "cartonWeightKg": null,
+            "unitsPerCarton": null,
+            "source": "product_weight",
+            "confidence": "standard"
+          },
+          "parts": {
+            "purchaseBase": 1.25,
+            "purchaseTax": 0.05,
+            "domesticFreight": 0.125,
+            "purchase": 1.425,
+            "commission": 2.9984999999999995,
+            "fulfillment": 4.35,
+            "fba": 4.35,
+            "fbm": 0,
+            "freight": 1.5,
+            "fxLoss": 0.29984999999999995,
+            "marketing": 1.9989999999999999,
+            "management": 1.1993999999999998,
+            "returns": 1.9989999999999999
+          },
+          "purchaseBaseAud": 1.25,
+          "purchaseTaxAud": 0.05,
+          "domesticFreightAud": 0.125,
+          "purchaseAud": 1.425,
+          "purchaseTaxCny": 0.24,
+          "domesticFreightCny": 0.6,
+          "domesticFreightWeightKg": 0.12,
+          "domesticFreightMinCny": 0.24,
+          "domesticFreightMaxCny": 0.6,
+          "landedPurchaseCny": 6.84,
+          "commission": 2.9984999999999995,
+          "fulfillment": 4.35,
+          "fba": 4.35,
+          "fbm": 0,
+          "freightCost": 1.5,
+          "freight": 1.5,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999,
+          "totalCost": 15.770749999999998,
+          "profit": 4.219250000000001,
+          "margin": 21.106803401700855
+        },
+        "units": {
+          "local_currency": "AUD",
+          "purchase_currency": "CNY",
+          "exchange_rate": "CNY/1 AUD",
+          "weight": "kg",
+          "dimensions": "cm",
+          "rates": "percent",
+          "margin": "percent"
+        },
+        "fee_sources": {
+          "purchase_cost": {
+            "value_cny": 6,
+            "source": "shared_1688_reference",
+            "mode": "low_confidence_top_6",
+            "status": "estimate_not_manufacturer_confirmation",
+            "rule_version": "1688-image-only-always-top6-trimmed-10-v6",
+            "quote_count": 6,
+            "included_quote_count": 6
+          },
+          "fulfillment": {
+            "mode": "FBA",
+            "source": "au_workbook_weight_rate",
+            "manual_override": false,
+            "workbook_cell": "Sheet1!D4",
+            "rate_source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+            "status": "preliminary_estimate"
+          },
+          "weight": "synthetic_amazon_item_weight",
+          "exchange_rate": {
+            "value": 4.8,
+            "source": "resolved_analysis_input"
+          },
+          "rates": {
+            "commissionRate": "resolved_analysis_input",
+            "fxLossRate": "resolved_analysis_input",
+            "marketingRate": "resolved_analysis_input",
+            "managementRate": "resolved_analysis_input",
+            "returnsRate": "resolved_analysis_input",
+            "purchaseTaxRate": "resolved_analysis_input",
+            "domesticFreightRateCnyPerKg": "product_weight_rate_estimate",
+            "airFreightRateCnyPerKg": "au_workbook_60_cny_per_kg"
+          },
+          "source_field_values": {}
+        },
+        "missing_inputs": [],
+        "manufacturer_cost_confirmed": false,
+        "detailed_profit_owner": "procurement"
+      },
+      "analysis_review_status": "pending",
+      "missing_fields": [],
+      "facts_revision": "facts:95d516222823f7d6",
+      "filter": {
+        "decision": "pass",
+        "reasons": [],
+        "rule_version": "analysis-preliminary-filter-v1",
+        "effective_store_rules": [
+          {
+            "monthlySalesBand": "100_plus",
+            "minReviews": 50,
+            "minRating": 4,
+            "minProfitMargin": null
+          }
+        ],
+        "effective_result_rules": {
+          "query": "",
+          "minMargin": 0,
+          "completeOnly": false
+        },
+        "export_scope": "qualified",
+        "business_confirmation": false
+      },
+      "source_version": {
+        "scheme": "content_fingerprint",
+        "ordering": "unordered",
+        "supersedes_revision": null
+      },
+      "screening_revision": "screening:5db30d48abb7d9f4",
+      "revision": "rev:4a05e50f4b9a0463"
+    },
+    {
+      "product_id": "AU:B0SYNTH002",
+      "batch_id": "synthetic-analysis-batch-20260909",
+      "source_ids": {
+        "analysis_product_id": "AU:B0SYNTH002",
+        "analysis_run_id": "synthetic-analysis-batch-20260909",
+        "procurement_task_id": "synthetic-existing-procurement-task-001",
+        "analysis_export_task_id": "synthetic-existing-analysis-export-001",
+        "amazon_asins": [
+          "B0SYNTH002"
+        ],
+        "amazon_parent_asin": "B0SYNTH000",
+        "seller_ids": [
+          "SYNTHETIC_SELLER_A"
+        ]
+      },
+      "asin": "B0SYNTH002",
+      "parent_asin": "B0SYNTH000",
+      "variant": {
+        "source_asins": [
+          "B0SYNTH002"
+        ],
+        "parent_resolved": true,
+        "policy": "Original source ASIN identity; parent is a relation, not permission to merge variants."
+      },
+      "marketplace": "AU",
+      "language": "en-AU",
+      "currency": "AUD",
+      "title": "Synthetic Example 2 Pieces Storage Bags",
+      "translated_title_zh": null,
+      "stores": [
+        {
+          "seller_id": "SYNTHETIC_SELLER_A",
+          "name": "Synthetic AU Store",
+          "marketplace": "AU",
+          "url": null,
+          "imported_row_numbers": [],
+          "criteria_source": null,
+          "raw_criteria": null
+        }
+      ],
+      "source_store_criteria": [],
+      "reference_materials": {
+        "amazon_url": "https://www.amazon.com.au/dp/B0SYNTH002",
+        "image_urls": [
+          "https://example.invalid/synthetic-product.jpg"
+        ],
+        "role": "competitor_reference_only"
+      },
+      "amazon_observations": {
+        "current_price": 22.21,
+        "monthly_sales": 100,
+        "monthly_sales_source": null,
+        "rating": 4.5,
+        "reviews": 80,
+        "item_weight_kg": 0.12,
+        "collected_at": "2026-09-09T00:00:00.000Z",
+        "detail_status": "success",
+        "detail_error_code": null
+      },
+      "unit_basis": {
+        "sellable_unit": "one Amazon offer unit",
+        "piece_count": 2,
+        "units_per_set": 2,
+        "order_quantity": null,
+        "detected_piece_count": 2,
+        "piece_count_source": "synthetic_title",
+        "piece_count_evidence": "2 Pieces",
+        "reference_unit_cost_cny": 3,
+        "purchase_cost_already_piece_adjusted": true
+      },
+      "preliminary_profit": {
+        "status": "calculated_estimate",
+        "stage": "preliminary",
+        "formula_version": "profit-workbook-au-weight-only-fba-v8",
+        "input_formula_version": "profit-workbook-au-weight-only-fba-v8",
+        "inputs": {
+          "salePrice": 19.99,
+          "purchaseCostCny": 6,
+          "fulfillmentFee": 5.25,
+          "exchangeRate": 4.8,
+          "actualWeightKg": 0.12,
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 4,
+          "domesticFreightRateCnyPerKg": 5,
+          "airFreightRateCnyPerKg": 60,
+          "volumetricDivisor": 139,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "fulfillmentMode": "FBM",
+          "airFreightActualWeightOnly": true,
+          "dimensionsCm": null
+        },
+        "result": {
+          "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+          "salePrice": 19.99,
+          "purchaseCostCny": 6,
+          "exchangeRate": 4.8,
+          "fulfillmentMode": "FBM",
+          "fulfillmentFee": 5.25,
+          "rates": {
+            "commissionRate": 15,
+            "fxLossRate": 1.5,
+            "marketingRate": 10,
+            "managementRate": 6,
+            "returnsRate": 10,
+            "purchaseTaxRate": 4,
+            "domesticFreightRateCnyPerKg": 5,
+            "airFreightRateCnyPerKg": 60
+          },
+          "airFreight": {
+            "actualWeightKg": 0.12,
+            "volumetricWeightKg": null,
+            "dimensionalWeightLb": null,
+            "chargeableWeightKg": 0.12,
+            "airFreightCny": 7.199999999999999,
+            "airFreightRateCnyPerKg": 60,
+            "airFreightRateCnyPerGram": 0.06,
+            "cartonWeightKg": null,
+            "unitsPerCarton": null,
+            "source": "product_weight",
+            "confidence": "standard"
+          },
+          "parts": {
+            "purchaseBase": 1.25,
+            "purchaseTax": 0.05,
+            "domesticFreight": 0.125,
+            "purchase": 1.425,
+            "commission": 2.9984999999999995,
+            "fulfillment": 5.25,
+            "fba": 0,
+            "fbm": 5.25,
+            "freight": 1.5,
+            "fxLoss": 0.29984999999999995,
+            "marketing": 1.9989999999999999,
+            "management": 1.1993999999999998,
+            "returns": 1.9989999999999999
+          },
+          "purchaseBaseAud": 1.25,
+          "purchaseTaxAud": 0.05,
+          "domesticFreightAud": 0.125,
+          "purchaseAud": 1.425,
+          "purchaseTaxCny": 0.24,
+          "domesticFreightCny": 0.6,
+          "domesticFreightWeightKg": 0.12,
+          "domesticFreightMinCny": 0.24,
+          "domesticFreightMaxCny": 0.6,
+          "landedPurchaseCny": 6.84,
+          "commission": 2.9984999999999995,
+          "fulfillment": 5.25,
+          "fba": 0,
+          "fbm": 5.25,
+          "freightCost": 1.5,
+          "freight": 1.5,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999,
+          "totalCost": 16.670749999999998,
+          "profit": 3.3192500000000003,
+          "margin": 16.604552276138072
+        },
+        "units": {
+          "local_currency": "AUD",
+          "purchase_currency": "CNY",
+          "exchange_rate": "CNY/1 AUD",
+          "weight": "kg",
+          "dimensions": "cm",
+          "rates": "percent",
+          "margin": "percent"
+        },
+        "fee_sources": {
+          "purchase_cost": {
+            "value_cny": 6,
+            "source": "shared_1688_reference",
+            "mode": "low_confidence_top_6",
+            "status": "estimate_not_manufacturer_confirmation",
+            "rule_version": "1688-image-only-always-top6-trimmed-10-v6",
+            "quote_count": 6,
+            "included_quote_count": 6
+          },
+          "fulfillment": {
+            "mode": "FBM",
+            "source": "analysis_manual",
+            "manual_override": true,
+            "workbook_cell": "Sheet1!D4",
+            "rate_source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+            "status": "preliminary_estimate"
+          },
+          "weight": "synthetic_amazon_item_weight",
+          "exchange_rate": {
+            "value": 4.8,
+            "source": "resolved_analysis_input"
+          },
+          "rates": {
+            "commissionRate": "resolved_analysis_input",
+            "fxLossRate": "resolved_analysis_input",
+            "marketingRate": "resolved_analysis_input",
+            "managementRate": "resolved_analysis_input",
+            "returnsRate": "resolved_analysis_input",
+            "purchaseTaxRate": "resolved_analysis_input",
+            "domesticFreightRateCnyPerKg": "product_weight_rate_estimate",
+            "airFreightRateCnyPerKg": "au_workbook_60_cny_per_kg"
+          },
+          "source_field_values": {}
+        },
+        "missing_inputs": [],
+        "manufacturer_cost_confirmed": false,
+        "detailed_profit_owner": "procurement"
+      },
+      "analysis_review_status": "pending",
+      "missing_fields": [],
+      "facts_revision": "facts:66145eab6d121d1f",
+      "filter": {
+        "decision": "pass",
+        "reasons": [],
+        "rule_version": "analysis-preliminary-filter-v1",
+        "effective_store_rules": [
+          {
+            "monthlySalesBand": "100_plus",
+            "minReviews": 50,
+            "minRating": 4,
+            "minProfitMargin": null
+          }
+        ],
+        "effective_result_rules": {
+          "query": "",
+          "minMargin": 0,
+          "completeOnly": false
+        },
+        "export_scope": "qualified",
+        "business_confirmation": false
+      },
+      "source_version": {
+        "scheme": "content_fingerprint",
+        "ordering": "unordered",
+        "supersedes_revision": null
+      },
+      "screening_revision": "screening:5db30d48abb7d9f4",
+      "revision": "rev:2a2128376d7191cb"
+    }
+  ],
+  "filter_rules": {
+    "version": "analysis-preliminary-filter-v1",
+    "amazon": {
+      "monthlySalesBand": "100_plus",
+      "minReviews": 50,
+      "minRating": 4,
+      "minProfitMargin": null
+    },
+    "results": {
+      "query": "",
+      "minMargin": 0,
+      "completeOnly": false
+    },
+    "export_scope": "qualified",
+    "selected_product_ids": null
+  },
+  "coverage": {
+    "scope": "amazon_visible_store_results",
+    "status": "partial",
+    "full_store_complete": false,
+    "counts": {
+      "imported_stores": 1,
+      "visible_candidates": 4
+    },
+    "detail_counts": {
+      "success": 3,
+      "pending": 1
+    },
+    "limitations": [
+      "Synthetic multi-page fixture: one product detail intentionally pending; not a real store crawl."
+    ]
+  },
+  "audit": {
+    "total_candidates": 4,
+    "passed": 2,
+    "excluded": 1,
+    "pending": 1,
+    "duplicate_product_ids": [],
+    "excluded_products": [
+      {
+        "product_id": "AU:B0SYNTH003",
+        "batch_id": "synthetic-analysis-batch-20260909",
+        "source_ids": {
+          "analysis_product_id": "AU:B0SYNTH003",
+          "analysis_run_id": "synthetic-analysis-batch-20260909",
+          "procurement_task_id": "synthetic-existing-procurement-task-001",
+          "analysis_export_task_id": "synthetic-existing-analysis-export-001",
+          "amazon_asins": [
+            "B0SYNTH003"
+          ],
+          "amazon_parent_asin": "B0SYNTH000",
+          "seller_ids": [
+            "SYNTHETIC_SELLER_A"
+          ]
+        },
+        "asin": "B0SYNTH003",
+        "parent_asin": "B0SYNTH000",
+        "variant": {
+          "source_asins": [
+            "B0SYNTH003"
+          ],
+          "parent_resolved": true,
+          "policy": "Original source ASIN identity; parent is a relation, not permission to merge variants."
+        },
+        "marketplace": "AU",
+        "language": "en-AU",
+        "currency": "AUD",
+        "title": "Synthetic Example 2 Pieces Storage Bags",
+        "translated_title_zh": null,
+        "stores": [
+          {
+            "seller_id": "SYNTHETIC_SELLER_A",
+            "name": "Synthetic AU Store",
+            "marketplace": "AU",
+            "url": null,
+            "imported_row_numbers": [],
+            "criteria_source": null,
+            "raw_criteria": null
+          }
+        ],
+        "source_store_criteria": [],
+        "reference_materials": {
+          "amazon_url": "https://www.amazon.com.au/dp/B0SYNTH003",
+          "image_urls": [
+            "https://example.invalid/synthetic-product.jpg"
+          ],
+          "role": "competitor_reference_only"
+        },
+        "amazon_observations": {
+          "current_price": 22.21,
+          "monthly_sales": 30,
+          "monthly_sales_source": null,
+          "rating": 4.5,
+          "reviews": 80,
+          "item_weight_kg": 0.12,
+          "collected_at": "2026-09-09T00:00:00.000Z",
+          "detail_status": "success",
+          "detail_error_code": null
+        },
+        "unit_basis": {
+          "sellable_unit": "one Amazon offer unit",
+          "piece_count": 2,
+          "units_per_set": 2,
+          "order_quantity": null,
+          "detected_piece_count": 2,
+          "piece_count_source": "synthetic_title",
+          "piece_count_evidence": "2 Pieces",
+          "reference_unit_cost_cny": 3,
+          "purchase_cost_already_piece_adjusted": true
+        },
+        "preliminary_profit": {
+          "status": "calculated_estimate",
+          "stage": "preliminary",
+          "formula_version": "profit-workbook-au-weight-only-fba-v8",
+          "input_formula_version": "profit-workbook-au-weight-only-fba-v8",
+          "inputs": {
+            "salePrice": 19.99,
+            "purchaseCostCny": 6,
+            "fulfillmentFee": 4.35,
+            "exchangeRate": 4.8,
+            "actualWeightKg": 0.12,
+            "commissionRate": 15,
+            "fxLossRate": 1.5,
+            "marketingRate": 10,
+            "managementRate": 6,
+            "returnsRate": 10,
+            "purchaseTaxRate": 4,
+            "domesticFreightRateCnyPerKg": 5,
+            "airFreightRateCnyPerKg": 60,
+            "volumetricDivisor": 139,
+            "cartonWeightKg": null,
+            "unitsPerCarton": null,
+            "fulfillmentMode": "FBA",
+            "airFreightActualWeightOnly": true,
+            "dimensionsCm": null
+          },
+          "result": {
+            "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+            "salePrice": 19.99,
+            "purchaseCostCny": 6,
+            "exchangeRate": 4.8,
+            "fulfillmentMode": "FBA",
+            "fulfillmentFee": 4.35,
+            "rates": {
+              "commissionRate": 15,
+              "fxLossRate": 1.5,
+              "marketingRate": 10,
+              "managementRate": 6,
+              "returnsRate": 10,
+              "purchaseTaxRate": 4,
+              "domesticFreightRateCnyPerKg": 5,
+              "airFreightRateCnyPerKg": 60
+            },
+            "airFreight": {
+              "actualWeightKg": 0.12,
+              "volumetricWeightKg": null,
+              "dimensionalWeightLb": null,
+              "chargeableWeightKg": 0.12,
+              "airFreightCny": 7.199999999999999,
+              "airFreightRateCnyPerKg": 60,
+              "airFreightRateCnyPerGram": 0.06,
+              "cartonWeightKg": null,
+              "unitsPerCarton": null,
+              "source": "product_weight",
+              "confidence": "standard"
+            },
+            "parts": {
+              "purchaseBase": 1.25,
+              "purchaseTax": 0.05,
+              "domesticFreight": 0.125,
+              "purchase": 1.425,
+              "commission": 2.9984999999999995,
+              "fulfillment": 4.35,
+              "fba": 4.35,
+              "fbm": 0,
+              "freight": 1.5,
+              "fxLoss": 0.29984999999999995,
+              "marketing": 1.9989999999999999,
+              "management": 1.1993999999999998,
+              "returns": 1.9989999999999999
+            },
+            "purchaseBaseAud": 1.25,
+            "purchaseTaxAud": 0.05,
+            "domesticFreightAud": 0.125,
+            "purchaseAud": 1.425,
+            "purchaseTaxCny": 0.24,
+            "domesticFreightCny": 0.6,
+            "domesticFreightWeightKg": 0.12,
+            "domesticFreightMinCny": 0.24,
+            "domesticFreightMaxCny": 0.6,
+            "landedPurchaseCny": 6.84,
+            "commission": 2.9984999999999995,
+            "fulfillment": 4.35,
+            "fba": 4.35,
+            "fbm": 0,
+            "freightCost": 1.5,
+            "freight": 1.5,
+            "fxLoss": 0.29984999999999995,
+            "marketing": 1.9989999999999999,
+            "management": 1.1993999999999998,
+            "returns": 1.9989999999999999,
+            "totalCost": 15.770749999999998,
+            "profit": 4.219250000000001,
+            "margin": 21.106803401700855
+          },
+          "units": {
+            "local_currency": "AUD",
+            "purchase_currency": "CNY",
+            "exchange_rate": "CNY/1 AUD",
+            "weight": "kg",
+            "dimensions": "cm",
+            "rates": "percent",
+            "margin": "percent"
+          },
+          "fee_sources": {
+            "purchase_cost": {
+              "value_cny": 6,
+              "source": "shared_1688_reference",
+              "mode": "low_confidence_top_6",
+              "status": "estimate_not_manufacturer_confirmation",
+              "rule_version": "1688-image-only-always-top6-trimmed-10-v6",
+              "quote_count": 6,
+              "included_quote_count": 6
+            },
+            "fulfillment": {
+              "mode": "FBA",
+              "source": "au_workbook_weight_rate",
+              "manual_override": false,
+              "workbook_cell": "Sheet1!D4",
+              "rate_source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+              "status": "preliminary_estimate"
+            },
+            "weight": "synthetic_amazon_item_weight",
+            "exchange_rate": {
+              "value": 4.8,
+              "source": "resolved_analysis_input"
+            },
+            "rates": {
+              "commissionRate": "resolved_analysis_input",
+              "fxLossRate": "resolved_analysis_input",
+              "marketingRate": "resolved_analysis_input",
+              "managementRate": "resolved_analysis_input",
+              "returnsRate": "resolved_analysis_input",
+              "purchaseTaxRate": "resolved_analysis_input",
+              "domesticFreightRateCnyPerKg": "product_weight_rate_estimate",
+              "airFreightRateCnyPerKg": "au_workbook_60_cny_per_kg"
+            },
+            "source_field_values": {}
+          },
+          "missing_inputs": [],
+          "manufacturer_cost_confirmed": false,
+          "detailed_profit_owner": "procurement"
+        },
+        "analysis_review_status": "pending",
+        "missing_fields": [],
+        "facts_revision": "facts:f77196fa63312afe",
+        "filter": {
+          "decision": "excluded",
+          "reasons": [
+            "MONTHLY_SALES_BELOW_100"
+          ],
+          "rule_version": "analysis-preliminary-filter-v1",
+          "effective_store_rules": [
+            {
+              "monthlySalesBand": "100_plus",
+              "minReviews": 50,
+              "minRating": 4,
+              "minProfitMargin": null
+            }
+          ],
+          "effective_result_rules": {
+            "query": "",
+            "minMargin": 0,
+            "completeOnly": false
+          },
+          "export_scope": "qualified",
+          "business_confirmation": false
+        },
+        "source_version": {
+          "scheme": "content_fingerprint",
+          "ordering": "unordered",
+          "supersedes_revision": null
+        },
+        "screening_revision": "screening:895f738fbcee6503",
+        "revision": "rev:b556263e5d08c4ea"
+      }
+    ],
+    "pending_products": [
+      {
+        "product_id": "AU:B0SYNTH004",
+        "batch_id": "synthetic-analysis-batch-20260909",
+        "source_ids": {
+          "analysis_product_id": "AU:B0SYNTH004",
+          "analysis_run_id": "synthetic-analysis-batch-20260909",
+          "procurement_task_id": "synthetic-existing-procurement-task-001",
+          "analysis_export_task_id": "synthetic-existing-analysis-export-001",
+          "amazon_asins": [
+            "B0SYNTH004"
+          ],
+          "amazon_parent_asin": "B0SYNTH000",
+          "seller_ids": [
+            "SYNTHETIC_SELLER_A"
+          ]
+        },
+        "asin": "B0SYNTH004",
+        "parent_asin": "B0SYNTH000",
+        "variant": {
+          "source_asins": [
+            "B0SYNTH004"
+          ],
+          "parent_resolved": true,
+          "policy": "Original source ASIN identity; parent is a relation, not permission to merge variants."
+        },
+        "marketplace": "AU",
+        "language": "en-AU",
+        "currency": "AUD",
+        "title": "Synthetic Example 2 Pieces Storage Bags",
+        "translated_title_zh": null,
+        "stores": [
+          {
+            "seller_id": "SYNTHETIC_SELLER_A",
+            "name": "Synthetic AU Store",
+            "marketplace": "AU",
+            "url": null,
+            "imported_row_numbers": [],
+            "criteria_source": null,
+            "raw_criteria": null
+          }
+        ],
+        "source_store_criteria": [],
+        "reference_materials": {
+          "amazon_url": "https://www.amazon.com.au/dp/B0SYNTH004",
+          "image_urls": [
+            "https://example.invalid/synthetic-product.jpg"
+          ],
+          "role": "competitor_reference_only"
+        },
+        "amazon_observations": {
+          "current_price": 22.21,
+          "monthly_sales": 100,
+          "monthly_sales_source": null,
+          "rating": 4.5,
+          "reviews": 80,
+          "item_weight_kg": null,
+          "collected_at": "2026-09-09T00:00:00.000Z",
+          "detail_status": "pending",
+          "detail_error_code": null
+        },
+        "unit_basis": {
+          "sellable_unit": "one Amazon offer unit",
+          "piece_count": 2,
+          "units_per_set": 2,
+          "order_quantity": null,
+          "detected_piece_count": 2,
+          "piece_count_source": "synthetic_title",
+          "piece_count_evidence": "2 Pieces",
+          "reference_unit_cost_cny": 3,
+          "purchase_cost_already_piece_adjusted": true
+        },
+        "preliminary_profit": {
+          "status": "pending_inputs",
+          "stage": "preliminary",
+          "formula_version": "profit-workbook-au-weight-only-fba-v8",
+          "input_formula_version": "profit-workbook-au-weight-only-fba-v8",
+          "inputs": {
+            "salePrice": 19.99,
+            "purchaseCostCny": null,
+            "fulfillmentFee": 4.35,
+            "exchangeRate": 4.8,
+            "actualWeightKg": null,
+            "commissionRate": 15,
+            "fxLossRate": 1.5,
+            "marketingRate": 10,
+            "managementRate": 6,
+            "returnsRate": 10,
+            "purchaseTaxRate": 4,
+            "domesticFreightRateCnyPerKg": 5,
+            "airFreightRateCnyPerKg": 60,
+            "volumetricDivisor": 139,
+            "cartonWeightKg": null,
+            "unitsPerCarton": null,
+            "fulfillmentMode": "FBA",
+            "airFreightActualWeightOnly": true,
+            "dimensionsCm": null
+          },
+          "result": null,
+          "units": {
+            "local_currency": "AUD",
+            "purchase_currency": "CNY",
+            "exchange_rate": "CNY/1 AUD",
+            "weight": "kg",
+            "dimensions": "cm",
+            "rates": "percent",
+            "margin": "percent"
+          },
+          "fee_sources": {
+            "purchase_cost": {
+              "value_cny": null,
+              "source": "shared_1688_reference",
+              "mode": "low_confidence_top_6",
+              "status": "estimate_not_manufacturer_confirmation",
+              "rule_version": "1688-image-only-always-top6-trimmed-10-v6",
+              "quote_count": 6,
+              "included_quote_count": 6
+            },
+            "fulfillment": {
+              "mode": "FBA",
+              "source": "au_workbook_weight_rate",
+              "manual_override": false,
+              "workbook_cell": "Sheet1!D4",
+              "rate_source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+              "status": "preliminary_estimate"
+            },
+            "weight": "synthetic_amazon_item_weight",
+            "exchange_rate": {
+              "value": 4.8,
+              "source": "resolved_analysis_input"
+            },
+            "rates": {
+              "commissionRate": "resolved_analysis_input",
+              "fxLossRate": "resolved_analysis_input",
+              "marketingRate": "resolved_analysis_input",
+              "managementRate": "resolved_analysis_input",
+              "returnsRate": "resolved_analysis_input",
+              "purchaseTaxRate": "resolved_analysis_input",
+              "domesticFreightRateCnyPerKg": "product_weight_rate_estimate",
+              "airFreightRateCnyPerKg": "au_workbook_60_cny_per_kg"
+            },
+            "source_field_values": {}
+          },
+          "missing_inputs": [
+            "actualWeightKg",
+            "purchaseCostCny"
+          ],
+          "manufacturer_cost_confirmed": false,
+          "detailed_profit_owner": "procurement"
+        },
+        "analysis_review_status": "pending",
+        "missing_fields": [
+          "采购成本",
+          "商品重量"
+        ],
+        "facts_revision": "facts:249fa97e0d707c92",
+        "filter": {
+          "decision": "pending",
+          "reasons": [
+            "MISSING_OR_INVALID_PROFIT_INPUT:actualWeightKg",
+            "MISSING_OR_INVALID_PROFIT_INPUT:purchaseCostCny",
+            "AMAZON_DETAIL_NOT_COMPLETE"
+          ],
+          "rule_version": "analysis-preliminary-filter-v1",
+          "effective_store_rules": [
+            {
+              "monthlySalesBand": "100_plus",
+              "minReviews": 50,
+              "minRating": 4,
+              "minProfitMargin": null
+            }
+          ],
+          "effective_result_rules": {
+            "query": "",
+            "minMargin": 0,
+            "completeOnly": false
+          },
+          "export_scope": "qualified",
+          "business_confirmation": false
+        },
+        "source_version": {
+          "scheme": "content_fingerprint",
+          "ordering": "unordered",
+          "supersedes_revision": null
+        },
+        "screening_revision": "screening:a7321d745b4ba798",
+        "revision": "rev:c7faefdc82681798"
+      }
+    ]
+  },
+  "package_id": "analysis:synthetic-analysis-batch-20260909:0a0db99187f4d2a5",
+  "created_at": "2026-09-09T00:00:00.000Z",
+  "formula_contract": {
+    "formula_version": "profit-workbook-au-weight-only-fba-v8",
+    "fee_model_version": "au-user-workbook-weight-only-v1;us-sop-2023-weight-v1",
+    "implementation": "lib/profit-model.mjs#calculateProductProfit",
+    "representation": "declarative_data_only",
+    "input_policy": "Use explicit product inputs. Do not apply consumer defaults or execute uploaded formula text.",
+    "inputs": {
+      "salePrice": {
+        "unit": "marketplace_currency/sellable_unit",
+        "positive": true
+      },
+      "purchaseCostCny": {
+        "unit": "CNY/sellable_unit",
+        "non_negative": true,
+        "note": "Already piece-adjusted; do not multiply units_per_set again."
+      },
+      "fulfillmentFee": {
+        "unit": "marketplace_currency/sellable_unit",
+        "non_negative": true
+      },
+      "fulfillmentMode": {
+        "values": [
+          "FBA",
+          "FBM"
+        ]
+      },
+      "exchangeRate": {
+        "unit": "CNY/1 marketplace_currency",
+        "positive": true
+      },
+      "actualWeightKg": {
+        "unit": "kg/sellable_unit",
+        "positive": true
+      },
+      "dimensionsCm": {
+        "unit": "cm",
+        "nullable": true
+      },
+      "cartonWeightKg": {
+        "unit": "kg/carton",
+        "nullable": true
+      },
+      "unitsPerCarton": {
+        "unit": "sellable_units/carton",
+        "nullable": true
+      },
+      "airFreightActualWeightOnly": {
+        "unit": "boolean"
+      },
+      "volumetricDivisor": {
+        "unit": "cubic_inches/pound",
+        "positive": true
+      },
+      "commissionRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "fxLossRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "marketingRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "managementRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "returnsRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "purchaseTaxRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "domesticFreightRateCnyPerKg": {
+        "unit": "CNY/kg",
+        "non_negative": true
+      },
+      "airFreightRateCnyPerKg": {
+        "unit": "CNY/kg",
+        "non_negative": true
+      }
+    },
+    "equations": [
+      {
+        "output": "purchaseTaxCny",
+        "expression": "purchaseCostCny * purchaseTaxRate / 100"
+      },
+      {
+        "output": "domesticFreightCny",
+        "expression": "actualWeightKg * domesticFreightRateCnyPerKg"
+      },
+      {
+        "output": "landedPurchaseCny",
+        "expression": "purchaseCostCny + purchaseTaxCny + domesticFreightCny"
+      },
+      {
+        "output": "parts.purchase",
+        "expression": "landedPurchaseCny / exchangeRate"
+      },
+      {
+        "output": "dimensionalWeightKg",
+        "expression": "product(dimensionsCm / 2.54) / volumetricDivisor / 2.2046226218",
+        "condition": "actual-weight-only is false and dimensions exist"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "actualWeightKg",
+        "condition": "airFreightActualWeightOnly is true"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "cartonWeightKg / unitsPerCarton",
+        "condition": "actual-weight-only is false and both carton inputs are positive"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "max(actualWeightKg, dimensionalWeightKg)",
+        "condition": "actual-weight-only is false and carton inputs are incomplete; ignore absent dimensions"
+      },
+      {
+        "output": "parts.freight",
+        "expression": "chargeableWeightKg * airFreightRateCnyPerKg / exchangeRate"
+      },
+      {
+        "output": "parts.commission",
+        "expression": "salePrice * commissionRate / 100"
+      },
+      {
+        "output": "parts.fxLoss",
+        "expression": "salePrice * fxLossRate / 100"
+      },
+      {
+        "output": "parts.marketing",
+        "expression": "salePrice * marketingRate / 100"
+      },
+      {
+        "output": "parts.management",
+        "expression": "salePrice * managementRate / 100"
+      },
+      {
+        "output": "parts.returns",
+        "expression": "salePrice * returnsRate / 100"
+      },
+      {
+        "output": "parts.fulfillment",
+        "expression": "fulfillmentFee",
+        "note": "Charge FBA or FBM once; parts.fba and parts.fbm are aliases, not extra fees."
+      },
+      {
+        "output": "totalCost",
+        "expression": "parts.purchase + parts.commission + parts.fulfillment + parts.freight + parts.fxLoss + parts.marketing + parts.management + parts.returns"
+      },
+      {
+        "output": "profit",
+        "expression": "salePrice - totalCost"
+      },
+      {
+        "output": "margin",
+        "expression": "profit / salePrice * 100"
+      }
+    ],
+    "margin_denominator": "salePrice",
+    "result_units": {
+      "profit": "marketplace_currency/sellable_unit",
+      "totalCost": "marketplace_currency/sellable_unit",
+      "margin": "percent",
+      "parts": "marketplace_currency/sellable_unit",
+      "cny_suffix_fields": "CNY/sellable_unit"
+    },
+    "rounding": {
+      "calculation": "IEEE-754 binary64; no intermediate or final rounding in calculateProductProfit",
+      "display": "2 decimal places for money and percentage; exported result keeps precision",
+      "upstream": "Keep already-resolved salePrice and piece-adjusted purchaseCostCny; do not derive again",
+      "comparison_absolute_tolerance": 1e-9
+    },
+    "au_fba": {
+      "currency": "AUD",
+      "source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+      "weight_unit": "g",
+      "billable_weight_rule": "max(1, ceil(actualWeightKg * 1000 - 1e-9))",
+      "selection": "First matching workbook row; smallest available envelope by weight only",
+      "dimensions_policy": "User-selected weight proxy; no automatic dimension tier",
+      "price_condition": null,
+      "rows": [
+        {
+          "envelopeSizePolicy": "small",
+          "tierLabel": "小号信封",
+          "maxDimensionsCm": [
+            20,
+            15,
+            1
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 75,
+          "weightBand": "0-75g",
+          "fee": 3.64,
+          "sourceRange": "Sheet1!A2:D2",
+          "sourceCell": "Sheet1!D2"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 75,
+          "weightBand": "0-75g",
+          "fee": 3.67,
+          "sourceRange": "Sheet1!A3:D3",
+          "sourceCell": "Sheet1!D3"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 76,
+          "maxWeightG": 225,
+          "weightBand": "76-225g",
+          "fee": 4.35,
+          "sourceRange": "Sheet1!A4:D4",
+          "sourceCell": "Sheet1!D4"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 226,
+          "maxWeightG": 475,
+          "weightBand": "226-475g",
+          "fee": 4.7,
+          "sourceRange": "Sheet1!A5:D5",
+          "sourceCell": "Sheet1!D5"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 225,
+          "weightBand": "0-225g",
+          "fee": 5.87,
+          "sourceRange": "Sheet1!A6:D6",
+          "sourceCell": "Sheet1!D6"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 226,
+          "maxWeightG": 475,
+          "weightBand": "226-475g",
+          "fee": 6.11,
+          "sourceRange": "Sheet1!A7:D7",
+          "sourceCell": "Sheet1!D7"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 476,
+          "maxWeightG": 975,
+          "weightBand": "476-975g",
+          "fee": 6.33,
+          "sourceRange": "Sheet1!A8:D8",
+          "sourceCell": "Sheet1!D8"
+        }
+      ],
+      "out_of_range": "null; manual fee required",
+      "manual_override": "Preserve explicit fulfillmentFee"
+    },
+    "ownership": {
+      "stage": "preliminary",
+      "detailed_profit_owner": "procurement",
+      "manufacturer_cost_confirmed": false,
+      "supplier_cost_changes_return_to_analysis": false
+    }
+  },
+  "authorization": {
+    "business_approval": false,
+    "approved_next_steps": [],
+    "user_confirmation_required_in": "procurement",
+    "note": "Filter pass and analysis review are not manufacturer confirmation, purchase, paid generation or listing publication authorization."
+  },
+  "handoff": {
+    "recipient": "1688-procurement-agent",
+    "next_stage": "manufacturer_cost_and_detailed_profit",
+    "detailed_profit_owner": "procurement",
+    "manufacturer_cost_changes_return_to_analysis": false
+  }
+}

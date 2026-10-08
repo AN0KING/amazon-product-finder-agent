@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Amazon marketplace product discovery agent high-fidelity frontend prototype"
+    />
+    <title>Scout | 亚马逊找品 Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script defer src="/vendor/lucide.min.js"></script>
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand-block">
+          <div class="brand-pixels" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <div>
+            <strong id="brandMarket">SCOUT NL</strong>
+            <span>PRODUCT AGENT</span>
+          </div>
+        </div>
+
+        <nav class="main-nav">
+          <button class="nav-item is-active" type="button" data-view-target="task">
+            <i data-lucide="scan-search" aria-hidden="true"></i>
+            <span>新建 / 配置任务</span>
+          </button>
+          <button class="nav-item" type="button" data-view-target="results">
+            <i data-lucide="list-filter" aria-hidden="true"></i>
+            <span>候选商品</span>
+            <b id="navCandidateCount">0</b>
+          </button>
+          <button class="nav-item" type="button" data-view-target="history">
+            <i data-lucide="history" aria-hidden="true"></i>
+            <span>任务记录</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="connection-line integration-status" id="amazonConnection" data-state="idle">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div class="seller-sprite-copy">
+              <strong>Amazon 店铺访问</strong>
+              <small id="amazonStatusText" aria-live="polite">未检查</small>
+            </div>
+            <button class="icon-button connection-retry" type="button" id="amazonRefreshButton" aria-label="检查 Amazon 店铺访问" title="检查 Amazon 店铺访问">
+              <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            </button>
+          </div>
+          <div class="connection-line integration-status" id="sellerSpriteConnection" data-state="idle">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div class="seller-sprite-copy">
+              <strong>SellerSprite MCP</strong>
+              <small class="seller-sprite-meta">
+                <span id="sellerSpriteStatusText" aria-live="polite">等待连接</span>
+                <span class="seller-sprite-separator" aria-hidden="true">·</span>
+                <span id="sellerSpriteCallCount" title="不是 ASIN 数；历史累计 ASIN 详情调用；授权检测不计入">历史调用 -- 次</span>
+              </small>
+            </div>
+            <button class="icon-button connection-retry" type="button" id="sellerSpriteRetryButton" aria-label="授权 SellerSprite" title="授权 SellerSprite">
+              <i data-lucide="plug" aria-hidden="true"></i>
+            </button>
+          </div>
+          <div class="connection-line integration-status" id="supplier1688Connection" data-state="idle">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div class="seller-sprite-copy">
+              <strong>1688 匹配</strong>
+              <small id="supplier1688StatusText" aria-live="polite">未登录</small>
+              <small id="supplier1688RateText"></small>
+            </div>
+            <div class="connection-actions">
+              <button class="icon-button connection-retry" type="button" id="resume1688Button" aria-label="验证完成，继续搜图" title="验证完成，继续搜图" hidden>
+                <i data-lucide="play" aria-hidden="true"></i>
+              </button>
+              <button class="icon-button connection-retry" type="button" id="restart1688Button" aria-label="重新打开 1688 验证窗口" title="重新打开卡住的验证窗口，保留登录身份" hidden>
+                <i data-lucide="rotate-cw" aria-hidden="true"></i>
+              </button>
+              <button class="icon-button connection-retry" type="button" id="login1688Button" aria-label="打开 1688 专用 Edge" title="打开 1688 专用 Edge">
+                <i data-lucide="log-in" aria-hidden="true"></i>
+              </button>
+              <button class="icon-button connection-retry" type="button" id="check1688Button" aria-label="在线验证 1688 身份" title="在线验证 1688 身份" hidden>
+                <i data-lucide="refresh-cw" aria-hidden="true"></i>
+              </button>
+            </div>
+          </div>
+          <p id="sidebarVersion" data-market-version>NL v0.9.39 · 单次任务</p>
+        </div>
+      </aside>
+
+      <main class="main-shell">
+        <header class="topbar">
+          <button class="icon-button mobile-menu" type="button" id="mobileMenuButton" aria-label="打开导航" title="打开导航">
+            <i data-lucide="menu" aria-hidden="true"></i>
+          </button>
+          <div class="topbar-context">
+            <span class="eyebrow" id="marketEyebrow" data-market-eyebrow>AMAZON NETHERLANDS</span>
+            <strong id="topbarTitle">新建找品任务</strong>
+          </div>
+          <div class="topbar-actions">
+            <span class="mode-label" id="dataModeLabel" data-mode="idle" role="status" aria-live="polite" title="等待手动连接">
+              <i data-lucide="plug" aria-hidden="true"></i><span id="dataModeText">等待连接</span>
+            </span>
+            <button class="icon-button" type="button" id="helpButton" aria-label="查看当前口径" title="查看当前口径">
+              <i data-lucide="circle-help" aria-hidden="true"></i>
+            </button>
+          </div>
+        </header>
+
+        <div class="view-stack">
+          <section class="amazon-collection-panel" id="amazonCollectionPanel" aria-labelledby="collectionPanelTitle" hidden>
+            <div class="collection-heading">
+              <div><span class="eyebrow">AMAZON COLLECTION</span><h2 id="collectionPanelTitle">采集监查 <span id="collectionStatus" role="status" aria-live="polite"></span></h2></div>
+              <div class="collection-actions">
+                <button class="secondary-button" id="collectionPauseButton" type="button">暂停</button>
+                <button class="secondary-button" id="collectionResumeButton" type="button">继续采集</button>
+                <button class="secondary-button" id="collectionRetryMissingButton" type="button">补采缺失字段</button>
+              </div>
+            </div>
+            <p class="collection-progress" id="collectionProgress"></p>
+            <p class="collection-message" id="collectionMessage"></p>
+            <p class="collection-message" id="collectionCause"></p>
+            <p class="collection-editing-note" id="collectionEditingNote"></p>
+            <div class="collection-times"><span>后台每 30 秒巡检 · 页面每 5 秒同步</span><span>最后进展 <time id="collectionLastProgress">—</time></span><span>下次自动重试 <time id="collectionNextRetry">—</time></span></div>
+            <details class="collection-quality"><summary>查看字段完整度</summary><div id="collectionQualitySummary"></div></details>
+          </section>
+          <section class="view-panel is-active" data-view="task" aria-labelledby="taskTitle">
+            <div class="page-heading">
+              <div>
+                <span class="section-index">01 / INPUT</span>
+                <h1 id="taskTitle">从店铺清单开始</h1>
+                <p>解析卖家、校验完整性，再启动一次性找品任务。</p>
+              </div>
+              <div class="page-pixel-scan" aria-hidden="true">
+                <span></span><span></span><span></span><span></span><span></span>
+              </div>
+            </div>
+
+            <div class="task-grid">
+              <section class="import-panel" aria-labelledby="importTitle">
+                <div class="panel-heading">
+                  <div>
+                    <span class="step-number">1</span>
+                    <h2 id="importTitle">导入店铺</h2>
+                  </div>
+                  <span class="status-label" id="importStatusLabel"><i data-lucide="file-up" aria-hidden="true"></i>等待上传</span>
+                </div>
+
+                <input id="storeFileInput" type="file" accept=".xlsx" hidden />
+                <button class="upload-zone" type="button" id="uploadZone">
+                  <i data-lucide="file-spreadsheet" aria-hidden="true"></i>
+                  <span><strong id="uploadedFilename">选择店铺文件</strong><small>每行一个 Amazon 店铺链接 · Agent 将访问店铺并枚举商品</small></span>
+                  <i data-lucide="upload" aria-hidden="true"></i>
+                </button>
+
+                <div class="import-metrics" aria-label="导入结果">
+                  <div><strong id="rawRowsMetric">--</strong><span>原始行</span></div>
+                  <div><strong id="uniqueStoresMetric">--</strong><span>唯一卖家</span></div>
+                  <div><strong id="duplicateRowsMetric">--</strong><span>重复归并</span></div>
+                  <div class="has-warning"><strong id="repairedRowsMetric">--</strong><span>自动修复</span></div>
+                </div>
+
+                <div class="data-audit">
+                  <div class="audit-row">
+                    <i data-lucide="store" aria-hidden="true"></i>
+                    <span>站点识别</span>
+                    <strong id="marketAuditValue">--</strong>
+                    <em class="is-waiting">等待校验</em>
+                  </div>
+                  <div class="audit-row">
+                    <i data-lucide="fingerprint" aria-hidden="true"></i>
+                    <span>任务主键</span>
+                    <strong id="keyAuditValue">--</strong>
+                    <em class="is-waiting">等待校验</em>
+                  </div>
+                  <div class="audit-row">
+                    <i data-lucide="wrench" aria-hidden="true"></i>
+                    <span>链接修复</span>
+                    <strong id="repairAuditValue">--</strong>
+                    <em class="is-waiting">等待校验</em>
+                  </div>
+                </div>
+
+                <p class="analysis-import-warning" id="storeImportWarnings" role="status" hidden></p>
+                <div class="store-manager" id="storeManager" hidden>
+                  <div class="store-manager-heading">
+                    <button class="store-manager-toggle" type="button" id="storeManagerToggle" aria-expanded="false" aria-controls="storeManagerBody">
+                      <span><i data-lucide="list" aria-hidden="true"></i>当前任务店铺 <strong id="currentStoreCount" aria-live="polite">0</strong></span>
+                      <i class="store-manager-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
+                    </button>
+                    <button class="danger-text-button store-clear-button" type="button" id="clearStoreListButton" title="清空当前任务店铺，不修改源 Excel">
+                      <i data-lucide="trash-2" aria-hidden="true"></i>清空当前清单
+                    </button>
+                  </div>
+                  <div class="store-manager-body" id="storeManagerBody" hidden>
+                    <div class="current-store-list" id="currentStoreList" role="list" aria-label="当前任务店铺"></div>
+                    <p>此处操作仅影响本次任务，不会修改或删除源 XLSX。</p>
+                  </div>
+                </div>
+              </section>
+
+              <section class="setup-panel" aria-labelledby="setupTitle">
+                <div class="panel-heading">
+                  <div>
+                    <span class="step-number">2</span>
+                    <h2 id="setupTitle">推荐条件</h2>
+                  </div>
+                </div>
+
+                <div class="field-row field-row-split">
+                  <label>
+                    <span>目标站点</span>
+                    <select id="marketplaceSelect" aria-label="目标 Amazon 站点">
+                      <option value="AU">澳大利亚 · AUD</option>
+                      <option value="CA">加拿大 · CAD</option>
+                      <option value="UK">英国 · GBP</option>
+                      <option value="DE">德国 · EUR</option>
+                      <option value="FR">法国 · EUR</option>
+                      <option value="IT">意大利 · EUR</option>
+                      <option value="ES">西班牙 · EUR</option>
+                      <option value="PL">波兰 · PLN</option>
+                      <option value="MX">墨西哥 · MXN</option>
+                      <option value="BR">巴西 · BRL</option>
+                      <option value="US">美国 · USD</option>
+                      <option value="NL">荷兰 · EUR</option>
+                    </select>
+                    <small class="field-hint" id="marketRegionHint"></small>
+                  </label>
+                  <label>
+                    <span>分析层级</span>
+                    <select id="asinLevelSelect">
+                      <option value="parent">源 ASIN（全部保留）</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div class="filter-builder compact-filter-builder">
+                  <h3 class="filter-group-title">数据来源</h3>
+                  <label class="toggle-line source-mode-toggle">
+                    <span>
+                      <strong>接入 SellerSprite</strong>
+                      <small>关闭时仅读取 Amazon 官网；不会授权或调用 SellerSprite</small>
+                    </span>
+                    <input id="useSellerSpriteToggle" type="checkbox" />
+                    <i aria-hidden="true"></i>
+                  </label>
+
+                </div>
+
+                <label class="toggle-line">
+                  <span>
+                    <strong>分析后仅显示数据完整商品</strong>
+                    <small>所有源 ASIN 都会保留；开启后只隐藏不完整项</small>
+                  </span>
+                  <input id="completeOnlyToggle" type="checkbox" />
+                  <i aria-hidden="true"></i>
+                </label>
+
+                <div class="analysis-actions">
+                  <button class="secondary-button" type="button" id="connectSellerSpriteButton" hidden>
+                    <i data-lucide="plug" aria-hidden="true"></i>
+                    授权 SellerSprite
+                  </button>
+                  <button class="primary-button" type="button" id="startAnalysisButton" disabled>
+                    <i data-lucide="play" aria-hidden="true"></i>
+                    开始分析
+                  </button>
+                </div>
+                <p class="analysis-requirement" id="analysisRequirementText">默认仅通过 Amazon 官网读取竞品信息，不会调用 SellerSprite。</p>
+              </section>
+            </div>
+
+            <section class="progress-panel" id="progressPanel" hidden aria-live="polite">
+              <div class="progress-header">
+                <div>
+                  <span class="live-dot"></span>
+                  <strong id="progressTitle">正在解析 Amazon 店铺</strong>
+                </div>
+                <span id="progressPercent">0%</span>
+              </div>
+              <div class="progress-track"><i id="progressBar"></i></div>
+              <ol class="stage-list" id="stageList">
+                <li class="is-current"><span>01</span>清单校验</li>
+                <li><span>02</span>店铺访问 / 商品分析</li>
+                <li data-stage="sellersprite"><span>03</span>ASIN 详情 / 保留源 ASIN</li>
+                <li><span>04</span>候选整理</li>
+                <li><span>05</span>Amazon 任务完成</li>
+              </ol>
+              <div class="progress-coverage" id="runCoverage" hidden aria-label="任务覆盖结果">
+                <div><span>输入店铺</span><strong id="coverageRequested">--</strong></div>
+                <div><span>访问成功</span><strong id="coverageQueried">--</strong></div>
+                <div><span>源 ASIN</span><strong id="coverageUnresolved">--</strong></div>
+                <div><span>访问失败</span><strong id="coverageFailed">--</strong></div>
+                <div><span>详情成功</span><strong id="coverageParents">--</strong></div>
+                <div><span>全部候选</span><strong id="coverageProducts">--</strong></div>
+                <div class="coverage-source"><span>数据口径</span><strong id="coverageProvider">Amazon 官网商品页</strong></div>
+              </div>
+              <details class="store-visit-audit" id="storeVisitAudit" hidden>
+                <summary>查看店铺访问明细 <span id="storeVisitAuditSummary">--</span></summary>
+                <div id="storeVisitAuditList"></div>
+              </details>
+              <div class="progress-error" id="progressError" role="alert" hidden>
+                <i data-lucide="circle-alert" aria-hidden="true"></i>
+                <div>
+              <strong id="progressErrorTitle">分析未完成</strong>
+                  <p id="progressErrorMessage">商品数据尚未读取完成，请查看原因后重试。</p>
+                </div>
+                <div class="progress-actions">
+                  <button class="primary-button" type="button" id="retryConnectionButton" data-action="connect"><i data-lucide="refresh-cw" aria-hidden="true"></i>重新授权并连接</button>
+                  <button class="secondary-button" type="button" id="useDemoDataButton" hidden><i data-lucide="flask-conical" aria-hidden="true"></i>使用模拟数据演示</button>
+                </div>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel" data-view="results" aria-labelledby="resultsTitle">
+            <div class="page-heading compact-heading">
+              <div>
+                <span class="section-index">02 / REVIEW</span>
+                <h1 id="resultsTitle">候选商品</h1>
+                <p>店铺采集与利润分析 → 您确认筛选、人工初审 → 手动导出</p>
+              </div>
+              <div class="export-menu" id="exportMenu">
+                <button class="secondary-button export-menu-trigger" type="button" id="exportButton" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenuList" title="保存到 D:\铺货筛选">
+                  <i data-lucide="folder-down" aria-hidden="true"></i>
+                  <span>导出运营表</span>
+                  <i class="export-menu-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
+                </button>
+                <div class="export-menu-list" id="exportMenuList" role="menu" aria-label="选择运营表导出范围" hidden>
+                  <button class="export-menu-item" type="button" role="menuitem" id="exportAllCandidatesButton">
+                    <i data-lucide="list" aria-hidden="true"></i>
+                    <span><strong>全部候选产品</strong><small>包含所有初审状态和完整度</small></span>
+                    <b id="exportAllCandidateCount">0</b>
+                  </button>
+                  <button class="export-menu-item" type="button" role="menuitem" id="exportApprovedProductsButton">
+                    <i data-lucide="badge-check" aria-hidden="true"></i>
+                    <span><strong>已初审产品</strong><small>仅包含初审状态为已通过</small></span>
+                    <b id="exportApprovedProductCount">0</b>
+                  </button>
+                  <button class="export-menu-item export-menu-optional" type="button" role="menuitem" id="exportAnalysisHandoffButton" disabled>
+                    <i data-lucide="folder-output" aria-hidden="true"></i>
+                    <span><strong>已初审产品交接包（可选）</strong><small>同一人工初审范围 · Excel + JSON</small></span>
+                    <b id="analysisReviewedExportCount">0</b>
+                  </button>
+                  <p class="export-menu-note" id="analysisExportAvailability" role="status"></p>
+                </div>
+              </div>
+            </div>
+
+            <div class="results-source-notice" id="resultsSourceNotice" role="note">
+              <i data-lucide="route" aria-hidden="true"></i>
+              <span>本次仅使用 Amazon 官网商品页；未授权、未调用 SellerSprite。</span>
+            </div>
+
+            <section class="results-filter-panel" id="resultsAmazonFilters" aria-labelledby="resultsAmazonFiltersTitle">
+              <div class="results-filter-heading">
+                <div>
+                  <h2 id="resultsAmazonFiltersTitle">Amazon 官网筛选</h2>
+                  <p>筛选只改变当前显示，全部已抓取 ASIN 始终保留在候选商品中。</p>
+                </div>
+                <div class="results-filter-actions">
+                  <button class="text-button" type="button" id="clearFiltersButton">恢复默认</button>
+                  <button class="primary-button" type="button" id="applyAmazonFiltersButton">
+                    <i data-lucide="check" aria-hidden="true"></i>
+                    <span>确认筛选</span>
+                  </button>
+                </div>
+              </div>
+              <div class="results-filter-grid">
+                <label class="filter-line filter-line-direct">
+                  <i data-lucide="chart-no-axes-column-increasing" aria-hidden="true"></i>
+                  <span>Amazon 月销量</span>
+                  <select class="filter-select" id="monthlySalesBand" aria-label="Amazon 页面月销量档位">
+                    <option value="all">全部月销量</option>
+                    <option value="under_50">小于 50</option>
+                    <option value="50_to_100">50+（50–&lt;100）</option>
+                    <option value="100_plus">100+（≥100）</option>
+                  </select>
+                </label>
+                <label class="filter-line filter-line-direct">
+                  <i data-lucide="message-square-more" aria-hidden="true"></i>
+                  <span>最低评价数量</span>
+                  <span class="input-with-unit"><input id="minReviews" type="number" min="0" step="1" placeholder="留空" /><b>条</b></span>
+                </label>
+                <label class="filter-line filter-line-direct">
+                  <i data-lucide="star" aria-hidden="true"></i>
+                  <span>最低评价星级</span>
+                  <span class="input-with-unit"><input id="minRating" type="number" min="0" max="5" step="0.1" placeholder="留空" /><b>星</b></span>
+                </label>
+              </div>
+            </section>
+
+            <section class="supplier-stage-bar" id="supplierStagePanel" aria-labelledby="supplierStageTitle">
+              <div class="supplier-stage-copy">
+                <i data-lucide="factory" aria-hidden="true"></i>
+                <div>
+                  <h2 id="supplierStageTitle">1688 参考报价</h2>
+                  <p id="supplierBatchSummary">Amazon 抓取完成后，先确认上方筛选，再单独匹配筛选范围内的商品。</p>
+                </div>
+              </div>
+              <button class="secondary-button" type="button" id="matchFiltered1688Button" disabled>
+                <i data-lucide="scan-search" aria-hidden="true"></i>
+                <span>匹配筛选后的商品</span>
+              </button>
+              <button class="secondary-button" type="button" id="pauseSupplierPipelineButton" hidden>暂停匹配</button>
+            </section>
+
+            <div class="results-toolbar">
+              <div class="search-control">
+                <i data-lucide="search" aria-hidden="true"></i>
+                <input id="resultSearch" type="search" placeholder="搜索 ASIN、商品或店铺" aria-label="搜索候选商品" />
+              </div>
+              <div class="toolbar-filter">
+                <label><span>最低利润率</span><input id="resultMinMargin" type="number" min="0" placeholder="不限" /><b>%</b></label>
+                <label><span>重量区间</span><select id="resultWeightBand" aria-label="按商品重量区间筛选">
+                  <option value="">全部</option>
+                  <option value="under_100">&lt;100g</option>
+                  <option value="100_150">101-150g</option>
+                  <option value="150_250">151-250g</option>
+                  <option value="250_500">251-500g</option>
+                  <option value="over_500">&gt;500g</option>
+                </select></label>
+              </div>
+              <label class="compact-toggle">
+                <input id="resultsCompleteToggle" type="checkbox" />
+                <i aria-hidden="true"></i>
+                <span>仅完整数据</span>
+              </label>
+              <button class="icon-button" type="button" id="refreshResultsButton" aria-label="刷新结果" title="刷新结果">
+                <i data-lucide="refresh-cw" aria-hidden="true"></i>
+              </button>
+            </div>
+
+            <div class="results-summary">
+              <p>已抓取唯一 ASIN <strong id="sourceAsinCount">0</strong> 个 <span>·</span> 全部候选 <strong id="totalCandidateCount">0</strong> 个 <span>·</span> 当前显示 <strong id="visibleCount">0</strong> 个 <span>·</span> 完整度隐藏 <strong id="hiddenCandidateCount">0</strong> 个 <button class="summary-action" id="showHiddenCandidatesButton" type="button" hidden><i data-lucide="eye" aria-hidden="true"></i>显示</button></p>
+              <div class="legend"><span><i class="legend-dot strong"></i>推荐</span><span><i class="legend-dot pending"></i>待判断</span><span><i class="legend-dot incomplete"></i>不完整</span></div>
+            </div>
+
+            <section class="analysis-stage-summary" id="analysisStageSummary" aria-label="采集覆盖信息">
+              <p class="analysis-coverage-line"><strong id="analysisCoverageStatus">尚未采集</strong><span id="analysisCoverageDetail">采集范围将随店铺分页和商品详情更新。</span></p>
+            </section>
+
+            <section class="asin-coverage-summary" aria-label="店铺 ASIN 覆盖情况">
+              <div class="asin-coverage-metric">
+                <span>Amazon 报告合计（估算）</span>
+                <strong id="storeAsinCount">未确认</strong>
+              </div>
+              <div class="asin-coverage-metric">
+                <span>已枚举唯一 ASIN</span>
+                <strong id="retainedAsinCount">0</strong>
+              </div>
+              <div class="asin-coverage-metric">
+                <span>待继续枚举（估算）</span>
+                <strong id="notIncludedAsinCount">未确认</strong>
+              </div>
+              <div class="asin-coverage-metric">
+                <span>筛选隐藏</span>
+                <strong id="filteredAsinCount">0</strong>
+              </div>
+              <div class="asin-coverage-reasons">
+                <span>覆盖说明</span>
+                <ul id="notIncludedReasonList">
+                  <li>Amazon 报告总数为动态估算，最终以唯一商品卡片为准</li>
+                </ul>
+              </div>
+            </section>
+
+            <nav class="results-pagination" id="resultsPagination" aria-label="候选商品分页" hidden>
+              <span id="resultsPageSummary">第 1 / 1 页</span>
+              <div>
+                <button class="icon-button" type="button" id="previousResultsPage" aria-label="上一页" title="上一页">
+                  <i data-lucide="chevron-left" aria-hidden="true"></i>
+                </button>
+                <button class="icon-button" type="button" id="nextResultsPage" aria-label="下一页" title="下一页">
+                  <i data-lucide="chevron-right" aria-hidden="true"></i>
+                </button>
+              </div>
+            </nav>
+
+            <div class="table-shell">
+              <table class="product-table">
+                <thead>
+                  <tr>
+                    <th>候选商品</th>
+                    <th>当前售价</th>
+                    <th>目标采购成本</th>
+                    <th>1688 均价</th>
+                    <th>利润率</th>
+                    <th>完整度</th>
+                    <th>初审</th>
+                    <th><span class="sr-only">操作</span></th>
+                  </tr>
+                </thead>
+                <tbody id="productTableBody"></tbody>
+              </table>
+              <div class="empty-results" id="emptyResults" hidden>
+                <div class="empty-pixels" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+                <strong id="emptyResultsTitle">没有符合当前条件的商品</strong>
+                <p id="emptyResultsHint">调整筛选条件后重新查看。</p>
+                <button class="text-button" type="button" id="resetResultFilters"><i data-lucide="rotate-ccw" aria-hidden="true"></i>重置筛选</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="view-panel" data-view="history" aria-labelledby="historyTitle">
+            <div class="page-heading compact-heading">
+              <div>
+                <span class="section-index">03 / RUNS</span>
+                <h1 id="historyTitle">任务记录</h1>
+                <p>一次性任务按运行保留，便于回看导入、筛选和审核结果。</p>
+              </div>
+            </div>
+            <div class="history-list" id="historyList" aria-live="polite">
+              <div class="history-empty-line"><span></span><p>暂无已保存任务</p><span></span></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div class="drawer-backdrop" id="drawerBackdrop" hidden>
+      <aside class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+        <header class="drawer-header">
+          <div><span class="section-index">PRODUCT REVIEW</span><h2 id="drawerTitle">商品分析</h2></div>
+          <button class="icon-button" type="button" id="closeDrawerButton" aria-label="关闭详情" title="关闭详情"><i data-lucide="x" aria-hidden="true"></i></button>
+        </header>
+        <div class="drawer-content">
+          <p class="analysis-handoff-notice" id="drawerAnalysisHandoffNote" hidden>此份交接快照已保存。需要继续独立分析时，可创建新的分析版本；采购端已有资料和正式详细利润保持原版本依据。</p>
+          <div class="analysis-version-actions">
+            <button class="secondary-button" id="newAnalysisVersionButton" type="button" hidden>创建新的分析版本</button>
+            <p id="analysisVersionActionHint" role="status" hidden></p>
+            <details id="analysisVersionHistory" hidden></details>
+          </div>
+          <div class="product-lead">
+            <div class="product-visual large" id="drawerVisual" aria-hidden="true"></div>
+            <div>
+              <span class="asin-label" id="drawerAsin">B0AU000001</span>
+              <h3 id="drawerProductName">商品名称</h3>
+              <p id="drawerStore">Seller ID</p>
+              <div class="lead-flags" id="drawerFlags"></div>
+              <button class="secondary-button manual-cost-entry" type="button" id="openManualCostButton">
+                <i data-lucide="wallet-cards" aria-hidden="true"></i>
+                编辑商品信息与成本
+              </button>
+            </div>
+          </div>
+
+          <div class="detail-tabs" role="tablist" aria-label="商品详情栏目">
+            <button class="is-active" id="amazonTab" type="button" role="tab" data-detail-tab="amazon" aria-controls="amazonPanel" aria-selected="true">Amazon 数据</button>
+            <button id="suppliersTab" type="button" role="tab" data-detail-tab="suppliers" aria-controls="suppliersPanel" aria-selected="false" tabindex="-1">1688 匹配</button>
+            <button id="profitTab" type="button" role="tab" data-detail-tab="profit" aria-controls="profitPanel" aria-selected="false" tabindex="-1">利润拆解</button>
+          </div>
+
+          <section class="detail-tab-panel is-active" id="amazonPanel" role="tabpanel" aria-labelledby="amazonTab" data-detail-panel="amazon">
+            <dl class="metric-list" id="amazonMetrics"></dl>
+            <div class="source-note" id="sellerSpriteSourceNote" data-mode="idle"><i data-lucide="plug" aria-hidden="true"></i><span>等待一次手动授权 SellerSprite，数据来源尚未确认。</span></div>
+          </section>
+
+          <section class="detail-tab-panel" id="suppliersPanel" role="tabpanel" aria-labelledby="suppliersTab" aria-hidden="true" data-detail-panel="suppliers">
+            <div class="supplier-summary" id="supplierSummaryBox" data-confidence="standard"><span id="supplierSummaryLabel">中间 6 家均价</span><strong id="supplierSummary">等待搜索</strong><small id="supplierSummaryNote">标准不足时，取图片相似度最高的 6 家真实有效报价并计算低置信度利润率</small></div>
+            <div class="supplier-list" id="supplierList"></div>
+          </section>
+
+          <section class="detail-tab-panel" id="profitPanel" role="tabpanel" aria-labelledby="profitTab" aria-hidden="true" data-detail-panel="profit">
+            <div class="profit-editor">
+              <label class="currency-input-field"><span>我们的售价（竞品 × 0.9）</span><span class="input-with-unit"><input id="editSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="editSalePriceCny" /><b id="salePriceCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editSalePriceCny" for="editSalePrice">人民币 --</output></label>
+              <label><span>1688 单件采购均价</span><span class="input-with-unit"><input id="editPurchaseCost" type="number" min="0" step="0.01" /><b>CNY</b></span></label>
+              <label><span>Amazon 标题件数</span><span class="input-with-unit"><input id="editPieceCount" type="number" min="1" max="10000" step="1" inputmode="numeric" aria-describedby="editPieceCountSource" /><b>件</b></span><small class="piece-count-source" id="editPieceCountSource"></small></label>
+              <label><span>整套采购成本</span><span class="input-with-unit is-readonly"><input id="editPurchaseTotal" type="number" step="0.01" readonly aria-readonly="true" /><b>CNY</b></span></label>
+              <label class="currency-input-field"><span>FBA 配送费</span><span class="input-with-unit"><input id="editFbaFee" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="editFbaFeeCny" /><b id="fbaFeeCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editFbaFeeCny" for="editFbaFee">人民币 --</output></label>
+              <label><span>计费重量</span><span class="input-with-unit"><input id="editWeight" type="number" min="0.001" step="0.001" inputmode="decimal" /><b>kg</b></span></label>
+            </div>
+            <div class="cost-breakdown" id="costBreakdown"></div>
+            <div class="profit-result" aria-live="polite" aria-atomic="true"><span>预估经营利润率</span><strong id="drawerProfitMargin">0%</strong><div class="profit-result-value" id="drawerProfitValue">-- / 件</div></div>
+          </section>
+        </div>
+        <footer class="drawer-footer">
+          <button class="danger-text-button" type="button" id="rejectProductButton"><i data-lucide="x" aria-hidden="true"></i>淘汰</button>
+          <button class="secondary-button" type="button" id="rematchProductButton"><i data-lucide="shuffle" aria-hidden="true"></i>退回匹配</button>
+          <button class="primary-button" type="button" id="approveProductButton"><i data-lucide="check" aria-hidden="true"></i>初审通过</button>
+        </footer>
+      </aside>
+    </div>
+
+    <div class="manual-cost-dialog" id="manualCostDialog" hidden role="dialog" aria-modal="true" aria-labelledby="manualCostDialogTitle" aria-describedby="manualCostDialogDescription">
+      <form class="manual-cost-dialog-panel" id="manualCostForm" novalidate tabindex="-1">
+        <header class="manual-cost-dialog-header">
+          <div>
+            <span class="section-index">MANUAL COST</span>
+            <h2 id="manualCostDialogTitle">单品成本与利润</h2>
+          </div>
+          <button class="icon-button" type="button" id="closeManualCostDialogButton" aria-label="关闭手动成本窗口" title="关闭">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </header>
+
+        <div class="manual-cost-dialog-body">
+          <div class="manual-cost-product">
+            <div class="manual-cost-product-icon" aria-hidden="true"><i data-lucide="package-search"></i></div>
+            <div>
+              <span class="asin-label" id="manualCostProductAsin">--</span>
+              <h3 id="manualCostProductName">当前商品</h3>
+              <p id="manualCostDialogDescription">本商品独立核算，不影响其他候选商品。</p>
+            </div>
+          </div>
+
+          <div class="manual-cost-source-line" aria-live="polite">
+            <span id="manualFormulaSource"><i data-lucide="file-spreadsheet" aria-hidden="true"></i>公式来源 · 交互文件</span>
+            <span id="manualSellerSpriteParameterSource" data-state="pending"><i data-lucide="database" aria-hidden="true"></i>SellerSprite 参数待载入</span>
+          </div>
+
+          <section class="manual-cost-section" aria-labelledby="manualAmazonSectionTitle">
+            <div class="manual-cost-section-heading">
+              <div>
+                <span class="step-number">A</span>
+                <div><strong id="manualAmazonSectionTitle">Amazon 数据补填</strong><small>接口失败也保留源 ASIN；人工值会标记来源</small></div>
+              </div>
+              <span class="manual-source-badge" id="manualDetailStatusBadge" data-state="pending">详情待补</span>
+            </div>
+            <p class="manual-detail-error" id="manualDetailFailureReason" hidden></p>
+            <div class="manual-cost-fields">
+              <label class="manual-cost-field manual-cost-field-wide">
+                <span>商品标题</span>
+                <span class="manual-cost-input"><input id="manualAmazonTitle" data-manual-amazon type="text" autocomplete="off" /></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>竞品当前售价</span>
+                <span class="manual-cost-input">
+                  <input id="manualAmazonCurrentPrice" data-manual-amazon type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="manualAmazonCurrentPriceCny" />
+                  <b id="manualAmazonCurrentPriceCurrency" data-market-currency>EUR</b>
+                </span>
+                <output class="currency-conversion-output" id="manualAmazonCurrentPriceCny" for="manualAmazonCurrentPrice">人民币 --</output>
+              </label>
+              <label class="manual-cost-field">
+                <span>竞品 30 天销量</span>
+                <span class="manual-cost-input"><input id="manualAmazonSales30" data-manual-amazon type="number" min="0" step="1" inputmode="numeric" /><b>件</b></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>竞品 60 天销量</span>
+                <span class="manual-cost-input"><input id="manualAmazonSales60" data-manual-amazon type="number" min="0" step="1" inputmode="numeric" /><b>件</b></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>评价星级</span>
+                <span class="manual-cost-input"><input id="manualAmazonRating" data-manual-amazon type="number" min="0" max="5" step="0.1" inputmode="decimal" /><b>/ 5</b></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>评价数量</span>
+                <span class="manual-cost-input"><input id="manualAmazonReviews" data-manual-amazon type="number" min="0" step="1" inputmode="numeric" /><b>条</b></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>竞品上架时间</span>
+                <span class="manual-cost-input"><input id="manualAmazonListingDate" data-manual-amazon type="date" /></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>首次 FBA 有货</span>
+                <span class="manual-cost-input"><input id="manualAmazonFirstFba" data-manual-amazon type="date" /></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>A+ 页面</span>
+                <span class="manual-cost-input">
+                  <select id="manualAmazonHasAPlus" data-manual-amazon>
+                    <option value="">未获取</option>
+                    <option value="true">有</option>
+                    <option value="false">无</option>
+                  </select>
+                </span>
+              </label>
+            </div>
+          </section>
+
+          <fieldset class="manual-fulfillment-fieldset">
+            <legend>履约方式</legend>
+            <div class="manual-fulfillment-segment" role="radiogroup" aria-label="选择履约方式">
+              <label for="manualCostFbaMode">
+                <input id="manualCostFbaMode" type="radio" name="manualFulfillmentMode" value="FBA" checked />
+                <span><i data-lucide="package-check" aria-hidden="true"></i><b>FBA</b><small>亚马逊配送</small></span>
+              </label>
+              <label for="manualCostFbmMode">
+                <input id="manualCostFbmMode" type="radio" name="manualFulfillmentMode" value="FBM" />
+                <span><i data-lucide="truck" aria-hidden="true"></i><b>FBM</b><small>卖家配送</small></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="manual-cost-fields">
+            <label class="manual-cost-field">
+              <span>我们的售价（竞品 × 0.9）</span>
+              <span class="manual-cost-input is-readonly">
+                <input id="manualCostSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="manualCostSalePriceCny" />
+                <b id="manualCostSalePriceCurrency" data-market-currency>EUR</b>
+              </span>
+              <output class="currency-conversion-output" id="manualCostSalePriceCny" for="manualCostSalePrice">人民币 --</output>
+            </label>
+            <label class="manual-cost-field">
+              <span>1688 单件采购价</span>
+              <span class="manual-cost-input">
+                <input id="manualPurchaseCost" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" required />
+                <b>CNY</b>
+              </span>
+            </label>
+            <label class="manual-cost-field">
+              <span>Amazon 标题件数</span>
+              <span class="manual-cost-input">
+                <input id="manualPieceCount" type="number" min="1" max="10000" step="1" inputmode="numeric" required aria-describedby="manualPieceCountSource" />
+                <b>件</b>
+              </span>
+              <small class="manual-field-source" id="manualPieceCountSource"></small>
+            </label>
+            <label class="manual-cost-field">
+              <span>整套采购成本</span>
+              <span class="manual-cost-input is-readonly">
+                <input id="manualPurchaseTotal" type="number" step="0.01" readonly aria-readonly="true" />
+                <b>CNY</b>
+              </span>
+            </label>
+            <label class="manual-cost-field manual-cost-field-wide">
+              <span id="manualFulfillmentFeeLabel">FBA 配送费</span>
+              <span class="manual-cost-input">
+                <input id="manualFulfillmentFee" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" required aria-describedby="manualFulfillmentFeeCny" />
+                <b id="manualFulfillmentCurrency" data-market-currency>EUR</b>
+              </span>
+              <output class="currency-conversion-output" id="manualFulfillmentFeeCny" for="manualFulfillmentFee">人民币 --</output>
+            </label>
+          </div>
+
+          <section class="manual-cost-section" aria-labelledby="manualSizeSectionTitle">
+            <div class="manual-cost-section-heading">
+              <div>
+                <span class="step-number">B</span>
+                <div><strong id="manualSizeSectionTitle">尺寸与重量</strong><small>SellerSprite 原值优先，可按商品覆盖</small></div>
+              </div>
+              <span class="manual-source-badge" id="manualSizeSourceBadge" data-state="pending">等待数据</span>
+            </div>
+
+            <div class="manual-dimension-grid">
+              <div class="manual-dimension-field">
+                <span>商品尺寸</span>
+                <div class="manual-dimension-inputs">
+                  <input id="manualProductLengthCm" data-product-cost="productLengthCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="长" aria-label="商品长度，厘米" />
+                  <input id="manualProductWidthCm" data-product-cost="productWidthCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="宽" aria-label="商品宽度，厘米" />
+                  <input id="manualProductHeightCm" data-product-cost="productHeightCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="高" aria-label="商品高度，厘米" />
+                  <b>cm</b>
+                </div>
+                <small id="manualProductDimensionsSource">SellerSprite 商品参数</small>
+              </div>
+
+              <div class="manual-dimension-field">
+                <span>包装尺寸</span>
+                <div class="manual-dimension-inputs">
+                  <input id="manualLengthCm" data-product-cost="packageLengthCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="长" aria-label="包装长度，厘米" />
+                  <input id="manualWidthCm" data-product-cost="packageWidthCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="宽" aria-label="包装宽度，厘米" />
+                  <input id="manualHeightCm" data-product-cost="packageHeightCm" type="number" min="0" step="0.01" inputmode="decimal" placeholder="高" aria-label="包装高度，厘米" />
+                  <b>cm</b>
+                </div>
+                <small id="manualPackageDimensionsSource">SellerSprite FBA 包装参数</small>
+              </div>
+            </div>
+
+            <div class="manual-cost-fields is-compact">
+              <label class="manual-cost-field">
+                <span>实际重量</span>
+                <span class="manual-cost-input"><input id="manualActualWeightKg" data-product-cost="actualWeightKg" type="number" min="0.001" step="0.001" inputmode="decimal" required /><b>kg</b></span>
+                <small class="manual-field-source" id="manualActualWeightSource">SellerSprite 包装重量优先</small>
+              </label>
+              <label class="manual-cost-field" id="manualCartonWeightField">
+                <span>外箱重量</span>
+                <span class="manual-cost-input"><input id="manualCartonWeightKg" data-product-cost="outerCartonWeightKg" type="number" min="0" step="0.001" inputmode="decimal" /><b>kg</b></span>
+                <small class="manual-field-source">产品级人工输入</small>
+              </label>
+            </div>
+          </section>
+
+          <section class="manual-cost-section" aria-labelledby="manualFreightSectionTitle">
+            <div class="manual-cost-section-heading">
+              <div>
+                <span class="step-number">C</span>
+                <div><strong id="manualFreightSectionTitle">空运头程</strong><small id="manualFreightPolicyNote">实际重与体积重取高值</small></div>
+              </div>
+            </div>
+            <div class="manual-cost-fields is-compact">
+              <label class="manual-cost-field" id="manualUnitsPerCartonField">
+                <span>装箱数</span>
+                <span class="manual-cost-input"><input id="manualUnitsPerCarton" data-product-cost="unitsPerCarton" type="number" min="1" step="1" inputmode="numeric" /><b>件/箱</b></span>
+              </label>
+              <label class="manual-cost-field">
+                <span>空运单价</span>
+                <span class="manual-cost-input"><input id="manualAirFreightRate" data-product-cost="airFreightRateCnyPerKg" type="number" min="0" step="0.01" inputmode="decimal" required /><b>CNY/kg</b></span>
+              </label>
+            </div>
+            <dl class="manual-formula-summary">
+              <div><dt>体积重</dt><dd id="manualVolumetricWeightKg"></dd></div>
+              <div><dt>计费重</dt><dd id="manualChargeableWeightKg"></dd></div>
+              <div><dt>单件头程</dt><dd id="manualAirFreightCny"></dd></div>
+            </dl>
+            <p class="manual-profit-formula-note" id="manualProfitFormulaNote" hidden></p>
+          </section>
+
+          <section class="manual-cost-section" aria-labelledby="manualRatesSectionTitle">
+            <div class="manual-cost-section-heading">
+              <div>
+                <span class="step-number">D</span>
+                <div><strong id="manualRatesSectionTitle">产品费率</strong><small>每个商品独立保存</small></div>
+              </div>
+            </div>
+            <div class="manual-rate-grid">
+              <label><span>Amazon 佣金</span><span class="manual-cost-input"><input id="manualCommissionRate" data-product-cost="commissionRate" type="number" min="0" max="100" step="0.1" value="15" required /><b>%</b></span></label>
+              <label><span>汇率折损</span><span class="manual-cost-input"><input id="manualFxLossRate" data-product-cost="fxLossRate" type="number" min="0" max="100" step="0.1" value="1.5" required /><b>%</b></span></label>
+              <label><span>营销费</span><span class="manual-cost-input"><input id="manualMarketingRate" data-product-cost="marketingRate" type="number" min="0" max="100" step="0.1" value="10" required /><b>%</b></span></label>
+              <label><span>管理费</span><span class="manual-cost-input"><input id="manualManagementRate" data-product-cost="managementRate" type="number" min="0" max="100" step="0.1" value="5" required /><b>%</b></span></label>
+              <label><span>退货预留</span><span class="manual-cost-input"><input id="manualReturnsRate" data-product-cost="returnsRate" type="number" min="0" max="100" step="0.1" value="8" required /><b>%</b></span></label>
+              <label><span>采购税费预留</span><span class="manual-cost-input"><input id="manualPurchaseTaxRate" data-product-cost="purchaseTaxRate" type="number" min="0" max="100" step="0.1" value="4" required /><b>%</b></span></label>
+              <label><span>国内运费单价</span><span class="manual-cost-input"><input id="manualDomesticFreightRate" data-product-cost="domesticFreightRateCnyPerKg" type="number" min="2" max="5" step="0.1" value="5" required /><b>CNY/kg</b></span></label>
+            </div>
+            <dl class="manual-formula-summary manual-domestic-summary">
+              <div><dt>采购税费</dt><dd id="manualPurchaseTaxCny"></dd></div>
+              <div><dt>国内运费 / 件</dt><dd id="manualDomesticFreightCny"></dd></div>
+            </dl>
+          </section>
+
+          <div class="manual-cost-confidence-note" id="manualCostConfidenceNote" data-confidence="low">
+            <i data-lucide="triangle-alert" aria-hidden="true"></i>
+            <div><strong>低置信度</strong><span>缺少外箱数据时使用 SellerSprite 单件包装参数回退，利润结果保留来源标记。</span></div>
+          </div>
+
+          <div class="manual-cost-profit" id="manualCostProfitPreview" aria-live="polite" hidden>
+            <div>
+              <span>预估经营利润率</span>
+              <div class="profit-result-value" id="manualCostProfitValue"></div>
+            </div>
+            <strong id="manualCostProfitMargin"></strong>
+          </div>
+
+          <p class="manual-cost-error" id="manualCostError" role="alert" hidden></p>
+        </div>
+
+        <footer class="manual-cost-dialog-footer">
+          <button class="secondary-button" type="submit" id="saveManualCostButton">
+            <i data-lucide="save" aria-hidden="true"></i>
+            保存修改
+          </button>
+          <button class="primary-button" type="button" id="manualCostApproveButton">
+            <i data-lucide="check" aria-hidden="true"></i>
+            保存并初审通过
+          </button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="context-dialog" id="contextDialog" hidden role="dialog" aria-modal="true" aria-labelledby="contextDialogTitle">
+      <div>
+        <header><h2 id="contextDialogTitle">当前计算口径</h2><button class="icon-button" type="button" id="closeContextButton" aria-label="关闭" title="关闭"><i data-lucide="x" aria-hidden="true"></i></button></header>
+        <ul>
+          <li id="marketScopeNote">当前站点：Amazon <span data-market-name>荷兰站</span>，销售币种 <span data-market-currency>EUR</span>，采购币种 CNY，配送地区 <span data-market-region>未设置</span>。</li>
+          <li>Amazon 指标：仅调用 Codex 中已配置 SellerSprite MCP 的“ASIN 详情”；密钥只由本地服务读取。</li>
+          <li>店铺流程：Agent 访问 Amazon 店铺并枚举全部源 ASIN，再逐个交给 SellerSprite 分析；父 ASIN 只作为关联字段，不合并删除源 ASIN。</li>
+          <li>数据模式：实时、混合估算与模拟演示始终在顶栏和商品详情中标记。</li>
+          <li>我们的售价：<span data-sale-price-policy>竞品当前售价 EUR × 0.9</span>；产品人员单品覆盖后，以人工售价重算。</li>
+          <li>目标采购成本：<span data-target-cost-policy>我们的售价 EUR × 当地币种兑 CNY 汇率 ÷ 5</span>。</li>
+          <li>FBA 费用：<span id="fbaScopeNote" data-fba-policy>临时使用美国旧标准计算，费表数值按 EUR 名义套用，产品人员可手工修改。</span></li>
+          <li>经营利润：按每个商品的尺寸、重量、头程与费率独立核算，数据来源和置信度随结果保存。</li>
+          <li>运营角色：不进入系统，可接收全部候选产品或仅接收已初审产品的导出表。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden>
+      <i data-lucide="check-circle-2" aria-hidden="true"></i>
+      <span id="toastMessage">已保存</span>
+    </div>
+  </body>
+</html>

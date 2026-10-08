@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "task_id": "DIR-20260909-A02",
+  "time": "2026-09-09T14:35:11.1127415+08:00",
+  "version": {
+    "version": "0.9.31",
+    "activeSearchRequests": 0,
+    "activeAmazonRequests": 0,
+    "active1688Requests": 0,
+    "draining": false,
+    "connected": false,
+    "toolCount": null,
+    "toolCallCount": 608,
+    "sessionToolCallCount": 0
+  },
+  "assets": [
+    {
+      "path": "/",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/app.js",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/styles.css",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    }
+  ],
+  "processId": 29304,
+  "previousProcessId": 16960,
+  "procurementServiceTouched": false,
+  "dataIntegrity": {
+    "files": 32,
+    "sha256Unchanged": true
+  },
+  "validation": {
+    "fullSuite": {
+      "tests": 439,
+      "initialPassed": 432,
+      "initialFailed": 7,
+      "failure": "VM fixture omitted analysisVersionPendingIds; production global exists",
+      "targetedRerun": {
+        "tests": 8,
+        "passed": 8
+      },
+      "remainingFailures": 0
+    },
+    "standaloneUi": {
+      "passed": true,
+      "saveFailureRollback": true,
+      "saveBeforeUnlock": true,
+      "duplicateCreationGuard": true,
+      "editableControlsRestored": 9,
+      "flatHistoryAcrossVersions": true,
+      "predecessorPreserved": true,
+      "originalInitWithoutProcurement": true,
+      "independentImportAndManualCosts": true
+    },
+    "reviewScroll": {
+      "passed": true,
+      "consecutiveApprovals": [
+        {
+          "before": 4391,
+          "after": 4391
+        },
+        {
+          "before": 4391,
+          "after": 4391
+        }
+      ],
+      "rejection": {
+        "before": 4391,
+        "after": 4391
+      },
+      "manualApproval": true,
+      "profitFilterRemoval": true,
+      "backgroundRefresh": true,
+      "removedRowFallback": true,
+      "rapidReopen": true
+    },
+    "launcher": {
+      "tests": 20,
+      "passed": 20,
+      "coldStart": true,
+      "existingService": true,
+      "forceRestart": true,
+      "noBrowser": true,
+      "keepServiceAlive": true,
+      "procurementPreconditionRemoved": true
+    },
+    "productionPlatformRequests": 0,
+    "productionBusinessMutations": 0
+  },
+  "backup": "D:\\deliverables\\amazon-product-finder-agent\\backups\\DIR-20260909-A02-predeploy"
+}

@@ -1,0 +1,113 @@
+{
+  "schema_version": "1.0",
+  "task_id": "DIR-20260909-A01",
+  "input_version": "1.1",
+  "time": "2026-09-09T13:28:04.8417966+08:00",
+  "version": {
+    "version": "0.9.30",
+    "activeSearchRequests": 0,
+    "activeAmazonRequests": 0,
+    "active1688Requests": 0,
+    "draining": false,
+    "connected": false,
+    "toolCount": null,
+    "toolCallCount": 608,
+    "sessionToolCallCount": 0
+  },
+  "assets": [
+    {
+      "path": "/",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/app.js",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/lib/analysis-handoff.mjs",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/lib/analysis-coverage.mjs",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    }
+  ],
+  "emptyHandoffStatus": 422,
+  "emptyHandoffResponse": {
+    "ok": false,
+    "error": {
+      "code": "INVALID_ANALYSIS_HANDOFF",
+      "message": "初筛交接数据格式无效。"
+    }
+  },
+  "deployment": {
+    "previous_version": "0.9.29",
+    "version": "0.9.30",
+    "previous_process_id": 6656,
+    "process_id": 16960,
+    "started_local": "2026-09-09T13:27:11+08:00",
+    "script": "scripts/restart-scout-only.ps1",
+    "procurement_service_touched": false
+  },
+  "data_integrity": {
+    "beforeFiles": 32,
+    "afterFiles": 32,
+    "unchanged": true,
+    "method": "SHA-256 comparison of every file in the existing data directory"
+  },
+  "verification": {
+    "full_regression": {
+      "tests": 429,
+      "initial_passed": 427,
+      "initial_failed": 2,
+      "note": "Two legacy test harness/expectation adapters corrected; targeted rerun 12/12 passed. No remaining observed failure."
+    },
+    "exporter_http_and_file_tests": {
+      "passed": 72,
+      "network_scope": "ephemeral local server; synthetic data and temporary storage"
+    },
+    "browser_handoff": {
+      "qualified": 2,
+      "excluded": 1,
+      "pending": 1,
+      "exports": 3,
+      "read_only_controls": 9,
+      "repeated_export_stable": true,
+      "screening_change_preserves_facts": true,
+      "platform_requests": 0
+    },
+    "browser_review": {
+      "continuous_approvals": 2,
+      "rejections": 1,
+      "scroll_top_before": 4363,
+      "scroll_top_after": 4363,
+      "removed_row_fallback": true,
+      "rapid_reopen": true
+    },
+    "existing_joint_report": "C:/Users/nanashiWu/Documents/Codex/2026-09-09/wo/outputs/integration/joint/actual-apl-9ht1g5/actual-apl-report.json",
+    "existing_joint_passed": 12,
+    "consumer_followup": "Director remaining-business-recheck.md at 2026-09-09T05:19:33.146Z confirms cross-market and screening-only changes both passed (2/2). A retained actual capture time; no current known consumer blocker."
+  },
+  "rollback": {
+    "code_directory": "D:/deliverables/amazon-product-finder-agent/backups/DIR-20260909-A01-predeploy",
+    "tested_restore": false,
+    "note": "Selected pre-A01 0.9.29 application/server/import/export/formula files. Compatible audit persistence additions and data are retained; no data rollback."
+  },
+  "real_business_actions_performed": false
+}

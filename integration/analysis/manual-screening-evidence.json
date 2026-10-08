@@ -1,0 +1,120 @@
+{
+  "schema_version": "1.0",
+  "task_id": "DIR-20260909-A03",
+  "time": "2026-09-09T15:09:13.1558748+08:00",
+  "version": {
+    "version": "0.9.32",
+    "activeSearchRequests": 0,
+    "activeAmazonRequests": 0,
+    "active1688Requests": 0,
+    "draining": false,
+    "connected": false,
+    "toolCount": null,
+    "toolCallCount": 608,
+    "sessionToolCallCount": 0
+  },
+  "assets": [
+    {
+      "path": "/",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/app.js",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/lib/analysis-handoff.mjs",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    },
+    {
+      "path": "/styles.css",
+      "status": 200,
+      "sourceMatches": true,
+      "cache": [
+        "no-store"
+      ]
+    }
+  ],
+  "processId": 16436,
+  "previousProcessId": 29304,
+  "procurementServiceTouched": false,
+  "data_integrity": {
+    "files": 32,
+    "sha256_unchanged": true,
+    "production_review_mutations": 0,
+    "production_business_exports": 0
+  },
+  "selection_policy": {
+    "source": "raw product.reviewStatus === approved",
+    "automatic_rules_select_products": false,
+    "original_all_excel_scope": "all products",
+    "original_reviewed_excel_scope": "all manually approved products",
+    "optional_json_scope": "same frozen manually approved exportRows snapshot",
+    "missing_selected_products": "retained; draft marked",
+    "downstream_business_approval": false
+  },
+  "tests": {
+    "targeted_original_profit_review_export_history": {
+      "passed": 68
+    },
+    "core_contract": {
+      "passed": 22
+    },
+    "http_and_file_store": {
+      "passed": 3
+    },
+    "manual_screening_browser": {
+      "passed": true,
+      "total_candidates": 944,
+      "automatic_rule_reference": 128,
+      "visible": 795,
+      "manual_approved": 2,
+      "all_excel": 944,
+      "approved_excel": 2,
+      "optional_json": 2,
+      "filtered_visible_zero_keeps_approved_two": true,
+      "missing_and_low_profit_retained": true,
+      "no_automatic_cards": true,
+      "no_automatic_exports": true,
+      "review_statuses_unchanged": true,
+      "repeat_export_stable": true,
+      "platform_requests": 0
+    },
+    "previous_handoff_browser": {
+      "passed": true,
+      "manual_review_clicks": 2,
+      "handoff_clicks": 3,
+      "read_only_controls": 9
+    },
+    "independent_version_browser": {
+      "passed": true,
+      "manual_review_clicks": 3,
+      "save_before_unlock": true,
+      "rollback_on_save_failure": true,
+      "flat_history": true,
+      "original_init_and_import": true
+    },
+    "review_scroll": {
+      "passed": true,
+      "before": 4296,
+      "after": 4296,
+      "manual_approval": true,
+      "filter_removal": true,
+      "background_refresh": true,
+      "rapid_reopen": true
+    }
+  },
+  "backup_directory": "D:\\deliverables\\amazon-product-finder-agent\\backups\\DIR-20260909-A03-predeploy"
+}

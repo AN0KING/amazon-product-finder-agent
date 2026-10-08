@@ -1,0 +1,701 @@
+{
+  "synthetic": true,
+  "schema_version": "1.0",
+  "formula_contract": {
+    "formula_version": "profit-workbook-au-weight-only-fba-v8",
+    "fee_model_version": "au-user-workbook-weight-only-v1;us-sop-2023-weight-v1",
+    "implementation": "lib/profit-model.mjs#calculateProductProfit",
+    "representation": "declarative_data_only",
+    "input_policy": "Use explicit product inputs. Do not apply consumer defaults or execute uploaded formula text.",
+    "inputs": {
+      "salePrice": {
+        "unit": "marketplace_currency/sellable_unit",
+        "positive": true
+      },
+      "purchaseCostCny": {
+        "unit": "CNY/sellable_unit",
+        "non_negative": true,
+        "note": "Already piece-adjusted; do not multiply units_per_set again."
+      },
+      "fulfillmentFee": {
+        "unit": "marketplace_currency/sellable_unit",
+        "non_negative": true
+      },
+      "fulfillmentMode": {
+        "values": [
+          "FBA",
+          "FBM"
+        ]
+      },
+      "exchangeRate": {
+        "unit": "CNY/1 marketplace_currency",
+        "positive": true
+      },
+      "actualWeightKg": {
+        "unit": "kg/sellable_unit",
+        "positive": true
+      },
+      "dimensionsCm": {
+        "unit": "cm",
+        "nullable": true
+      },
+      "cartonWeightKg": {
+        "unit": "kg/carton",
+        "nullable": true
+      },
+      "unitsPerCarton": {
+        "unit": "sellable_units/carton",
+        "nullable": true
+      },
+      "airFreightActualWeightOnly": {
+        "unit": "boolean"
+      },
+      "volumetricDivisor": {
+        "unit": "cubic_inches/pound",
+        "positive": true
+      },
+      "commissionRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "fxLossRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "marketingRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "managementRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "returnsRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "purchaseTaxRate": {
+        "unit": "percent",
+        "non_negative": true
+      },
+      "domesticFreightRateCnyPerKg": {
+        "unit": "CNY/kg",
+        "non_negative": true
+      },
+      "airFreightRateCnyPerKg": {
+        "unit": "CNY/kg",
+        "non_negative": true
+      }
+    },
+    "equations": [
+      {
+        "output": "purchaseTaxCny",
+        "expression": "purchaseCostCny * purchaseTaxRate / 100"
+      },
+      {
+        "output": "domesticFreightCny",
+        "expression": "actualWeightKg * domesticFreightRateCnyPerKg"
+      },
+      {
+        "output": "landedPurchaseCny",
+        "expression": "purchaseCostCny + purchaseTaxCny + domesticFreightCny"
+      },
+      {
+        "output": "parts.purchase",
+        "expression": "landedPurchaseCny / exchangeRate"
+      },
+      {
+        "output": "dimensionalWeightKg",
+        "expression": "product(dimensionsCm / 2.54) / volumetricDivisor / 2.2046226218",
+        "condition": "actual-weight-only is false and dimensions exist"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "actualWeightKg",
+        "condition": "airFreightActualWeightOnly is true"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "cartonWeightKg / unitsPerCarton",
+        "condition": "actual-weight-only is false and both carton inputs are positive"
+      },
+      {
+        "output": "chargeableWeightKg",
+        "expression": "max(actualWeightKg, dimensionalWeightKg)",
+        "condition": "actual-weight-only is false and carton inputs are incomplete; ignore absent dimensions"
+      },
+      {
+        "output": "parts.freight",
+        "expression": "chargeableWeightKg * airFreightRateCnyPerKg / exchangeRate"
+      },
+      {
+        "output": "parts.commission",
+        "expression": "salePrice * commissionRate / 100"
+      },
+      {
+        "output": "parts.fxLoss",
+        "expression": "salePrice * fxLossRate / 100"
+      },
+      {
+        "output": "parts.marketing",
+        "expression": "salePrice * marketingRate / 100"
+      },
+      {
+        "output": "parts.management",
+        "expression": "salePrice * managementRate / 100"
+      },
+      {
+        "output": "parts.returns",
+        "expression": "salePrice * returnsRate / 100"
+      },
+      {
+        "output": "parts.fulfillment",
+        "expression": "fulfillmentFee",
+        "note": "Charge FBA or FBM once; parts.fba and parts.fbm are aliases, not extra fees."
+      },
+      {
+        "output": "totalCost",
+        "expression": "parts.purchase + parts.commission + parts.fulfillment + parts.freight + parts.fxLoss + parts.marketing + parts.management + parts.returns"
+      },
+      {
+        "output": "profit",
+        "expression": "salePrice - totalCost"
+      },
+      {
+        "output": "margin",
+        "expression": "profit / salePrice * 100"
+      }
+    ],
+    "margin_denominator": "salePrice",
+    "result_units": {
+      "profit": "marketplace_currency/sellable_unit",
+      "totalCost": "marketplace_currency/sellable_unit",
+      "margin": "percent",
+      "parts": "marketplace_currency/sellable_unit",
+      "cny_suffix_fields": "CNY/sellable_unit"
+    },
+    "rounding": {
+      "calculation": "IEEE-754 binary64; no intermediate or final rounding in calculateProductProfit",
+      "display": "2 decimal places for money and percentage; exported result keeps precision",
+      "upstream": "Keep already-resolved salePrice and piece-adjusted purchaseCostCny; do not derive again",
+      "comparison_absolute_tolerance": 1e-9
+    },
+    "au_fba": {
+      "currency": "AUD",
+      "source": "用户《澳洲FBA运费.xlsx》Sheet1 A2:D8",
+      "weight_unit": "g",
+      "billable_weight_rule": "max(1, ceil(actualWeightKg * 1000 - 1e-9))",
+      "selection": "First matching workbook row; smallest available envelope by weight only",
+      "dimensions_policy": "User-selected weight proxy; no automatic dimension tier",
+      "price_condition": null,
+      "rows": [
+        {
+          "envelopeSizePolicy": "small",
+          "tierLabel": "小号信封",
+          "maxDimensionsCm": [
+            20,
+            15,
+            1
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 75,
+          "weightBand": "0-75g",
+          "fee": 3.64,
+          "sourceRange": "Sheet1!A2:D2",
+          "sourceCell": "Sheet1!D2"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 75,
+          "weightBand": "0-75g",
+          "fee": 3.67,
+          "sourceRange": "Sheet1!A3:D3",
+          "sourceCell": "Sheet1!D3"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 76,
+          "maxWeightG": 225,
+          "weightBand": "76-225g",
+          "fee": 4.35,
+          "sourceRange": "Sheet1!A4:D4",
+          "sourceCell": "Sheet1!D4"
+        },
+        {
+          "envelopeSizePolicy": "standard",
+          "tierLabel": "标准信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            2.5
+          ],
+          "minWeightG": 226,
+          "maxWeightG": 475,
+          "weightBand": "226-475g",
+          "fee": 4.7,
+          "sourceRange": "Sheet1!A5:D5",
+          "sourceCell": "Sheet1!D5"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 0,
+          "maxWeightG": 225,
+          "weightBand": "0-225g",
+          "fee": 5.87,
+          "sourceRange": "Sheet1!A6:D6",
+          "sourceCell": "Sheet1!D6"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 226,
+          "maxWeightG": 475,
+          "weightBand": "226-475g",
+          "fee": 6.11,
+          "sourceRange": "Sheet1!A7:D7",
+          "sourceCell": "Sheet1!D7"
+        },
+        {
+          "envelopeSizePolicy": "large",
+          "tierLabel": "大号信封",
+          "maxDimensionsCm": [
+            33,
+            23,
+            5
+          ],
+          "minWeightG": 476,
+          "maxWeightG": 975,
+          "weightBand": "476-975g",
+          "fee": 6.33,
+          "sourceRange": "Sheet1!A8:D8",
+          "sourceCell": "Sheet1!D8"
+        }
+      ],
+      "out_of_range": "null; manual fee required",
+      "manual_override": "Preserve explicit fulfillmentFee"
+    },
+    "ownership": {
+      "stage": "preliminary",
+      "detailed_profit_owner": "procurement",
+      "manufacturer_cost_confirmed": false,
+      "supplier_cost_changes_return_to_analysis": false
+    }
+  },
+  "cases": [
+    {
+      "name": "AU 120g workbook FBA / 2 units per set",
+      "input": {
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 4.35,
+        "exchangeRate": 4.8,
+        "actualWeightKg": 0.12,
+        "dimensionsCm": null,
+        "cartonWeightKg": null,
+        "unitsPerCarton": null,
+        "airFreightActualWeightOnly": true,
+        "volumetricDivisor": 139,
+        "commissionRate": 15,
+        "fxLossRate": 1.5,
+        "marketingRate": 10,
+        "managementRate": 6,
+        "returnsRate": 10,
+        "purchaseTaxRate": 4,
+        "domesticFreightRateCnyPerKg": 5,
+        "airFreightRateCnyPerKg": 60
+      },
+      "units_per_set": 2,
+      "reference_unit_cost_cny": 3,
+      "output": {
+        "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "exchangeRate": 4.8,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 4.35,
+        "rates": {
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 4,
+          "domesticFreightRateCnyPerKg": 5,
+          "airFreightRateCnyPerKg": 60
+        },
+        "airFreight": {
+          "actualWeightKg": 0.12,
+          "volumetricWeightKg": null,
+          "dimensionalWeightLb": null,
+          "chargeableWeightKg": 0.12,
+          "airFreightCny": 7.199999999999999,
+          "airFreightRateCnyPerKg": 60,
+          "airFreightRateCnyPerGram": 0.06,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "source": "product_weight",
+          "confidence": "standard"
+        },
+        "parts": {
+          "purchaseBase": 1.25,
+          "purchaseTax": 0.05,
+          "domesticFreight": 0.125,
+          "purchase": 1.425,
+          "commission": 2.9984999999999995,
+          "fulfillment": 4.35,
+          "fba": 4.35,
+          "fbm": 0,
+          "freight": 1.5,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999
+        },
+        "purchaseBaseAud": 1.25,
+        "purchaseTaxAud": 0.05,
+        "domesticFreightAud": 0.125,
+        "purchaseAud": 1.425,
+        "purchaseTaxCny": 0.24,
+        "domesticFreightCny": 0.6,
+        "domesticFreightWeightKg": 0.12,
+        "domesticFreightMinCny": 0.24,
+        "domesticFreightMaxCny": 0.6,
+        "landedPurchaseCny": 6.84,
+        "commission": 2.9984999999999995,
+        "fulfillment": 4.35,
+        "fba": 4.35,
+        "fbm": 0,
+        "freightCost": 1.5,
+        "freight": 1.5,
+        "fxLoss": 0.29984999999999995,
+        "marketing": 1.9989999999999999,
+        "management": 1.1993999999999998,
+        "returns": 1.9989999999999999,
+        "totalCost": 15.770749999999998,
+        "profit": 4.219250000000001,
+        "margin": 21.106803401700855
+      },
+      "displayed": {
+        "fulfillment_cny": 20.88,
+        "profit_cny": 20.25
+      }
+    },
+    {
+      "name": "AU manual FBA override preserved",
+      "input": {
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 6.2,
+        "exchangeRate": 4.8,
+        "actualWeightKg": 0.12,
+        "dimensionsCm": null,
+        "cartonWeightKg": null,
+        "unitsPerCarton": null,
+        "airFreightActualWeightOnly": true,
+        "volumetricDivisor": 139,
+        "commissionRate": 15,
+        "fxLossRate": 1.5,
+        "marketingRate": 10,
+        "managementRate": 6,
+        "returnsRate": 10,
+        "purchaseTaxRate": 4,
+        "domesticFreightRateCnyPerKg": 5,
+        "airFreightRateCnyPerKg": 60
+      },
+      "manual_fba_override": true,
+      "output": {
+        "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "exchangeRate": 4.8,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 6.2,
+        "rates": {
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 4,
+          "domesticFreightRateCnyPerKg": 5,
+          "airFreightRateCnyPerKg": 60
+        },
+        "airFreight": {
+          "actualWeightKg": 0.12,
+          "volumetricWeightKg": null,
+          "dimensionalWeightLb": null,
+          "chargeableWeightKg": 0.12,
+          "airFreightCny": 7.199999999999999,
+          "airFreightRateCnyPerKg": 60,
+          "airFreightRateCnyPerGram": 0.06,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "source": "product_weight",
+          "confidence": "standard"
+        },
+        "parts": {
+          "purchaseBase": 1.25,
+          "purchaseTax": 0.05,
+          "domesticFreight": 0.125,
+          "purchase": 1.425,
+          "commission": 2.9984999999999995,
+          "fulfillment": 6.2,
+          "fba": 6.2,
+          "fbm": 0,
+          "freight": 1.5,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999
+        },
+        "purchaseBaseAud": 1.25,
+        "purchaseTaxAud": 0.05,
+        "domesticFreightAud": 0.125,
+        "purchaseAud": 1.425,
+        "purchaseTaxCny": 0.24,
+        "domesticFreightCny": 0.6,
+        "domesticFreightWeightKg": 0.12,
+        "domesticFreightMinCny": 0.24,
+        "domesticFreightMaxCny": 0.6,
+        "landedPurchaseCny": 6.84,
+        "commission": 2.9984999999999995,
+        "fulfillment": 6.2,
+        "fba": 6.2,
+        "fbm": 0,
+        "freightCost": 1.5,
+        "freight": 1.5,
+        "fxLoss": 0.29984999999999995,
+        "marketing": 1.9989999999999999,
+        "management": 1.1993999999999998,
+        "returns": 1.9989999999999999,
+        "totalCost": 17.620749999999997,
+        "profit": 2.369250000000001,
+        "margin": 11.852176088044027
+      },
+      "displayed": {
+        "fulfillment_cny": 29.76,
+        "profit_cny": 11.37
+      }
+    },
+    {
+      "name": "AU FBM fulfillment fee charged once",
+      "input": {
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "fulfillmentMode": "FBM",
+        "fulfillmentFee": 5.25,
+        "exchangeRate": 4.8,
+        "actualWeightKg": 0.12,
+        "dimensionsCm": null,
+        "cartonWeightKg": null,
+        "unitsPerCarton": null,
+        "airFreightActualWeightOnly": true,
+        "volumetricDivisor": 139,
+        "commissionRate": 15,
+        "fxLossRate": 1.5,
+        "marketingRate": 10,
+        "managementRate": 6,
+        "returnsRate": 10,
+        "purchaseTaxRate": 4,
+        "domesticFreightRateCnyPerKg": 5,
+        "airFreightRateCnyPerKg": 60
+      },
+      "output": {
+        "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "exchangeRate": 4.8,
+        "fulfillmentMode": "FBM",
+        "fulfillmentFee": 5.25,
+        "rates": {
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 4,
+          "domesticFreightRateCnyPerKg": 5,
+          "airFreightRateCnyPerKg": 60
+        },
+        "airFreight": {
+          "actualWeightKg": 0.12,
+          "volumetricWeightKg": null,
+          "dimensionalWeightLb": null,
+          "chargeableWeightKg": 0.12,
+          "airFreightCny": 7.199999999999999,
+          "airFreightRateCnyPerKg": 60,
+          "airFreightRateCnyPerGram": 0.06,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "source": "product_weight",
+          "confidence": "standard"
+        },
+        "parts": {
+          "purchaseBase": 1.25,
+          "purchaseTax": 0.05,
+          "domesticFreight": 0.125,
+          "purchase": 1.425,
+          "commission": 2.9984999999999995,
+          "fulfillment": 5.25,
+          "fba": 0,
+          "fbm": 5.25,
+          "freight": 1.5,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999
+        },
+        "purchaseBaseAud": 1.25,
+        "purchaseTaxAud": 0.05,
+        "domesticFreightAud": 0.125,
+        "purchaseAud": 1.425,
+        "purchaseTaxCny": 0.24,
+        "domesticFreightCny": 0.6,
+        "domesticFreightWeightKg": 0.12,
+        "domesticFreightMinCny": 0.24,
+        "domesticFreightMaxCny": 0.6,
+        "landedPurchaseCny": 6.84,
+        "commission": 2.9984999999999995,
+        "fulfillment": 5.25,
+        "fba": 0,
+        "fbm": 5.25,
+        "freightCost": 1.5,
+        "freight": 1.5,
+        "fxLoss": 0.29984999999999995,
+        "marketing": 1.9989999999999999,
+        "management": 1.1993999999999998,
+        "returns": 1.9989999999999999,
+        "totalCost": 16.670749999999998,
+        "profit": 3.3192500000000003,
+        "margin": 16.604552276138072
+      },
+      "displayed": {
+        "fulfillment_cny": 25.2,
+        "profit_cny": 15.93
+      }
+    },
+    {
+      "name": "Explicit zero purchase tax and manual freight rates",
+      "input": {
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 4.35,
+        "exchangeRate": 4.8,
+        "actualWeightKg": 0.12,
+        "dimensionsCm": null,
+        "cartonWeightKg": null,
+        "unitsPerCarton": null,
+        "airFreightActualWeightOnly": true,
+        "volumetricDivisor": 139,
+        "commissionRate": 15,
+        "fxLossRate": 1.5,
+        "marketingRate": 10,
+        "managementRate": 6,
+        "returnsRate": 10,
+        "purchaseTaxRate": 0,
+        "domesticFreightRateCnyPerKg": 3.4,
+        "airFreightRateCnyPerKg": 52
+      },
+      "output": {
+        "formulaVersion": "profit-workbook-au-weight-only-fba-v8",
+        "salePrice": 19.99,
+        "purchaseCostCny": 6,
+        "exchangeRate": 4.8,
+        "fulfillmentMode": "FBA",
+        "fulfillmentFee": 4.35,
+        "rates": {
+          "commissionRate": 15,
+          "fxLossRate": 1.5,
+          "marketingRate": 10,
+          "managementRate": 6,
+          "returnsRate": 10,
+          "purchaseTaxRate": 0,
+          "domesticFreightRateCnyPerKg": 3.4,
+          "airFreightRateCnyPerKg": 52
+        },
+        "airFreight": {
+          "actualWeightKg": 0.12,
+          "volumetricWeightKg": null,
+          "dimensionalWeightLb": null,
+          "chargeableWeightKg": 0.12,
+          "airFreightCny": 6.24,
+          "airFreightRateCnyPerKg": 52,
+          "airFreightRateCnyPerGram": 0.052,
+          "cartonWeightKg": null,
+          "unitsPerCarton": null,
+          "source": "product_weight",
+          "confidence": "standard"
+        },
+        "parts": {
+          "purchaseBase": 1.25,
+          "purchaseTax": 0,
+          "domesticFreight": 0.08499999999999999,
+          "purchase": 1.3350000000000002,
+          "commission": 2.9984999999999995,
+          "fulfillment": 4.35,
+          "fba": 4.35,
+          "fbm": 0,
+          "freight": 1.3,
+          "fxLoss": 0.29984999999999995,
+          "marketing": 1.9989999999999999,
+          "management": 1.1993999999999998,
+          "returns": 1.9989999999999999
+        },
+        "purchaseBaseAud": 1.25,
+        "purchaseTaxAud": 0,
+        "domesticFreightAud": 0.08499999999999999,
+        "purchaseAud": 1.3350000000000002,
+        "purchaseTaxCny": 0,
+        "domesticFreightCny": 0.408,
+        "domesticFreightWeightKg": 0.12,
+        "domesticFreightMinCny": 0.24,
+        "domesticFreightMaxCny": 0.6,
+        "landedPurchaseCny": 6.408,
+        "commission": 2.9984999999999995,
+        "fulfillment": 4.35,
+        "fba": 4.35,
+        "fbm": 0,
+        "freightCost": 1.3,
+        "freight": 1.3,
+        "fxLoss": 0.29984999999999995,
+        "marketing": 1.9989999999999999,
+        "management": 1.1993999999999998,
+        "returns": 1.9989999999999999,
+        "totalCost": 15.480749999999999,
+        "profit": 4.50925,
+        "margin": 22.55752876438219
+      },
+      "displayed": {
+        "fulfillment_cny": 20.88,
+        "profit_cny": 21.64
+      }
+    }
+  ]
+}
