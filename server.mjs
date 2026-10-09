@@ -76,7 +76,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.42";
+const APP_VERSION = "0.9.43";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -658,7 +658,11 @@ function enforceLocalRequest(request) {
     throw new HttpError(403, "INVALID_ORIGIN", "The Origin header is not allowed.");
   }
   const fetchSite = request.headers["sec-fetch-site"];
-  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+  // GET/HEAD are read-only and responses carry no CORS headers, so cross-site
+  // reads cannot leak data. State-changing methods (POST etc.) stay guarded by
+  // the exact-Origin rule above, so only reject cross-site non-safe methods.
+  const isSafeMethod = request.method === "GET" || request.method === "HEAD";
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none" && !isSafeMethod) {
     throw new HttpError(403, "CROSS_SITE_REQUEST", "Cross-site requests are not allowed.");
   }
 }
