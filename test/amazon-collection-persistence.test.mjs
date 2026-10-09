@@ -240,3 +240,91 @@ test("retained successful raw results still expose the latest failed collection 
   assert.equal(recovered.collectionLastAttempt, undefined);
   assert.equal(recovered.currentPriceStatus, "verified");
 });
+
+test("supplierSearchAudit is compacted on save: rejected detail is reduced to counts, scalar fields survive", async () => {
+  const runId = "audit-compaction";
+  const bulkyRejected = Array.from({ length: 71 }, (_, i) => ({
+    rank: i + 1,
+    supplierId: `b2b-supplier-${i}`,
+    offerId: `offer-${i}`,
+    name: `供应商 ${i}`,
+    url: `https://detail.1688.com/offer/${i}.html`,
+    candidateImageUrl: `https://cbu01.alicdn.com/img/${i}.jpg`,
+    unitPriceCny: 1 + i * 0.01,
+    moq: 100,
+    unit: "件",
+    imageSimilarityScore: 0.3 + i * 0.001,
+    imageSimilarityDecision: "below_threshold",
+    imageSimilarityComponents: { perceptualHash: 0.9, differenceHash: 0.1 },
+    excludedReason: i % 2 ? "image_similarity_below_threshold" : "outside_top_6_fallback",
+  }));
+  const bulkyAccepted = Array.from({ length: 6 }, (_, i) => ({
+    rank: i + 1,
+    supplierId: `accepted-${i}`,
+    offerId: `aoffer-${i}`,
+    unitPriceCny: 5 + i,
+    imageSimilarityScore: 0.8,
+    imageSimilarityComponents: { perceptualHash: 0.95, differenceHash: 0.05 },
+  }));
+  const store = new PersistenceStore({ directory: path.join(temporaryRoot, runId) });
+  await store.ready();
+  await store.saveSnapshot({
+    runState: { id: runId, marketplace: "CA", currency: "CAD", amazonDomain: "www.amazon.ca", mode: "live", analysisSourceMode: "amazon_only" },
+    products: [product({
+      supplierSearchAudit: {
+        target: { moq: 100, unit: "件" },
+        rawCandidateCount: 40,
+        similarity: { threshold: 0.5, evaluatedCount: 40 },
+        accepted: bulkyAccepted,
+        rejected: bulkyRejected,
+        groups: { primary: 6 },
+        selectionMode: "fallback_estimate",
+        costConfidence: "low",
+        procurementTaskId: "task-1",
+        procurementTaskStatus: "complete",
+        procurementTaskReused: false,
+        searchAttempts: 1,
+        searchStrategyVersion: "v1",
+        sharedContext: false,
+        onlineAuthRequired: false,
+      },
+    })],
+  });
+  const saved = await store.getRunSnapshot(runId);
+  const audit = saved.products[0].supplierSearchAudit;
+  // 标量摘要字段原样保留。
+  assert.deepEqual(audit.target, { moq: 100, unit: "件" });
+  assert.equal(audit.rawCandidateCount, 40);
+  assert.equal(audit.selectionMode, "fallback_estimate");
+  assert.equal(audit.costConfidence, "low");
+  assert.equal(audit.procurementTaskId, "task-1");
+  assert.deepEqual(audit.similarity, { threshold: 0.5, evaluatedCount: 40 });
+  assert.deepEqual(audit.groups, { primary: 6 });
+  // rejected 被压缩为计数摘要，不再保留完整报价明细。
+  assert.equal(audit.rejected.summary, true);
+  assert.equal(audit.rejected.count, 71);
+  assert.deepEqual(audit.rejected.reasons, {
+    outside_top_6_fallback: 36,
+    image_similarity_below_threshold: 35,
+  });
+  assert.ok(!Array.isArray(audit.rejected) || audit.rejected.summary === true);
+  // accepted 被精简为三元组，不含 imageSimilarityComponents。
+  assert.equal(audit.accepted.length, 6);
+  assert.deepEqual(audit.accepted[0], { supplierId: "accepted-0", offerId: "aoffer-0", rank: 1, unitPriceCny: 5 });
+  assert.equal("imageSimilarityComponents" in audit.accepted[0], false);
+  // 落盘文件体积应远小于未裁剪前的 ~100KB 量级。
+  const rawFile = await readFile(store.runPath(runId), "utf8");
+  assert.ok(rawFile.length < 200_000, `run file ${rawFile.length} bytes should be well under 200KB`);
+});
+
+test("products without supplierSearchAudit pass through compaction unchanged", async () => {
+  const runId = "audit-compaction-null";
+  const store = new PersistenceStore({ directory: path.join(temporaryRoot, runId) });
+  await store.ready();
+  await store.saveSnapshot({
+    runState: { id: runId, marketplace: "CA", currency: "CAD", amazonDomain: "www.amazon.ca", mode: "live", analysisSourceMode: "amazon_only" },
+    products: [product({ supplierSearchAudit: null })],
+  });
+  const saved = await store.getRunSnapshot(runId);
+  assert.equal(saved.products[0].supplierSearchAudit, null);
+});
