@@ -9254,83 +9254,50 @@ import {
 
   function createSpreadsheetExportPayload(rows, exportMarket, worksheetName = "运营确认表") {
     const headers = [
-      "任务 ID", "批次 ID", "商品 ID", "任务模式", "站点", "Marketplace ID", "币种", `汇率 (CNY/${exportMarket.currency})`, "Amazon 数据来源", "Amazon 店铺来源站点", "SellerSprite 分析站点", "Provider 模式", "数据口径", "1688 数据来源", "输入店铺数", "访问成功店铺数", "发现源 ASIN 数", "访问失败店铺数", "SellerSprite 分析失败店铺数", "扫描达到上限店铺数", "初审状态", "竞品图片", "图片嵌入状态", "竞品图片链接", "源 ASIN", "父 ASIN", "SellerSprite 详情状态", "SellerSprite 详情失败原因", "SellerSprite 查竞品状态", "SellerSprite 查竞品失败原因", "商品名称", "英文标题", "Amazon 标题识别件数", "生效采购件数", "件数来源", "件数识别依据", "件数规则版本", "1688 找厂任务 ID", "Seller ID", "店铺", "来源店铺数", "来源店铺", `Amazon ${exportMarket.code} 链接`,
-      `竞品当前售价 (${exportMarket.currency})`, "竞品当前售价 (CNY)", `我们的售价 (${exportMarket.currency})`, "我们的售价 (CNY)", "竞品 30 天销量", "竞品 60 天销量", `竞品 30 天销售额 (${exportMarket.currency})`, "竞品 30 天销售额 (CNY)", "销量更新日期", "评分", "评价数", "A+ 页面",
-      "首次 FBA 有货", "SellerSprite 上架日期", "Amazon 字段来源", "数据采集时间",
-      "图片相似度门槛（严格大于 %）", "图片判定运算符", "图片相似度方法", "图片相似度算法版本", "图片已评估数", "图片达标厂家数", "标准达标厂家数", "图片匹配规则版本",
-      "目标采购成本 (CNY)", "盈利线 (CNY)", "标准达标报价数", "纳入均价报价数", "1688 成本估算模式", "1688 匹配置信度", "1688 单件估算均价 (CNY)", "采购成本公式", "达到85%成本线", "粗算利润率 (%)", "1688 报价明细", "整套采购成本 (CNY)", "采购税率 (%)", "采购税费 (CNY)", "国内运费费率 (CNY/kg)", "国内运费计费重量 (kg)", "国内运费参考下限 (CNY)", "国内运费参考上限 (CNY)", "国内运费/件 (CNY)", "落地采购成本 (CNY)",
-      "履约方式", "履约方式来源", `FBA 配送费 (${exportMarket.currency})`, "FBA 配送费 (CNY)", `FBM 履约费 (${exportMarket.currency})`, "FBM 履约费 (CNY)", `计入履约费 (${exportMarket.currency})`, "计入履约费 (CNY)", "履约费来源", "FBA 计算方式", "FBA 计费重量 (lb，仅美国 SOP)", "FBA 计算依据",
-      "商品重量 (kg)", "FBA 包装重量 (kg)", "FBA 计费输入 (kg)", "重量来源",
+      "任务 ID", "商品 ID", "竞品图片", "源 ASIN", "父 ASIN", "商品名称", "英文标题", "Amazon 标题识别件数", "生效采购件数",
+      `竞品当前售价 (${exportMarket.currency})`, "竞品当前售价 (CNY)", `我们的售价 (${exportMarket.currency})`, "我们的售价 (CNY)",
+      "评分", "评价数", "竞品 30 天销量", "竞品 60 天销量",
+      "商品重量 (kg)", "FBA 包装重量 (kg)", "FBA 计费输入 (kg)",
+      "整套采购成本 (CNY)", "采购税率 (%)", "采购税费 (CNY)", "国内运费费率 (CNY/kg)", "国内运费计费重量 (kg)", "国内运费参考下限 (CNY)", "国内运费参考上限 (CNY)", "国内运费/件 (CNY)", "落地采购成本 (CNY)",
+      "履约方式", `FBA 配送费 (${exportMarket.currency})`, "FBA 配送费 (CNY)", `FBM 履约费 (${exportMarket.currency})`, "FBM 履约费 (CNY)", `计入履约费 (${exportMarket.currency})`, "计入履约费 (CNY)",
       "利润实际重 (kg)", "体积重 (kg)", "空运计费重 (kg)", "外箱重量 (kg)", "装箱数", "空运单价 (CNY/kg)", "单件空运头程 (CNY)",
-      "Amazon 佣金率 (%)", "汇损率 (%)", "营销费率 (%)", "管理费率 (%)", "退货预留率 (%)", "利润公式版本", "头程参数来源", "头程置信度",
-      `预估总成本 (${exportMarket.currency})`, "预估总成本 (CNY)", `预估单件利润 (${exportMarket.currency})`, "预估单件利润 (CNY)", "预估经营利润率 (%)", "利润分析必需数据完整", "利润分析必需缺失字段", "未采集 / 缺失原因（导出专用）", "计算口径",
+      "Amazon 佣金率 (%)", "汇损率 (%)", "营销费率 (%)", "管理费率 (%)", "退货预留率 (%)",
+      `预估总成本 (${exportMarket.currency})`, "预估总成本 (CNY)", `预估单件利润 (${exportMarket.currency})`, "预估单件利润 (CNY)", "预估经营利润率 (%)", "利润分析必需数据完整", "利润分析必需缺失字段",
+      "数据采集时间",
     ];
     const dataRows = rows.map((product) => {
       const purchasePricing = ensureProductPurchasePricing(product);
       const calculation = calculateProfit(product);
       const profitInputs = ensureProductProfitInputs(product);
-      const coverage = runState.coverage || {};
       ensureFulfillmentState(product);
       const isFbm = product.fulfillmentMode === "FBM";
       const isFba = product.fulfillmentMode === "FBA";
-      const productMarket = MARKET_CONFIGS[product.marketplace] || exportMarket;
-      const isAuProduct = productMarket.code === "AU";
       const activeFee = getFulfillmentFee(product);
-      const exportImageUrl = safeAmazonImageUrl(product.imageUrl);
-      const supplierDescription = isManualCostProduct(product)
-        ? product.suppliers?.length ? `1688 报价已保留；人工单件采购价 × ${purchasePricing.pieceCount} 件` : `人工单件采购价 × ${purchasePricing.pieceCount} 件`
-        : product.supplierSearchStatus === "complete"
-          ? `1688 图片匹配；中间6家单件均价 × ${purchasePricing.pieceCount} 件`
-          : isLowConfidenceSupplierEstimate(product)
-            ? `1688 图片相似度最高6家；低置信度单件均价 × ${purchasePricing.pieceCount} 件`
-            : product.supplierSearchError || "1688 未启动";
       return [
-        exportTaskIdForProduct(product), runState.id || "", product.id || "", dataModeLabel(runState), exportMarket.code, runState.marketplaceId || exportMarket.marketplaceId, exportMarket.currency, profitInputs.exchangeRate,
-        product.dataSource || analysisSourceLabel(product), product.sourceMarketplace || exportMarket.code, product.providerMarketplace || exportMarket.code,
-        product.providerMode || "direct", analysisSourceLabel(product), supplierDescription,
-        coverage.requested ?? "", coverage.queried ?? "", coverage.discoveredAsins ?? "", coverage.visitFailed ?? "", coverage.failed ?? "", coverage.truncatedStores ?? "",
-        REVIEW_LABELS[product.reviewStatus], "", exportImageUrl ? "待嵌入" : product.imageUrl ? "图片地址不受信任" : "无图片链接", exportImageUrl,
-        product.sourceAsin || product.asin, product.parentAsin || "", product.detailStatus || "unknown", sellerSpriteDetailFailureLabel(product) || "",
-        product.competitorLookupStatus || "not_requested", product.competitorLookupStatus === "success" ? "" : sellerSpriteCompetitorLookupLabel(product),
-        product.name, product.englishName, product.detectedPieceCount ?? 1, purchasePricing.pieceCount, pieceCountExportSource(product), product.pieceCountEvidence || "", product.pieceCountRuleVersion || TITLE_PIECE_COUNT_RULE_VERSION,
-        validProcurementTaskId(product.supplierProcurementTaskId) || "", product.sellerId, visibleStoreName(product.storeName),
-        Math.max(1, product.sourceStores?.length || 0), formatSourceStores(product),
-        `https://${product.amazonDomain || exportMarket.amazonDomain}/dp/${product.asin}`,
+        exportTaskIdForProduct(product), product.id || "", "",
+        product.sourceAsin || product.asin, product.parentAsin || "",
+        product.name, product.englishName, product.detectedPieceCount ?? 1, purchasePricing.pieceCount,
         product.currentPrice, convertCurrencyToCny(product.currentPrice, exportMarket) ?? "",
         product.salePrice, convertCurrencyToCny(product.salePrice, exportMarket) ?? "",
-        product.sales30 ?? "", product.sales60 ?? "", product.salesAmount30 ?? "", convertCurrencyToCny(product.salesAmount30, exportMarket) ?? "", product.sales30UpdatedAt || "",
-        product.rating, product.reviews, typeof product.hasAPlus === "boolean" ? (product.hasAPlus ? "有" : "无") : "未获取", product.firstFba || "",
-        product.listingAvailableAt || "", JSON.stringify(product.fieldSources || {}), product.collectedAt,
-        MIN_IMAGE_SIMILARITY_SCORE * 100, product.supplierSimilarity?.operator || IMAGE_SIMILARITY_OPERATOR,
-        product.supplierSimilarity?.method || "未核验", product.supplierSimilarity?.version || "未核验",
-        product.supplierSimilarity?.evaluatedCount ?? 0, product.supplierSimilarity?.imageQualifiedCount ?? 0,
-        product.supplierSimilarity?.qualifiedCount ?? 0,
-        product.supplierRuleVersion || "未核验",
-        product.targetCostCny ?? "", product.thresholdCostCny ?? "", product.suppliers?.filter(isSupplierMatchQualified).length ?? 0, product.suppliers?.filter((supplier) => supplier.included).length ?? 0,
-        product.supplierCostMode === SUPPLIER_COST_MODE_VERIFIED ? "标准10家去极值" : product.supplierCostMode === SUPPLIER_COST_MODE_FALLBACK ? "图片相似度最高6家（低置信度）" : "未形成自动成本",
-        product.supplierCostConfidence === "high" ? "高" : product.supplierCostConfidence === "low" ? "低" : "未核验",
-        product.supplierAverageCny ?? "", Number.isFinite(purchasePricing.unitCostCny) ? `${purchasePricing.unitCostCny} × ${purchasePricing.pieceCount} = ${purchasePricing.totalCostCny}` : "", typeof product.supplierProfitable === "boolean" ? (product.supplierProfitable ? "是" : "否") : "未计算", Number.isFinite(product.roughMargin) ? roundMoney(product.roughMargin) : "", JSON.stringify(supplierImageAuditForExport(product)),
+        product.rating, product.reviews, product.sales30 ?? "", product.sales60 ?? "",
+        product.productWeight ?? "", product.fbaWeight ?? "", product.billingWeight ?? "",
         product.purchaseCost ?? "", profitInputs.purchaseTaxRate,
         calculation ? roundMoney(calculation.purchaseTaxCny) : "", profitInputs.domesticFreightRateCnyPerKg,
         calculation?.domesticFreightWeightKg ?? "", calculation ? roundMoney(calculation.domesticFreightMinCny) : "",
         calculation ? roundMoney(calculation.domesticFreightMaxCny) : "", calculation ? roundMoney(calculation.domesticFreightCny) : "",
         calculation ? roundMoney(calculation.landedPurchaseCny) : "",
-        product.fulfillmentMode || "未获取", fulfillmentModeSourceLabel(product),
+        product.fulfillmentMode || "未获取",
         isFba ? product.fbaFee ?? "" : "", isFba ? convertCurrencyToCny(product.fbaFee, exportMarket) ?? "" : "",
         isFbm ? product.fbmFee ?? "" : "", isFbm ? convertCurrencyToCny(product.fbmFee, exportMarket) ?? "" : "",
-        activeFee ?? "", convertCurrencyToCny(activeFee, exportMarket) ?? "", fulfillmentFeeSource(product),
-        isFba ? product.fbaEstimate?.tierLabel || "" : "不适用",
-        isFba && !isAuProduct && Number.isFinite(product.fbaEstimate?.billableWeightLb) ? product.fbaEstimate.billableWeightLb : isFba ? "" : "不适用",
-        isFba ? product.fbaEstimate ? (isAuProduct ? `${product.fbaEstimate.priceBandLabel} · ${product.fbaEstimate.billableWeightG}g · ${product.fbaEstimate.rateApplicability}` : `${product.fbaEstimate.confidence} · 仅按${product.fbaEstimate.weightSource}`) : "" : "不适用",
-        product.productWeight ?? "", product.fbaWeight ?? "", product.billingWeight ?? "", product.weightSource,
+        activeFee ?? "", convertCurrencyToCny(activeFee, exportMarket) ?? "",
         profitInputs.actualWeightKg ?? "", calculation?.airFreight?.volumetricWeightKg ?? "", calculation?.airFreight?.chargeableWeightKg ?? "",
         profitInputs.cartonWeightKg ?? "", profitInputs.unitsPerCarton ?? "", profitInputs.airFreightRateCnyPerKg,
         calculation?.airFreight?.airFreightCny ?? "", profitInputs.commissionRate, profitInputs.fxLossRate, profitInputs.marketingRate,
-        profitInputs.managementRate, profitInputs.returnsRate, profitInputs.formulaVersion, calculation?.airFreight?.source || "未计算", calculation?.airFreight?.confidence || "未计算",
+        profitInputs.managementRate, profitInputs.returnsRate,
         calculation ? roundMoney(calculation.totalCost) : "", calculation ? convertCurrencyToCny(calculation.totalCost, exportMarket) : "",
         calculation ? roundMoney(calculation.profit) : "", calculation ? convertCurrencyToCny(calculation.profit, exportMarket) : "", calculation ? roundMoney(calculation.margin) : "",
-        product.complete ? "是" : "否", product.missing.join("、"), exportMissingFields(product).join("；"),
-        `${profitPolicyLabel(exportMarket)}；${calculation?.purchaseCostAssumedZero ? "预估利润率（未扣采购成本）；" : ""}${supplierDescription}；${fulfillmentPolicyDetail(product)}`,
+        product.complete ? "是" : "否", product.missing.join("、"),
+        product.collectedAt,
       ];
     });
     return {
@@ -9338,7 +9305,6 @@ import {
       headers,
       rows: dataRows,
       imageColumnIndex: headers.indexOf("竞品图片"),
-      imageStatusColumnIndex: headers.indexOf("图片嵌入状态"),
       images: rows.map((product) => ({
         url: safeAmazonImageUrl(product.imageUrl),
         alt: String(product.name || product.englishName || product.sourceAsin || product.asin || "竞品图片"),

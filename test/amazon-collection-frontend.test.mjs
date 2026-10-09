@@ -472,7 +472,6 @@ test("zero-cost estimates filter immediately, keep exported cost blank and canno
   assert.match(element("drawerProfitValue").innerHTML, /预估利润率（未扣采购成本）/);
   const exported = app.spreadsheet([product]);
   assert.equal(exported.rows[0][exported.headers.indexOf("整套采购成本 (CNY)")], "");
-  assert.ok(exported.rows[0].some((value) => typeof value === "string" && value.includes("预估利润率（未扣采购成本）")));
 });
 
 test("missing Amazon fields no longer show the removed cart or delivery-region price labels", () => {
