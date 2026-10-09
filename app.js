@@ -2274,7 +2274,8 @@ import {
     if (byId("useSellerSpriteToggle")) byId("useSellerSpriteToggle").checked = useSellerSprite;
     if (byId("monthlySalesBand")) {
       const restoredMonthlySalesBand = criteria.monthlySalesBand;
-      byId("monthlySalesBand").value = ["all", "under_50", "50_to_100", "100_plus"].includes(restoredMonthlySalesBand)
+      // 亚马逊准则 2026-10-09：月销量 50 以下档位已移除（50 以下产品不再采集）。
+      byId("monthlySalesBand").value = ["all", "50_to_100", "100_plus"].includes(restoredMonthlySalesBand)
         ? restoredMonthlySalesBand
         : "all";
       activeRunCriteria.monthlySalesBand = byId("monthlySalesBand").value;
@@ -2952,7 +2953,7 @@ import {
     if (numericValues.some((value) => !Number.isFinite(value) || value < 0)) {
       return "筛选条件只能填写不小于 0 的数字。";
     }
-    if (!["all", "under_50", "50_to_100", "100_plus"].includes(criteria.monthlySalesBand)) return "Amazon 月销量档位无效。";
+    if (!["all", "50_to_100", "100_plus"].includes(criteria.monthlySalesBand)) return "Amazon 月销量档位无效。";
     if (criteria.minRating !== null && criteria.minRating > 5) {
       return "最低评价星级不能超过 5。";
     }
@@ -5975,6 +5976,15 @@ import {
       resultPage += 1;
       renderResults();
     });
+    // 表格结尾的翻页控件（与顶部翻页共用同一页码状态）。
+    byId("previousResultsPageBottom")?.addEventListener("click", () => {
+      resultPage = Math.max(1, resultPage - 1);
+      renderResults();
+    });
+    byId("nextResultsPageBottom")?.addEventListener("click", () => {
+      resultPage += 1;
+      renderResults();
+    });
 
     byId("refreshResultsButton")?.addEventListener("click", () => {
       renderResults();
@@ -6137,13 +6147,13 @@ import {
     const monthlySalesBand = criteria.monthlySalesBand || "all";
     const monthlySales = finiteOrNull(product?.sales30);
     // 亚马逊准则 2026-09-29：未采集到月销量的一律按"月销量 50 以下"处理（详情仍在采集中的除外，等待真实销量）。
+    // 亚马逊准则 2026-10-09：50 以下档位已移除——月销量 50 以下（无销量角标）的竞品在采集源头即被排除。
     const effectiveMonthlySales = monthlySales !== null && monthlySales >= 0
       ? monthlySales
       : detailPending
         ? null
         : 0;
     if (effectiveMonthlySales !== null) {
-      if (monthlySalesBand === "under_50" && effectiveMonthlySales >= 50) reasons.push("MONTHLY_SALES_AT_OR_ABOVE_50");
       if (monthlySalesBand === "50_to_100" && !(effectiveMonthlySales >= 50 && effectiveMonthlySales < 100)) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
       if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
     }
@@ -6283,7 +6293,8 @@ import {
 
   function currentFilterExclusionReasons() {
     const labels = {
-      MONTHLY_SALES_AT_OR_ABOVE_50: "Amazon 月销量不在 50 以下（未采集销量的按 50 以下处理）",
+      MONTHLY_SALES_AT_OR_ABOVE_50: "Amazon 月销量不在 50 以下（旧档位，已停用）",
+      MONTHLY_SALES_BELOW_50: "Amazon 月销量未达 50（未显示销量标识的按 50 以下处理）",
       MONTHLY_SALES_OUTSIDE_50_TO_100: "Amazon 月销量不在 50–<100",
       MONTHLY_SALES_BELOW_100: "Amazon 月销量低于 100",
       RATING_BELOW_MINIMUM: "评价星级低于筛选值或缺失",
@@ -6426,6 +6437,17 @@ import {
     );
     if (byId("previousResultsPage")) byId("previousResultsPage").disabled = resultPage <= 1;
     if (byId("nextResultsPage")) byId("nextResultsPage").disabled = resultPage >= pageCount;
+    // 表格结尾翻页控件与顶部保持同步。
+    const paginationBottom = byId("resultsPaginationBottom");
+    if (paginationBottom) paginationBottom.hidden = currentVisibleProducts.length <= RESULTS_PAGE_SIZE;
+    setText(
+      "resultsPageSummaryBottom",
+      currentVisibleProducts.length
+        ? `第 ${resultPage} / ${pageCount} 页 · ${formatInteger(pageStart + 1)}–${formatInteger(pageStart + pageProducts.length)} 条`
+        : "第 1 / 1 页",
+    );
+    if (byId("previousResultsPageBottom")) byId("previousResultsPageBottom").disabled = resultPage <= 1;
+    if (byId("nextResultsPageBottom")) byId("nextResultsPageBottom").disabled = resultPage >= pageCount;
     const empty = byId("emptyResults");
     const emptyAction = byId("resetResultFilters");
     const completeOnlyEnabled = byId("resultsCompleteToggle")?.checked ?? false;
@@ -6451,7 +6473,7 @@ import {
       hiddenIncomplete
         ? "这些商品已有大致数据，可手工补齐成本并初审；导出文件会明确标记完整度和缺失字段。"
         : hiddenByCriteria
-          ? "月销量、评价数量或星级未达当前条件（未采集销量的按月销量 50 以下处理）；具体原因见上方覆盖说明，ASIN 不会被删除。"
+          ? "月销量、评价数量或星级未达当前条件（未显示月销量标识的按月销量 50 以下处理，不再采集分析）；具体原因见上方覆盖说明，ASIN 不会被删除。"
         : "调整筛选条件后重新查看。",
     );
     if (emptyAction) {
@@ -7716,7 +7738,7 @@ import {
       ["售价核验状态", amazonPriceStatusLabel(product) || null],
       ["我们的售价", moneyMetric(product.salePrice, product.manualSalePrice ? "人工覆盖" : "竞品售价 × 0.9")],
       ["Amazon 标题件数", product.pieceCountSource === "default" ? null : `${product.pieceCount} 件 · ${pieceCountSourceLabel(product)}`],
-      ["竞品 30 天销量", Number.isFinite(product.sales30) ? `${formatInteger(product.sales30)}${product.sales30Evidence?.kind === "lower_bound" ? "+" : ""} pcs${amazonOnly ? " · Amazon 购买量提示" : ""}` : amazonOnly ? `${auditedMissing("sales30")} · 筛选按月销量 50 以下处理` : null],
+      ["竞品 30 天销量", Number.isFinite(product.sales30) ? `${formatInteger(product.sales30)}${product.sales30Evidence?.kind === "lower_bound" ? "+" : ""} pcs${product.sales30Evidence?.source === "amazon_store_card" ? " · 店铺首页角标" : amazonOnly ? " · Amazon 购买量提示" : ""}` : amazonOnly ? `${auditedMissing("sales30")} · 未显示销量标识（按 50 以下处理）` : null],
       ["竞品 60 天销量", Number.isFinite(product.sales60) ? `${formatInteger(product.sales60)} pcs` : null],
       ["竞品 30 天销售额", moneyMetric(product.salesAmount30, amazonOnly ? "数据来源见字段核验" : "SellerSprite 最近 30 天口径") || (amazonOnly ? `${auditedMissing("salesAmount30")}（准确销售额）` : null)],
       ["销量更新日期", product.sales30UpdatedAt || null],

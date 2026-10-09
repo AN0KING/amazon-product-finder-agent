@@ -375,8 +375,7 @@
                   <i data-lucide="chart-no-axes-column-increasing" aria-hidden="true"></i>
                   <span>Amazon 月销量</span>
                   <select class="filter-select" id="monthlySalesBand" aria-label="Amazon 页面月销量档位">
-                    <option value="all">全部月销量</option>
-                    <option value="under_50">小于 50</option>
+                    <option value="all">全部月销量（仅 50+，月销量 50 以下已不采集）</option>
                     <option value="50_to_100">50+（50–&lt;100）</option>
                     <option value="100_plus">100+（≥100）</option>
                   </select>
@@ -504,6 +503,18 @@
                 <button class="text-button" type="button" id="resetResultFilters"><i data-lucide="rotate-ccw" aria-hidden="true"></i>重置筛选</button>
               </div>
             </div>
+
+            <nav class="results-pagination" id="resultsPaginationBottom" aria-label="候选商品分页（表格结尾）" hidden>
+              <span id="resultsPageSummaryBottom">第 1 / 1 页</span>
+              <div>
+                <button class="icon-button" type="button" id="previousResultsPageBottom" aria-label="上一页" title="上一页">
+                  <i data-lucide="chevron-left" aria-hidden="true"></i>
+                </button>
+                <button class="icon-button" type="button" id="nextResultsPageBottom" aria-label="下一页" title="下一页">
+                  <i data-lucide="chevron-right" aria-hidden="true"></i>
+                </button>
+              </div>
+            </nav>
           </section>
 
           <section class="view-panel" data-view="history" aria-labelledby="historyTitle">

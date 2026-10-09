@@ -320,14 +320,15 @@ test("all 1200 image candidates remain matchable without prices, weights or succ
 test("the matching selection follows every current result filter across the entire filtered list", () => {
   const { app, element } = harness();
   app.restore(snapshot(job("paused"), []));
-  const base = { detailStatus: "success", productWeight: 0.12, billingWeight: 0.12, complete: true, margin: 35, sales30: 40, rating: 4.7, reviews: 30 };
+  // 亚马逊准则 2026-10-09：under_50 档位已移除，档位筛选使用 50_to_100 / 100_plus。
+  const base = { detailStatus: "success", productWeight: 0.12, billingWeight: 0.12, complete: true, margin: 35, sales30: 60, rating: 4.7, reviews: 30 };
   app.setProducts([
     imageCandidate(1, base), imageCandidate(2, { ...base, name: "Red image product", englishName: "Red image product" }),
     imageCandidate(3, { ...base, productWeight: 0.3, billingWeight: 0.3 }), imageCandidate(4, { ...base, complete: false }),
     imageCandidate(5, { ...base, margin: 10 }), imageCandidate(6, { ...base, rating: 3.8 }),
     imageCandidate(7, { ...base, sales30: 140 }), imageCandidate(8, { ...base, reviews: 2 }),
   ]);
-  app.view(null, 5, { minRating: 4.5, minReviews: 20, monthlySalesBand: "under_50" });
+  app.view(null, 5, { minRating: 4.5, minReviews: 20, monthlySalesBand: "50_to_100" });
   element("resultSearch").value = "blue";
   element("resultWeightBand").value = "100_150";
   element("resultsCompleteToggle").checked = true;
