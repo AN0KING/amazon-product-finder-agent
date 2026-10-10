@@ -1,0 +1,242 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-10",
+  "sourceFileCount": 47,
+  "files": [
+    {
+      "path": "1688-procurement-assistant-2.3.0/README.md",
+      "bytes": 3590,
+      "sha256": "a793a4e57d36c58f9302bb1fb158c8c028071983003fe6661ab3109540419538"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/lib/image-search-rate-policy.mjs",
+      "bytes": 7659,
+      "sha256": "7facac7106f37aaac68c8c0c927d37bdff17a05d71b3c8bdedc619b485f8ffee"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/package.json",
+      "bytes": 389,
+      "sha256": "89fa78430043427c423355c6137c127b6ee515a61787600ea06e04d6a5248273"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/scripts/1688-console-launcher.mjs",
+      "bytes": 3169,
+      "sha256": "edbcac7e2650fd31b3fce318fb6fe5143dd2a83f2d6ed3ecebb0e9bee473b210"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/server.mjs",
+      "bytes": 44456,
+      "sha256": "62d96d0cd6d37f089f0216356dbe6a5f97156f6d11d31abde941f5f59bab723b"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/test/bridge-queue.test.mjs",
+      "bytes": 16919,
+      "sha256": "750c28003459c090a5be730c92440016bcd2cf2ed69a80b6d47ad3df7edf1f4a"
+    },
+    {
+      "path": "1688-procurement-assistant-2.3.0/test/image-search-rate-policy.test.mjs",
+      "bytes": 8011,
+      "sha256": "f6f8f40c2255ea4773f51a5fca8571a82bfa8f1103a99cbbe2841b8be96b594c"
+    },
+    {
+      "path": "1688-image-finder/README.md",
+      "bytes": 3906,
+      "sha256": "fb393c398e12e7ea552a3b1daef23c9758b641cfccd9b670477384356516c7f2"
+    },
+    {
+      "path": "1688-image-finder/dist/auth/cookies.js",
+      "bytes": 1242,
+      "sha256": "a014a7dc06ad0d8a8181c85fa5f2bfae980fdd9f95e5c8a542cb48a8c2af0a7d"
+    },
+    {
+      "path": "1688-image-finder/dist/auth/verify.js",
+      "bytes": 2464,
+      "sha256": "0b9a761e1388d5d50a67e42819929bfa64e4acd6bceb2ed2fd4f81fc14408302"
+    },
+    {
+      "path": "1688-image-finder/dist/cli.js",
+      "bytes": 4238,
+      "sha256": "0a5092c6854d19dd0cb024b943c08453543b8ef064239aa788953500e77774fb"
+    },
+    {
+      "path": "1688-image-finder/dist/commands/image-search.js",
+      "bytes": 24935,
+      "sha256": "3e2753f9f8e245e6ab8934d125485349946ddeb0a73bc0c861796079a793dfdf"
+    },
+    {
+      "path": "1688-image-finder/dist/commands/login.js",
+      "bytes": 42316,
+      "sha256": "81b0e3afb18cebe5f231f124062fe7b9fb74d9bc04d2e96a3710bf93b9b1b58a"
+    },
+    {
+      "path": "1688-image-finder/dist/io/errors.js",
+      "bytes": 400,
+      "sha256": "228f71f9aa4ff36c52f8c7f9c16e15d06e9d834e74711f52c906b0f43a117b41"
+    },
+    {
+      "path": "1688-image-finder/dist/io/output.js",
+      "bytes": 5748,
+      "sha256": "1dabf70b65ab4a93b90f77cc0c5ef1a5d0d9bcebd5ceb04d10298446a86f8888"
+    },
+    {
+      "path": "1688-image-finder/dist/io/prompt.js",
+      "bytes": 441,
+      "sha256": "cb212b5b487ac45e6e90d0d001bb00a5061497442545161144cb5ef198e9a1d2"
+    },
+    {
+      "path": "1688-image-finder/dist/procurement/contact-message.js",
+      "bytes": 1993,
+      "sha256": "797c7eeac2848c8bbc7435328587fbe0d21bbdcb62a86261fd7e3bb212d43d52"
+    },
+    {
+      "path": "1688-image-finder/dist/procurement/store.js",
+      "bytes": 135272,
+      "sha256": "45592197c4b658613df201b9f1c5189b2d0363c1e80760f21701ccd539ca2da0"
+    },
+    {
+      "path": "1688-image-finder/dist/procurement/types.js",
+      "bytes": 967,
+      "sha256": "6809e9ef734867d6722b28402f6bbdff04dbf7e46f182a6c44a5fa2fe59127a4"
+    },
+    {
+      "path": "1688-image-finder/dist/session/artifacts.js",
+      "bytes": 7156,
+      "sha256": "ea2a97eb0dd625401a6ff0b039098850f612c4c5c4c41b9220d413ea04a00250"
+    },
+    {
+      "path": "1688-image-finder/dist/session/context.js",
+      "bytes": 4356,
+      "sha256": "1f1ee3c324c790f214df90fe84b47b173e88c0962dea26ee127a56cc6443afaa"
+    },
+    {
+      "path": "1688-image-finder/dist/session/cookie-store.js",
+      "bytes": 3707,
+      "sha256": "5866ad9444b09ed4e9226dbda09e055fb2f14d5d77f01216c36e3630e88d36b6"
+    },
+    {
+      "path": "1688-image-finder/dist/session/dispatch.js",
+      "bytes": 2046,
+      "sha256": "322cebebfe6140f63472015b58dde475a573a604ab65a4a0d6b33b7365b9158a"
+    },
+    {
+      "path": "1688-image-finder/dist/session/events.js",
+      "bytes": 4671,
+      "sha256": "c0781f633cc2413bdb1b2613f3ce6e1e5452e8cc6c8a5635e2c87cb92cc9850f"
+    },
+    {
+      "path": "1688-image-finder/dist/session/image-search-locators.js",
+      "bytes": 2407,
+      "sha256": "db9c85dd5bc147ca0e62b28b2b04830f8ce9ee6847f2593ca464e05bc1a40735"
+    },
+    {
+      "path": "1688-image-finder/dist/session/locator.js",
+      "bytes": 3338,
+      "sha256": "ee7f5fd4e5d9aa9213ec048f51311cd13e39d7d6265f660cef83ce5a29af1c5d"
+    },
+    {
+      "path": "1688-image-finder/dist/session/lock.js",
+      "bytes": 1096,
+      "sha256": "13f948a98ce27db4c543c3c37ecc729e0ddb61ceadc02c70142e3bcf939664cc"
+    },
+    {
+      "path": "1688-image-finder/dist/session/mtop.js",
+      "bytes": 262,
+      "sha256": "a9ae4c664b291f237a390a837bcf48c2d2187e7db7246886eb762cf64c7af7ef"
+    },
+    {
+      "path": "1688-image-finder/dist/session/native-edge.js",
+      "bytes": 69434,
+      "sha256": "38ad36355c31c22d7b9a2ae0a006e9dfac7533770eac1831ece27973b7b92e77"
+    },
+    {
+      "path": "1688-image-finder/dist/session/page-state.js",
+      "bytes": 3033,
+      "sha256": "d371572f2dee45193c73919d92e3d0f49e62e3940f3dbf03bb5996b34c1ec87a"
+    },
+    {
+      "path": "1688-image-finder/dist/session/paths.js",
+      "bytes": 6720,
+      "sha256": "f41f74780d56def3f23db406b10e4f6c97767f194a5fd05bd2b1e65e26d9a62d"
+    },
+    {
+      "path": "1688-image-finder/dist/session/recovery.js",
+      "bytes": 16448,
+      "sha256": "781cfc70a909352f872408e946c8b37888d02c1f28e6318221abcf5b71a49ba2"
+    },
+    {
+      "path": "1688-image-finder/dist/session/response-capture.js",
+      "bytes": 4135,
+      "sha256": "73b8d26d673dedb7d382d7ed7f99c8c88b7450b3540571c1bb3a6bef9513fff1"
+    },
+    {
+      "path": "1688-image-finder/dist/session/search-capture.js",
+      "bytes": 10165,
+      "sha256": "30c33a35b67786f773d7a8badb85b4eed2c3235987bb796535940d9dd2e56ac3"
+    },
+    {
+      "path": "1688-image-finder/dist/session/search-locators.js",
+      "bytes": 631,
+      "sha256": "ba1053cec19fa0dd4fff65a9c499d6268254ebd5ca002e42f41cb3302307597a"
+    },
+    {
+      "path": "1688-image-finder/dist/session/search-mtop.js",
+      "bytes": 8190,
+      "sha256": "0843b98e0426b79bdcacb613ffd3d7d4628ce1c8d1bf8286f56faca351c09a81"
+    },
+    {
+      "path": "1688-image-finder/dist/session/shared.js",
+      "bytes": 6030,
+      "sha256": "90711b756f1e9fc60107a0bee818a91ee24e2d1b97536f9b1e46b6437c38bf08"
+    },
+    {
+      "path": "1688-image-finder/dist/session/state.js",
+      "bytes": 872,
+      "sha256": "a046b8f7c34acbb98941cab8ba9ae8cbf0cc4ceb08de6e68d92b0740fd8afafd"
+    },
+    {
+      "path": "1688-image-finder/dist/session/wait.js",
+      "bytes": 1532,
+      "sha256": "364fc4aef6a2fb4c652cad90dc85ac343c6edfeb0d3fa603c2e944f296b442f7"
+    },
+    {
+      "path": "1688-image-finder/dist/util/encoding.js",
+      "bytes": 285,
+      "sha256": "76b11d1b32a2d86b9632663ae9c904f076afa8999a12f21ed8c7027c009f6f71"
+    },
+    {
+      "path": "1688-image-finder/dist/util/temp.js",
+      "bytes": 176,
+      "sha256": "c035238d2e156ac2d04dcba69e27e23946caf924febc65ca2e8b175d1f7fe840"
+    },
+    {
+      "path": "1688-image-finder/dist/util/time.js",
+      "bytes": 485,
+      "sha256": "f4f33d0a8e193559cb4a00068a7321412bd1545acaf88110779a819b4da30805"
+    },
+    {
+      "path": "1688-image-finder/package-lock.json",
+      "bytes": 33556,
+      "sha256": "3d90c92d4145e5e6787fb55d65fb36da73f1e8a12b5d83f7489412b8b896a50b"
+    },
+    {
+      "path": "1688-image-finder/package.json",
+      "bytes": 723,
+      "sha256": "f323a6b61af21a7f8f125c0639d13bd7361a7e704467a06cfcec5233142d0830"
+    },
+    {
+      "path": "1688-image-finder/test/image-search-single-submit.test.mjs",
+      "bytes": 16403,
+      "sha256": "5fe7c7ea2ee63cf6a759cbef57f0807a6653dd2d6c07d22b38007a9f5cc0e243"
+    },
+    {
+      "path": "1688-image-finder/test/login-managed-image-verification.test.mjs",
+      "bytes": 32510,
+      "sha256": "2fc06cb3ccf6bb1c0e0c619c8473764656ce6351e71811c2ab75e58e5dcbeb26"
+    },
+    {
+      "path": "1688-image-finder/test/native-edge-launch.test.mjs",
+      "bytes": 6303,
+      "sha256": "54f3e859d20314ce60063af7e4d50c40cc034f3c14e5b2c77ed5a40e68b03df5"
+    }
+  ]
+}

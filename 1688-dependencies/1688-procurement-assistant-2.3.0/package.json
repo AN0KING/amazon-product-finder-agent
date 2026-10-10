@@ -1,0 +1,11 @@
+{
+  "name": "1688-procurement-assistant",
+  "version": "2.3.0",
+  "private": true,
+  "type": "module",
+  "description": "1688 采购助手桥接服务：兼容店铺分析 Agent 的本机集成协议（integrationProtocol 8 / loginBrokerProtocol 5），浏览器会话复用 1688-image-finder 的专用 Edge。",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
