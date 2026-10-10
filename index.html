@@ -88,7 +88,7 @@
               </button>
             </div>
           </div>
-          <p id="sidebarVersion" data-market-version>NL v0.9.39 · 单次任务</p>
+          <p id="sidebarVersion" data-market-version>NL v0.9.48 · 单次任务</p>
         </div>
       </aside>
 
@@ -375,7 +375,7 @@
                   <i data-lucide="chart-no-axes-column-increasing" aria-hidden="true"></i>
                   <span>Amazon 月销量</span>
                   <select class="filter-select" id="monthlySalesBand" aria-label="Amazon 页面月销量档位">
-                    <option value="all">全部月销量（仅 50+，月销量 50 以下已不采集）</option>
+                    <option value="all">全部合格月销量（须明确标识 50+）</option>
                     <option value="50_to_100">50+（50–&lt;100）</option>
                     <option value="100_plus">100+（≥100）</option>
                   </select>
@@ -578,8 +578,8 @@
 
           <section class="detail-tab-panel" id="profitPanel" role="tabpanel" aria-labelledby="profitTab" aria-hidden="true" data-detail-panel="profit">
             <div class="profit-editor">
-              <label class="currency-input-field"><span>我们的售价（竞品 × 0.9）</span><span class="input-with-unit"><input id="editSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="editSalePriceCny" /><b id="salePriceCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editSalePriceCny" for="editSalePrice">人民币 --</output></label>
-              <label><span>1688 单件采购均价</span><span class="input-with-unit"><input id="editPurchaseCost" type="number" min="0" step="0.01" /><b>CNY</b></span></label>
+              <label class="currency-input-field"><span>我们的售价（与竞品相同）</span><span class="input-with-unit"><input id="editSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="editSalePriceCny" /><b id="salePriceCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editSalePriceCny" for="editSalePrice">人民币 --</output></label>
+              <label><span>1688 单件采购均价</span><span class="input-with-unit"><input id="editPurchaseCost" type="number" min="0" step="0.01" aria-describedby="editPurchaseCostSource" /><b>CNY</b></span><small class="piece-count-source" id="editPurchaseCostSource">默认使用 1688 单件采购均价；修改后使用人工单价。</small></label>
               <label><span>Amazon 标题件数</span><span class="input-with-unit"><input id="editPieceCount" type="number" min="1" max="10000" step="1" inputmode="numeric" aria-describedby="editPieceCountSource" /><b>件</b></span><small class="piece-count-source" id="editPieceCountSource"></small></label>
               <label><span>整套采购成本</span><span class="input-with-unit is-readonly"><input id="editPurchaseTotal" type="number" step="0.01" readonly aria-readonly="true" /><b>CNY</b></span></label>
               <label class="currency-input-field"><span>FBA 配送费</span><span class="input-with-unit"><input id="editFbaFee" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="editFbaFeeCny" /><b id="fbaFeeCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editFbaFeeCny" for="editFbaFee">人民币 --</output></label>
@@ -699,7 +699,7 @@
 
           <div class="manual-cost-fields">
             <label class="manual-cost-field">
-              <span>我们的售价（竞品 × 0.9）</span>
+              <span>我们的售价（与竞品相同）</span>
               <span class="manual-cost-input is-readonly">
                 <input id="manualCostSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="manualCostSalePriceCny" />
                 <b id="manualCostSalePriceCurrency" data-market-currency>EUR</b>
@@ -709,9 +709,10 @@
             <label class="manual-cost-field">
               <span>1688 单件采购价</span>
               <span class="manual-cost-input">
-                <input id="manualPurchaseCost" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" required />
+                <input id="manualPurchaseCost" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" aria-describedby="manualPurchaseCostSource" />
                 <b>CNY</b>
               </span>
+              <small class="manual-field-source" id="manualPurchaseCostSource">默认使用 1688 单件采购均价；修改后使用人工单价。</small>
             </label>
             <label class="manual-cost-field">
               <span>Amazon 标题件数</span>
@@ -869,7 +870,7 @@
           <li>Amazon 指标：仅调用 Codex 中已配置 SellerSprite MCP 的“ASIN 详情”；密钥只由本地服务读取。</li>
           <li>店铺流程：Agent 访问 Amazon 店铺并枚举全部源 ASIN，再逐个交给 SellerSprite 分析；父 ASIN 只作为关联字段，不合并删除源 ASIN。</li>
           <li>数据模式：实时、混合估算与模拟演示始终在顶栏和商品详情中标记。</li>
-          <li>我们的售价：<span data-sale-price-policy>竞品当前售价 EUR × 0.9</span>；产品人员单品覆盖后，以人工售价重算。</li>
+          <li>我们的售价：<span data-sale-price-policy>与竞品当前售价 EUR 相同</span>；产品人员单品覆盖后，以人工售价重算。</li>
           <li>目标采购成本：<span data-target-cost-policy>我们的售价 EUR × 当地币种兑 CNY 汇率 ÷ 5</span>。</li>
           <li>FBA 费用：<span id="fbaScopeNote" data-fba-policy>临时使用美国旧标准计算，费表数值按 EUR 名义套用，产品人员可手工修改。</span></li>
           <li>经营利润：按每个商品的尺寸、重量、头程与费率独立核算，数据来源和置信度随结果保存。</li>

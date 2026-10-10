@@ -74,7 +74,7 @@ async function mockedSession(t, { body = html(), failFirstProduct = false } = {}
 }
 
 async function analyze(loader) {
-  return analyzeAmazonDiscoveredAsins([{ asins: [asin], sourceStore: { storeIndex: 0 }, visit: { complete: true } }],
+  return analyzeAmazonDiscoveredAsins([{ asins: [asin], salesByAsin: { [asin]: { sales30: 100, rawText: "100+ bought in past month" } }, sourceStore: { storeIndex: 0 }, visit: { complete: true } }],
     { runId: "single-visit", marketplace: "AU", detailAsins: [asin] }, "2026-09-24T06:00:00.000Z", undefined,
     { detailLoader: loader });
 }

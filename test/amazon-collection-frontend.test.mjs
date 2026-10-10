@@ -1,3 +1,4 @@
+import * as salesPolicy from "../lib/amazon-sales-policy.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -19,6 +20,7 @@ const canonicalProduct = () => ({
   id: productId, asin: "B000000001", sourceAsin: "B000000001", marketplace: "AU", sourceMarketplace: "AU", analysisSourceMode: "amazon_only",
   detailStatus: "success", detailParserVersion: 5, currentPrice: 9.99, currentPriceStatus: "verified", manualSalePrice: true, salePrice: 18,
   name: "Canonical manual title", englishName: "Canonical manual title", sellerId: "EXAMPLESELLER", rating: 4.5, reviews: 33,
+  sales30: 100, sales30Evidence: { source: "amazon_product_page", period: "past_month", kind: "lower_bound", value: 100, rawText: "100+ bought in past month", asin: "B000000001" },
   productWeight: 0.1, billingWeight: 0.1, imageUrl: "https://m.media-amazon.com/images/I/example.jpg",
   manualPurchaseCost: true, purchaseCost: 6, purchaseUnitCostCny: 3, pieceCount: 2, pieceCountSource: "manual",
   manualFbaFee: true, fbaFee: 2, fulfillmentMode: "FBA", fulfillmentModeSource: "manual",
@@ -34,6 +36,8 @@ function imageCandidate(index = 1, overrides = {}) {
     detailStatus: "pending", manualPurchaseCost: false, purchaseCost: null, purchaseUnitCostCny: null, suppliers: [], supplierSearchStatus: "not_started",
     manualFbaFee: false, fbaFee: null, manualAmazonFields: {}, pieceCount: 1,
     profitInputs: { ...profitModel.DEFAULT_PROFIT_RATES, formulaVersion: profitModel.PROFIT_FORMULA_VERSION, exchangeRate: 4.8, actualWeightKg: null },
+    sales30: overrides.sales30 ?? 100,
+    sales30Evidence: { source: "amazon_store_card", period: "past_month", kind: "lower_bound", value: overrides.sales30 ?? 100, rawText: `${overrides.sales30 ?? 100}+ bought in past month`, asin },
     ...overrides,
   };
 }
@@ -57,7 +61,7 @@ function harness() {
   const calls = [], timers = [], toasts = [], events = [];
   let respond = async (path) => { throw new Error(`Unexpected API request: ${path}`); };
   const context = vm.createContext({
-    ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
     document: { body: element("body"), addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
     window: { crypto: { randomUUID: () => "new-synthetic-run" }, setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {},
       setInterval(callback, ms) { timers.push({ callback, ms, interval: true }); return timers.length; }, clearInterval() {}, confirm: () => true,
@@ -89,6 +93,9 @@ function harness() {
       spreadsheet: (items) => createSpreadsheetExportPayload(items, activeMarket),
       fetchLegacy: () => fetchProductCandidates(storeList.stores, runState.criteria, new AbortController().signal, () => {}),
       mutate: () => { approveActiveProduct(); rejectActiveProduct(); rematchActiveProduct(); saveManualCost(); commitProfitEdits(false); exportProducts(); exportAnalysisHandoff(); },
+      approve: approveActiveProduct, saveEditor: commitProfitEdits, mapCandidate: mapCandidateProduct, mergeCandidates: mergeAnalyzedCandidateProducts,
+      editor: getEditorValues, preview: renderProfitPreview, manualPreview: renderManualCostPreview,
+      openManual: openManualCostDialog, approveManual: () => saveManualCost({ approve: true }), saveManualDraft: () => saveManualCost({ allowIncomplete: true }),
       filtered: getFilteredProducts, matching: getAmazonFilteredProductsFor1688, pending: getPending1688ResumeProducts,
       startMatching: startFiltered1688Matching, renderSupplier: renderSupplier1688Stage,
       batch: (items) => run1688ImageSearchBatch(items, new AbortController().signal),
@@ -454,7 +461,7 @@ test("restoring a legitimate manual zero cost preserves the user's explicit inpu
   assert.equal(restored.profitPendingReasons.includes("采购成本"), false);
 });
 
-test("zero-cost estimates filter immediately, keep exported cost blank and cannot approve without actual cost", () => {
+test("zero-cost estimates keep exported cost blank and allow initial review before matching", () => {
   const { app, element } = harness();
   app.restore(snapshot(job("paused"), [imageCandidate(1, {
     detailStatus: "success", currentPrice: 30, currentPriceStatus: "verified",
@@ -468,7 +475,7 @@ test("zero-cost estimates filter immediately, keep exported cost blank and canno
   assert.equal(app.filtered().length, 0);
   app.openLocalDrawer(product.id);
   assert.equal(element("editPurchaseCost").value, "");
-  assert.equal(element("approveProductButton").disabled, true);
+  assert.equal(element("approveProductButton").disabled, false);
   assert.match(element("drawerProfitValue").innerHTML, /预估利润率（未扣采购成本）/);
   const exported = app.spreadsheet([product]);
   assert.equal(exported.rows[0][exported.headers.indexOf("整套采购成本 (CNY)")], "");
@@ -630,57 +637,78 @@ test("a stale supplier-batch checkpoint terminates before any image search", asy
   assert.equal(calls.some((call) => call.path === "/api/1688/image-search"), false);
 });
 
-test("re-scoping to the current filter discards the server-owned batch before saving a new one", async () => {
-  const fixture = harness();
-  const { app, calls, toasts } = fixture;
-  const first = imageCandidate(1, { supplierSearchStatus: "pending" });
-  const second = imageCandidate(2);
-  const oldPipeline = { owner: "server", status: "paused", productIds: [first.id], selectedCount: 1, matchableCount: 1, revision: 5 };
-  const paused = { ...job("paused", 2), causeCode: "SUPPLIER_MATCHING" };
-  const base = snapshot(job("paused", 2), [first, second]);
-  base.runState.supplier1688Pipeline = oldPipeline;
-  app.restore(structuredClone(base));
-  app.view(null, 1, {});
-  app.setSupplierLoggedIn(true);
-  let saved = structuredClone(base);
-  fixture.respond(async (path, options) => {
-    if (path === "/api/amazon/collection") return paused;
-    if (path === "/api/amazon/collection/control") {
-      const action = JSON.parse(options.body).action;
-      if (action === "resume_after_supplier") return job("queued", 3);
-      assert.equal(action, "pause_for_supplier");
-      return paused;
-    }
-    if (path === "/api/1688/pipeline/control") {
-      const body = JSON.parse(options.body);
-      if (body.action === "discard") {
-        assert.equal(body.runId, runId);
-        saved = structuredClone(base);
-        delete saved.runState.supplier1688Pipeline;
-        return null;
+for (const oldStatus of ['paused', 'complete']) {
+  test(`current filters append to the same ${oldStatus} task and preserve earlier records`, async () => {
+    const fixture = harness();
+    const { app, calls } = fixture;
+    const first = imageCandidate(1, oldStatus === 'complete' ? { supplierSearchStatus: 'manual_cost', manualPurchaseCost: true, purchaseCost: 8, purchaseUnitCostCny: 8 } : { supplierSearchStatus: 'pending' });
+    const second = imageCandidate(2);
+    const oldPipeline = { owner: 'server', status: oldStatus, productIds: [first.id], selectedCount: 1, matchableCount: 1, revision: 263, selectionId: 'original-selection', tasks: { [first.id]: { taskId: 'task_original', status: oldStatus === 'complete' ? 'complete' : 'pending', attempts: 1 } } };
+    const current = job('completed', 139);
+    const base = snapshot(current, [first, second]);
+    base.runState.supplier1688Pipeline = oldPipeline;
+    let saved = structuredClone(base);
+    app.restore(structuredClone(base)); app.view(null, 1, {}); app.setSupplierLoggedIn(true);
+    fixture.respond(async (path, options) => {
+      if (path === '/api/amazon/collection') return current;
+      if (path === '/api/amazon/collection/control') { assert.equal(JSON.parse(options.body).action, 'pause_for_supplier'); return current; }
+      if (path === `/api/runs/${runId}`) return structuredClone(saved);
+      if (path === '/api/runs') {
+        const incoming = JSON.parse(options.body);
+        assert.equal(incoming.runState.supplier1688Pipeline.revision, 263, 'the page may save the original snapshot, never replace the cohort');
+        saved = { ...incoming, amazonCollection: saved.amazonCollection };
+        return { runs: [] };
       }
-      assert.equal(body.action, "resume");
-      const pipeline = { ...saved.runState.supplier1688Pipeline, owner: "server", status: "queued", revision: 6, runId };
-      saved = { ...saved, runState: { ...saved.runState, supplier1688Pipeline: pipeline } };
-      return pipeline;
-    }
-    if (path === `/api/runs/${runId}`) return structuredClone(saved);
-    if (path === "/api/runs") {
-      const incoming = JSON.parse(options.body);
-      saved = { ...incoming, amazonCollection: saved.amazonCollection };
-      return { runs: [] };
+      if (path === '/api/1688/pipeline/control') {
+        const body = JSON.parse(options.body);
+        assert.equal(body.runId, runId);
+        if (body.action === 'append') {
+          assert.deepEqual(body.productIds, oldStatus === 'complete' ? [second.id] : [first.id, second.id]);
+          saved.runState.supplier1688Pipeline = { ...oldPipeline, status: 'paused', productIds: [first.id, second.id], selectedCount: 2, matchableCount: 2, revision: 264 };
+          return { ...saved.runState.supplier1688Pipeline, runId };
+        }
+        assert.equal(body.action, 'resume');
+        saved.runState.supplier1688Pipeline = { ...saved.runState.supplier1688Pipeline, status: 'queued', revision: 265 };
+        return { ...saved.runState.supplier1688Pipeline, runId };
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    assert.equal(await app.startMatching(), true);
+    const appendIndex = calls.findIndex(call => call.body?.action === 'append');
+    const resumeIndex = calls.findIndex(call => call.body?.action === 'resume');
+    assert.ok(appendIndex >= 0 && resumeIndex > appendIndex);
+    assert.ok(calls.slice(appendIndex + 1, resumeIndex).some(call => call.path === `/api/runs/${runId}`));
+    assert.equal(calls.some(call => call.body?.action === 'discard'), false);
+    assert.equal(calls.slice(appendIndex).some(call => call.path === '/api/runs'), false);
+    assert.equal(calls.some(call => call.path === '/api/1688/image-search'), false);
+    assert.equal(app.state().runState.id, runId);
+    assert.equal(app.state().runState.supplier1688Pipeline.selectionId, 'original-selection');
+    assert.deepEqual(JSON.parse(JSON.stringify(app.state().runState.supplier1688Pipeline.tasks)), oldPipeline.tasks);
+    if (oldStatus === 'complete') assert.equal(app.state().products[0].purchaseCost, 8);
+  });
+}
+
+test('an append failure retains the old task and shows its cause without resuming matching', async () => {
+  const fixture = harness(); const { app, calls, toasts } = fixture;
+  const current = job('completed', 139);
+  const base = snapshot(current, [imageCandidate(1), imageCandidate(2)]);
+  base.runState.supplier1688Pipeline = { owner: 'server', status: 'complete', productIds: [productId], revision: 263, selectionId: 'original-selection' };
+  app.restore(structuredClone(base)); app.view(null, 1, {}); app.setSupplierLoggedIn(true);
+  fixture.respond(async (path, options) => {
+    if (path === '/api/runs') return { runs: [] };
+    if (path === '/api/amazon/collection/control') return current;
+    if (path === `/api/runs/${runId}`) return structuredClone(base);
+    if (path === '/api/1688/pipeline/control') {
+      assert.equal(JSON.parse(options.body).action, 'append');
+      throw Object.assign(new Error('Synthetic disk write failure'), { code: 'SNAPSHOT_WRITE_FAILED' });
     }
     throw new Error(`Unexpected request ${path}`);
   });
-  assert.equal(await app.startMatching(), true);
-  const discardIndex = calls.findIndex((call) => call.body?.action === "discard");
-  assert.ok(discardIndex > 0, "the old server-owned batch must be discarded first");
-  const batchSaveIndex = calls.findIndex((call) => call.path === "/api/runs"
-    && call.body.runState.supplier1688Pipeline?.productIds?.length === 2);
-  assert.ok(batchSaveIndex > discardIndex, "the new filtered batch is saved after the discard");
-  const resumeIndex = calls.findIndex((call) => call.body?.action === "resume");
-  assert.ok(resumeIndex > batchSaveIndex, "the new batch is handed to the background after saving");
-  assert.equal(toasts.some(([message]) => String(message).includes("已清空旧批次")), true);
+  assert.equal(await app.startMatching(), false);
+  assert.equal(calls.some(call => ['resume', 'discard'].includes(call.body?.action)), false);
+  assert.equal(app.state().runState.supplier1688Pipeline.revision, 263);
+  assert.equal(app.state().runState.supplier1688Pipeline.selectionId, 'original-selection');
+  assert.ok(toasts.some(([message]) => message.includes('Synthetic disk write failure')));
 });
 
 test("supplier preparation waits for an older in-flight snapshot before loading the final pause revision", async () => {
@@ -787,12 +815,11 @@ test("a new collection revision automatically computes profit once weight arrive
   });
   app.restore(snapshot(job("running", 1), [pricedWithoutWeight]));
   const incomplete = app.state().products[0];
-  assert.equal(incomplete.salePrice, 8.99);
-  // 亚马逊准则 2026-09-29：重量未采集的一律按最低运费档计算，不再阻断利润。
-  assert.ok(Number.isFinite(incomplete.margin));
-  assert.deepEqual(Array.from(incomplete.profitPendingReasons), []);
+  assert.equal(incomplete.salePrice, 9.99);
+  assert.equal(incomplete.margin, null);
+  assert.ok(incomplete.profitPendingReasons.includes("商品重量"));
   assert.equal(incomplete.fbaFee, 3.64);
-  assert.equal(incomplete.fbaEstimate.weightSource, "重量未采集 · 按最低运费档估算");
+  assert.equal(incomplete.fbaEstimate.weightSource, "页面未提供重量 · FBA 配送费按最低档估算");
   const nextProduct = { ...structuredClone(pricedWithoutWeight), productWeight: 0.12, billingWeight: 0.12 };
   fixture.respond(async (path) => path === "/api/amazon/collection" ? job("completed", 2) : snapshot(job("completed", 2), [nextProduct]));
   await app.poll();
@@ -1044,4 +1071,448 @@ test("server failed is not equivalent to a passed match even when its image scor
   assert.ok(Number.isFinite(restored.margin));
   assert.equal(restored.profitCalculation.purchaseCostAssumedZero, true);
   assert.equal(calls.length, 0);
+});
+
+test("default candidates and resumed matching require each product's own 50+ badge while preserving excluded history", () => {
+  const { app } = harness();
+  const eligible = [50, 100, 200, 1200].map((sales30, index) => imageCandidate(index + 1, { sales30 }));
+  const unknown = { ...serverPricedSnapshot({ score: 0.98, count: 10 }).saved.products[0],
+    id: "AU:B000000005", asin: "B000000005", sourceAsin: "B000000005", sales30: null, sales30Evidence: null };
+  const numericOnly = imageCandidate(6, { sales30: 100, sales30Evidence: null });
+  const otherAsin = imageCandidate(7, { sales30Evidence: eligible[0].sales30Evidence });
+  const items = [...eligible, unknown, numericOnly, otherAsin];
+  app.restore(snapshot(job("completed"), items));
+  app.setPipeline({ productIds: items.map(product => product.id), status: "paused", owner: "server" });
+  assert.deepEqual(Array.from(app.filtered(), item => item.id), eligible.map(item => item.id));
+  assert.deepEqual(Array.from(app.matching(), item => item.id), eligible.map(item => item.id));
+  assert.deepEqual(Array.from(app.pending(), item => item.id), eligible.map(item => item.id));
+  assert.equal(app.state().products.length, 7);
+  const preserved = app.state().products.find(item => item.id === unknown.id);
+  assert.equal(preserved.purchaseCost, unknown.purchaseCost);
+  assert.deepEqual(structuredClone(preserved.suppliers), unknown.suppliers);
+});
+
+test("a completed server response never claims matching continued and explains sales exclusions", async () => {
+  const fixture = harness();
+  const item = imageCandidate(1, { supplierSearchStatus: "session_expired" });
+  fixture.app.restore(supplierSnapshot(supplierPipeline({ status: "paused", enabled: false }), [item]));
+  const complete = supplierPipeline({ status: "complete", enabled: false, remaining: 0, processed: 0, excludedMonthlySalesCount: 43, revision: 2 });
+  fixture.respond(async path => path === '/api/1688/pipeline/control' ? complete : supplierSnapshot(complete, [{ ...item, sales30: null, sales30Evidence: null }]));
+  assert.equal(await fixture.app.resumeSupplier(), false);
+  assert.equal(fixture.toasts.some(([, severity]) => severity === 'success'), false);
+  assert.match(fixture.toasts.at(-1)[0], /43.*50\+/);
+  assert.equal(fixture.toasts.at(-1)[1], 'info');
+  assert.equal(fixture.app.pending().length, 0);
+  assert.equal(fixture.element('matchFiltered1688Button').disabled, true);
+  assert.match(fixture.element('supplierBatchSummary').textContent, /43.*已跳过/);
+  const callCount = fixture.calls.length;
+  assert.equal(await fixture.app.resumeSupplier(), false);
+  assert.equal(fixture.calls.length, callCount);
+});
+
+test("server no-pending rejection refreshes stale state and preserves its actionable explanation", async () => {
+  const fixture = harness();
+  const item = imageCandidate(1, { supplierSearchStatus: 'session_expired' });
+  fixture.app.restore(supplierSnapshot(supplierPipeline({ status: 'paused', enabled: false }), [item]));
+  const complete = supplierPipeline({ status: 'complete', remaining: 0, enabled: false, excludedMonthlySalesCount: 43, revision: 2 });
+  fixture.respond(async path => {
+    if (path === '/api/1688/pipeline/control') throw Object.assign(new Error('43 个商品已跳过，请刷新页面。'), { code: 'SUPPLIER_NO_PENDING_PRODUCTS' });
+    return supplierSnapshot(complete, [{ ...item, sales30Evidence: null }]);
+  });
+  assert.equal(await fixture.app.resumeSupplier(), false);
+  assert.equal(fixture.toasts.at(-1)[1], 'info');
+  assert.match(fixture.toasts.at(-1)[0], /43.*刷新页面/);
+  assert.equal(fixture.app.state().runState.supplier1688Pipeline.status, 'complete');
+});
+
+test("a paused or attention response cannot show the background matching success toast", async () => {
+  for (const status of ['paused', 'needs_attention']) {
+    const fixture = harness();
+    const item = imageCandidate();
+    fixture.app.restore(supplierSnapshot(supplierPipeline({ status: 'paused', enabled: false }), [item]));
+    const paused = supplierPipeline({ status, remaining: 1, enabled: false, message: '请先完成验证，原断点保留。', revision: 2 });
+    fixture.respond(async path => path === '/api/1688/pipeline/control' ? paused : supplierSnapshot(paused, [item]));
+    assert.equal(await fixture.app.resumeSupplier(), false);
+    assert.equal(fixture.toasts.at(-1)[1], 'info');
+    assert.match(fixture.toasts.at(-1)[0], /验证/);
+  }
+});
+
+test("a cooldown resume response reports waiting rather than active image matching", async () => {
+  const fixture = harness();
+  const item = imageCandidate();
+  fixture.app.restore(supplierSnapshot(supplierPipeline({ status: 'paused', enabled: false }), [item]));
+  const cooling = supplierPipeline({ status: 'cooldown', remaining: 1, enabled: true, revision: 2 });
+  fixture.respond(async path => path === '/api/1688/pipeline/control' ? cooling : supplierSnapshot(cooling, [item]));
+  assert.equal(await fixture.app.resumeSupplier(), true);
+  assert.equal(fixture.toasts.at(-1)[1], 'info');
+  assert.match(fixture.toasts.at(-1)[0], /冷却/);
+});
+
+function pageWithoutWeight(overrides = {}) {
+  return { ...canonicalProduct(), productWeight: null, fbaWeight: null, billingWeight: null,
+    manualFbaFee: false, fbaFee: null,
+    collectionQuality: { fields: { weight: { status: "unavailable", reason: "page_not_provided" } } },
+    profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: null }, ...overrides };
+}
+
+test("confirmed absent weight uses minimum FBA and can be reviewed without fabricating weight or profit", () => {
+  const { app, element, toasts } = harness();
+  const original = pageWithoutWeight();
+  app.restore(snapshot(job("completed"), [original]));
+  const restoredSuppliers = structuredClone(app.state().products[0].suppliers);
+  app.openLocalDrawer(productId);
+  assert.equal(element("editWeight").value, "");
+  assert.equal(Number(element("editFbaFee").value), 3.64);
+  assert.equal(element("approveProductButton").disabled, false);
+  assert.match(element("costBreakdown").innerHTML, /最低档/);
+  app.approve();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.billingWeight, null);
+  assert.equal(product.productWeight, null);
+  assert.equal(product.profitInputs.actualWeightKg, null);
+  assert.equal(product.profitCalculation, null);
+  assert.equal(product.margin, null);
+  assert.equal(product.salePrice, original.salePrice);
+  assert.equal(product.purchaseCost, original.purchaseCost);
+  assert.deepEqual(structuredClone(product.suppliers), restoredSuppliers);
+  assert.match(toasts.at(-1)[0], /初审通过.*最低档估算/);
+});
+
+test("candidate initial review may precede purchase quotes and price collection", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ currentPrice: null, currentPriceStatus: "unavailable", salePrice: null,
+    manualSalePrice: false, purchaseCost: null, purchaseUnitCostCny: null, manualPurchaseCost: false,
+    supplierSearchStatus: "not_started", suppliers: [] })]));
+  app.view(productId, 1, {});
+  assert.equal(app.filtered().length, 1);
+  app.openLocalDrawer(productId);
+  assert.equal(element("approveProductButton").disabled, false);
+  app.approve();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.salePrice, null);
+  assert.equal(product.purchaseCost, null);
+  assert.equal(product.manualPurchaseCost, false);
+});
+
+for (const status of ["pending", "failed"]) test(status + " detail does not qualify as page weight absence", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("paused"), [pageWithoutWeight({ detailStatus: status })]));
+  app.openLocalDrawer(productId);
+  assert.equal(element("approveProductButton").disabled, true);
+  assert.equal(app.state().products[0].fbaFee, null);
+  app.approve();
+  assert.equal(app.state().products[0].reviewStatus, "pending");
+});
+
+for (const raw of ["0", "-1", "oops"]) test("invalid weight " + raw + " cannot pass initial review", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  element("editWeight").value = raw;
+  app.approve();
+  assert.equal(app.state().products[0].reviewStatus, "pending");
+  assert.equal(app.state().products[0].billingWeight, null);
+});
+
+test("missing sales evidence blocks initial review even when weight is absent", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ sales30Evidence: null })]));
+  app.openLocalDrawer(productId);
+  assert.equal(element("approveProductButton").disabled, true);
+  app.approve();
+  assert.equal(app.state().products[0].reviewStatus, "pending");
+});
+
+test("unknown weight is not presented as a real low-weight band", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.view(null, 1, {});
+  assert.equal(app.filtered().length, 1);
+  element("resultWeightBand").value = "under_100";
+  assert.equal(app.filtered().length, 0);
+});
+
+test("manual cost dialog also permits confirmed missing weight and preserves manual sale price", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  assert.equal(element("manualCostApproveButton").disabled, false);
+  app.approveManual();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.billingWeight, null);
+  assert.equal(product.salePrice, 18);
+  assert.equal(product.manualSalePrice, true);
+  assert.equal(product.fbaFee, 3.64);
+});
+
+for (const raw of ["0", "-1", "oops"]) test("manual dialog rejects invalid weight " + raw, () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  element("manualActualWeightKg").value = raw;
+  app.approveManual();
+  assert.equal(app.state().products[0].reviewStatus, "pending");
+  assert.equal(app.state().products[0].billingWeight, null);
+  assert.match(element("manualCostError").textContent, /实际重量/);
+});
+
+test("manual dialog can approve before price and procurement quotes exist", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ currentPrice: null, currentPriceStatus: "unavailable", salePrice: null,
+    manualSalePrice: false, purchaseCost: null, purchaseUnitCostCny: null, manualPurchaseCost: false,
+    supplierSearchStatus: "not_started", suppliers: [] })]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  assert.equal(element("manualCostApproveButton").disabled, false);
+  app.approveManual();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.purchaseCost, null);
+  assert.equal(product.manualPurchaseCost, false);
+  assert.equal(product.profitCalculation, null);
+});
+
+test("legacy candidate mapping and refresh retain distinct weight evidence and audit", () => {
+  const { app } = harness();
+  app.restore(snapshot(job("completed")));
+  const incoming = { asin: "B000000002", marketplace: "AU", detailStatus: "success", detailParserVersion: 6,
+    title: "Weight evidence product", productWeightKg: 0.2, fbaPackageWeightKg: 0.3,
+    productWeightEvidence: { kind: "item", rawText: "Item Weight: 200 g", value: 0.2 },
+    packageWeightEvidence: { kind: "package", rawText: "Package Weight: 300 g", value: 0.3 },
+    collectionQuality: { fields: { weight: { status: "verified" } } } };
+  const mapped = app.mapCandidate(incoming, 0);
+  assert.deepEqual(structuredClone(mapped.productWeightEvidence), incoming.productWeightEvidence);
+  assert.deepEqual(structuredClone(mapped.packageWeightEvidence), incoming.packageWeightEvidence);
+  assert.deepEqual(structuredClone(mapped.collectionQuality), incoming.collectionQuality);
+  app.mergeCandidates([incoming]);
+  incoming.productWeightKg = 0.25;
+  incoming.productWeightEvidence = { kind: "item", rawText: "Item Weight: 250 g", value: 0.25 };
+  app.mergeCandidates([incoming]);
+  const updated = app.state().products.find(item => item.asin === incoming.asin);
+  assert.equal(updated.productWeight, 0.25);
+  assert.deepEqual(structuredClone(updated.productWeightEvidence), incoming.productWeightEvidence);
+  assert.deepEqual(structuredClone(updated.packageWeightEvidence), incoming.packageWeightEvidence);
+});
+
+test("manual dialog cannot approve a manually changed monthly count using the old badge", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  element("manualAmazonSales30").value = "20";
+  app.approveManual();
+  assert.equal(app.state().products[0].reviewStatus, "pending");
+  assert.equal(app.state().products[0].sales30, 100);
+  assert.match(element("manualCostError").textContent, /50\+/);
+});
+
+test("a real manual weight replaces the minimum FBA assumption with an ordinary weight fee", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  element("editWeight").value = "0.2";
+  app.approve();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.fbaFee, 4.35);
+  assert.equal(product.fbaFeeSource, "au_workbook_weight_rate");
+  assert.equal(product.fbaEstimate.assumption, "weight_only_envelope_proxy");
+  assert.equal(product.profitInputs.actualWeightKg, 0.2);
+  assert.ok(Number.isFinite(product.margin));
+});
+
+test("US manual dialog retains its minimum fee when page weight is unavailable", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ marketplace: "US" })]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  assert.equal(Number(element("manualFulfillmentFee").value), 3.22);
+  app.approveManual();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "approved");
+  assert.equal(product.fbaFee, 3.22);
+  assert.equal(product.billingWeight, null);
+});
+
+test("newly collected monthly evidence makes a saved no-badge product eligible", () => {
+  const { app } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ sales30: null, sales30Evidence: null })]));
+  assert.equal(app.filtered().length, 0);
+  app.mergeCandidates([{ asin: "B000000001", marketplace: "AU", detailStatus: "success", detailParserVersion: 6,
+    sales30: 100, sales30Evidence: canonicalProduct().sales30Evidence }]);
+  assert.equal(app.filtered().length, 1);
+  assert.deepEqual(structuredClone(app.state().products[0].sales30Evidence), canonicalProduct().sales30Evidence);
+});
+
+test("saving an incomplete handoff draft preserves missing fields without approving", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ currentPrice: null, currentPriceStatus: "unavailable", salePrice: null,
+    manualSalePrice: false, purchaseCost: null, purchaseUnitCostCny: null, manualPurchaseCost: false,
+    supplierSearchStatus: "not_started", suppliers: [] })]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  element("manualAmazonTitle").value = "Updated draft title";
+  app.saveManualDraft();
+  const product = app.state().products[0];
+  assert.equal(product.reviewStatus, "pending");
+  assert.equal(product.name, "Updated draft title");
+  assert.equal(product.purchaseCost, null);
+  assert.equal(product.profitCalculation, null);
+});
+
+test("saving changed manual sales archives the old badge without retaining candidate eligibility", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight()]));
+  app.openLocalDrawer(productId);
+  app.openManual();
+  element("manualAmazonSales30").value = "20";
+  app.saveManualDraft();
+  const product = app.state().products[0];
+  assert.equal(product.sales30, 20);
+  assert.equal(product.sales30Evidence, null);
+  assert.equal(product.sales30EvidenceHistory[0].value, 100);
+  assert.equal(app.filtered().length, 0);
+});
+
+function automaticCostFixture(overrides = {}) {
+  const { saved, result } = serverPricedSnapshot({ score: 0.98, count: 10 });
+  Object.assign(saved.products[0], overrides);
+  const fixture = harness();
+  fixture.app.restore(saved, { persistMigrations: false });
+  fixture.app.openLocalDrawer(productId);
+  return { ...fixture, supplierResult: result };
+}
+
+for (const route of ["drawer", "manual"]) {
+  test(route + " initial review defaults to the saved 1688 average when purchase input is empty", () => {
+    const { app, element } = automaticCostFixture({ purchaseUnitCostCny: null, purchaseCost: null });
+    const average = app.state().products[0].supplierAverageCny;
+    const quotes = structuredClone(app.state().products[0].suppliers);
+    if (route === "manual") {
+      app.openManual();
+      element("manualPurchaseCost").value = "";
+      app.manualPreview();
+      assert.equal(Number(element("manualPurchaseTotal").value), average);
+      assert.match(element("manualPurchaseCostSource").textContent, /默认使用 1688/);
+      app.approveManual();
+    } else {
+      element("editPurchaseCost").value = "";
+      app.preview();
+      assert.equal(app.editor().purchaseUnitCostCny, average);
+      assert.match(element("editPurchaseCostSource").textContent, /默认使用 1688/);
+      app.approve();
+    }
+    const product = app.state().products[0];
+    assert.equal(product.reviewStatus, "approved");
+    assert.equal(product.purchaseUnitCostCny, average);
+    assert.equal(product.purchaseCost, average);
+    assert.equal(product.profitCalculation.purchaseCostCny, average);
+    assert.equal(product.profitCalculation.purchaseCostAssumedZero, false);
+    assert.equal(product.manualPurchaseCost, false);
+    assert.notEqual(product.costSource, "manual");
+    assert.deepEqual(structuredClone(product.suppliers), quotes);
+  });
+
+  test(route + " unchanged precise average is never converted into a manual override", () => {
+    const { app } = automaticCostFixture({ supplierAverageCny: 3.14159, purchaseUnitCostCny: null, purchaseCost: null, pieceCount: 3, pieceCountSource: "manual" });
+    if (route === "manual") { app.openManual(); app.approveManual(); }
+    else app.approve();
+    const product = app.state().products[0];
+    assert.equal(product.reviewStatus, "approved");
+    assert.equal(product.purchaseUnitCostCny, 3.14159);
+    assert.equal(product.purchaseCost, 9.42);
+    assert.equal(product.manualPurchaseCost, false);
+    assert.notEqual(product.costSource, "manual");
+  });
+
+  for (const unit of [0, 2.34567]) test(route + " manual price " + unit + " survives reload and later supplier results", () => {
+    const { app, element, supplierResult } = automaticCostFixture({ pieceCount: 3, pieceCountSource: "manual" });
+    const originalAverage = app.state().products[0].supplierAverageCny;
+    const quotes = structuredClone(app.state().products[0].suppliers);
+    if (route === "manual") {
+      app.openManual(); element("manualPurchaseCost").value = String(unit); app.manualPreview();
+      assert.equal(Number(element("manualPurchaseTotal").value), Math.round(unit * 3 * 100) / 100);
+      app.approveManual();
+    } else {
+      element("editPurchaseCost").value = String(unit); app.preview();
+      assert.equal(app.editor().purchaseCost, Math.round(unit * 3 * 100) / 100);
+      assert.match(element("costBreakdown").innerHTML, /人工单价/);
+      assert.doesNotMatch(element("costBreakdown").innerHTML, /÷ 6 家/);
+      app.approve();
+    }
+    const product = app.state().products[0];
+    assert.equal(product.reviewStatus, "approved");
+    assert.equal(product.manualPurchaseCost, true);
+    assert.equal(product.costSource, "manual");
+    assert.equal(product.purchaseUnitCostCny, unit);
+    assert.equal(product.purchaseCost, Math.round(unit * 3 * 100) / 100);
+    assert.equal(product.profitCalculation.purchaseCostCny, product.purchaseCost);
+    if (route === "manual") assert.equal(Number(element("manualCostSalePrice").value), product.salePrice);
+    const restarted = harness().app;
+    restarted.restore(app.capture(), { persistMigrations: false });
+    const reloaded = restarted.state().products[0];
+    restarted.applySupplierResult(reloaded, { ...supplierResult, averageCostCny: 99 });
+    assert.equal(reloaded.purchaseUnitCostCny, unit);
+    assert.equal(reloaded.purchaseCost, product.purchaseCost);
+    assert.equal(reloaded.manualPurchaseCost, true);
+    assert.equal(reloaded.supplierAverageCny, originalAverage);
+    assert.deepEqual(structuredClone(reloaded.suppliers), quotes);
+  });
+
+  for (const raw of ["-1", "invalid"]) test(route + " invalid manual procurement price cannot silently use the average", () => {
+    const { app, element } = automaticCostFixture();
+    const before = app.state().products[0].purchaseCost;
+    if (route === "manual") { app.openManual(); element("manualPurchaseCost").value = raw; app.approveManual(); }
+    else { element("editPurchaseCost").value = raw; app.approve(); }
+    assert.equal(app.state().products[0].reviewStatus, "pending");
+    assert.equal(app.state().products[0].purchaseCost, before);
+    assert.equal(app.state().products[0].manualPurchaseCost, false);
+  });
+}
+
+test("an untouched open input follows a newer average without becoming a manual override", () => {
+  const { app } = automaticCostFixture();
+  app.state().products[0].supplierAverageCny = 7.25;
+  app.preview();
+  assert.equal(app.editor().purchaseUnitCostCny, 7.25);
+  app.approve();
+  assert.equal(app.state().products[0].purchaseUnitCostCny, 7.25);
+  assert.equal(app.state().products[0].manualPurchaseCost, false);
+});
+
+for (const marker of [{ costSource: "manual" }, { supplierSource: "manual-product-cost" }]) test("legacy manual purchase marker remains authoritative with an empty input", () => {
+  const { app, element, supplierResult } = automaticCostFixture({ ...marker, manualPurchaseCost: false, purchaseUnitCostCny: 2, purchaseCost: 2 });
+  element("editPurchaseCost").value = "";
+  app.approve();
+  const product = app.state().products[0];
+  assert.equal(product.purchaseUnitCostCny, 2);
+  const before = structuredClone(product);
+  app.applySupplierResult(product, supplierResult);
+  assert.deepEqual(structuredClone(product), before);
+});
+
+for (const marker of [{ costSource: "manual" }, { supplierSource: "manual-product-cost" }]) test("legacy manual purchase markers skip frontend supplier matching", () => {
+  const { app } = automaticCostFixture({ ...marker, manualPurchaseCost: false, purchaseUnitCostCny: 2, purchaseCost: 2, supplierSearchStatus: "pending" });
+  assert.equal(app.matching().length, 0);
+  assert.equal(app.pending().length, 0);
+});
+
+test("successive auto-saves can change a manual unit price back to the original displayed average", () => {
+  const { app, element } = automaticCostFixture();
+  const original = app.state().products[0].supplierAverageCny;
+  element("editPurchaseCost").value = "7.25";
+  assert.equal(app.saveEditor(false, { preserveEditor: true }), true);
+  assert.equal(app.state().products[0].purchaseUnitCostCny, 7.25);
+  element("editPurchaseCost").value = String(original);
+  app.approve();
+  const product = app.state().products[0];
+  assert.equal(product.purchaseUnitCostCny, original);
+  assert.equal(product.manualPurchaseCost, true);
+  assert.equal(product.reviewStatus, "approved");
 });

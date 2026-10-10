@@ -7,7 +7,9 @@ const TASK = '12345678-1234-1234-1234-123456789abc';
 const EPOCH = Date.parse('2026-09-24T00:00:00Z');
 const copy = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
-const product = (id, extra = {}) => ({ id, asin: id, imageUrl: 'https://m.media-amazon.com/images/I/fixture.jpg',
+const product = (id, extra = {}) => ({ id, asin: 'B012345678', imageUrl: 'https://m.media-amazon.com/images/I/fixture.jpg',
+  sales30: 50, sales30Evidence: { source: 'amazon_product_page', period: 'past_month',
+    value: 50, rawText: '50+ bought in past month', asin: 'B012345678', kind: 'lower_bound' },
   supplierSearchStatus: 'not_started', purchaseCost: null, ...extra });
 const ready = () => ({ auth: { ready: true }, queue: { queued: 0, running: 0, riskBlocked: 0, ratePolicy: {} } });
 const snapshot = (products, ids = products.map(item => item.id), pipeline = {}) => ({
@@ -271,4 +273,245 @@ test('a replacement batch starts cleanly after the old one is discarded', async 
   await mock.runner.tick();
   assert.deepEqual(mock.calls.map(call => call.item.id), ['Z']);
   assert.equal(mock.store.read().runState.supplier1688Pipeline.owner, 'server');
+});
+
+test('append extends the same 66-product cohort by 194 and preserves every old result and task', async t => {
+  const old = Array.from({ length: 66 }, (_, index) => product('old-' + index, {
+    supplierSearchStatus: 'complete', purchaseCost: index + 1, margin: 25,
+    supplierQuotes: [{ offerId: 'offer-' + index, price: index + 1 }],
+  }));
+  const fresh = Array.from({ length: 194 }, (_, index) => product('new-' + index));
+  const tasks = Object.fromEntries(old.map(item => [item.id, {
+    status: 'complete', taskId: TASK, attempts: 2, failureCount: 1,
+  }]));
+  const state = snapshot([...old, ...fresh, product('no-image', { imageUrl: '' })], old.map(item => item.id), {
+    owner: 'server', selectionId: 'original-selection', startedAt: '2026-10-09T00:00:00Z',
+    status: 'complete', enabled: false, revision: 263, selectedCount: 66, matchableCount: 66,
+    processed: 66, remaining: 0, completedAt: '2026-10-09T01:00:00Z', tasks,
+  });
+  const mock = await setup(t, { snapshot: state, start: false });
+  const ids = [...fresh.map(item => item.id), 'new-0', 'old-0', 'no-image'];
+  const status = await mock.runner.append(RUN, ids);
+  assert.equal(status.runId, RUN);
+  assert.equal(status.selectionId, 'original-selection');
+  assert.equal(status.startedAt, state.runState.supplier1688Pipeline.startedAt);
+  assert.equal(status.revision, 264);
+  assert.equal(status.selectedCount, 260); assert.equal(status.matchableCount, 260);
+  assert.equal(status.processed, 66); assert.equal(status.remaining, 194);
+  assert.equal(status.status, 'paused'); assert.equal(status.enabled, false);
+  assert.equal(status.lastReason, 'selection_saved');
+  assert.deepEqual(status.tasks, tasks);
+  assert.deepEqual(mock.store.read().products, state.products);
+  assert.deepEqual(status.productIds, [...old, ...fresh].map(item => item.id));
+  assert.equal(mock.calls.length, 0); assert.equal(mock.store.active, null);
+  const writes = mock.store.writes.length;
+  assert.deepEqual(await mock.runner.append(RUN, ids), status);
+  assert.equal(mock.store.writes.length, writes);
+  await mock.runner.tick(); assert.equal(mock.calls.length, 0);
+  await mock.runner.start(RUN, { resume: true });
+  await mock.runner.tick();
+  assert.deepEqual(mock.calls.map(call => call.item.id), ['new-0']);
+  assert.deepEqual(mock.store.read().products.slice(0, 66), old);
+});
+
+test('append excludes prior terminal, protected, missing-image and exhausted products without resetting their tasks', async t => {
+  const items = [
+    product('old', { supplierSearchStatus: 'complete', purchaseCost: 18 }),
+    product('new'), product('estimate', { supplierSearchStatus: 'fallback_estimate', purchaseCost: 8 }),
+    product('manual', { manualPurchaseCost: true, purchaseCost: 0 }),
+    product('manual-source', { costSource: 'manual', purchaseCost: 9 }),
+    product('handoff', { analysisHandoff: { owner: 'procurement' } }),
+    product('rejected', { reviewStatus: 'rejected' }),
+    product('missing-image', { imageUrl: null }),
+    product('failed'), product('skipped'), product('finished-task'),
+  ];
+  const tasks = { old: { status: 'complete', taskId: TASK, attempts: 1 },
+    failed: { status: 'failed', taskId: TASK, attempts: 5, failureCount: 3 },
+    skipped: { status: 'skipped', attempts: 1 }, 'finished-task': { status: 'complete', attempts: 2 } };
+  const mock = await setup(t, { start: false, snapshot: snapshot(items, ['old'], {
+    owner: 'server', status: 'complete', enabled: false, revision: 10, tasks,
+  }) });
+  const status = await mock.runner.append(RUN, items.map(item => item.id));
+  assert.deepEqual(status.productIds, ['old', 'new']);
+  assert.equal(status.failedCount, 1);
+  assert.deepEqual(status.tasks, tasks);
+  assert.deepEqual(mock.store.read().products, items);
+  assert.equal(mock.calls.length, 0);
+});
+
+test('append retains browser ownership and manual or risk pauses until a separate explicit resume', async t => {
+  for (const saved of [
+    { owner: 'server', status: 'paused', enabled: false, causeCode: 'USER_PAUSED', lastReason: 'user_paused' },
+    { owner: 'server', status: 'needs_attention', enabled: false, causeCode: 'RISK_CONTROL', lastReason: 'RISK_CONTROL' },
+    { status: 'paused', enabled: false, causeCode: null, lastReason: 'selection_saved' },
+  ]) {
+    const tasks = { A: { status: 'pending', taskId: TASK, attempts: 2, failureCount: 1, nextRetryAt: '2026-10-10T00:00:00Z' } };
+    const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A'], { ...saved, tasks }) });
+    const status = await mock.runner.append(RUN, ['B']);
+    for (const key of ['owner', 'status', 'enabled', 'causeCode', 'lastReason']) assert.equal(status[key], saved[key]);
+    assert.deepEqual(status.tasks, tasks);
+    await mock.runner.tick();
+    assert.equal(mock.calls.length, 0); assert.equal(mock.store.active, null);
+  }
+});
+
+test('append validates all product IDs before saving and rejects unsupported or foreign scope without a partial write', async t => {
+  const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A']) });
+  const before = mock.store.read();
+  for (const ids of [undefined, [], [''], ['  '], [1], ['B\n'], Array(10001).fill('B'), ['B', 'foreign']]) {
+    await assert.rejects(mock.runner.append(RUN, ids), { code: 'SUPPLIER_SCOPE_INVALID', status: 422 });
+    assert.deepEqual(mock.store.read(), before);
+  }
+  assert.equal(mock.store.writes.length, 0); assert.equal(mock.runner.runId, null);
+  const status = await mock.runner.append(RUN, [' B ', 'B']);
+  assert.deepEqual(status.productIds, ['A', 'B']);
+});
+
+test('append refuses running or queued cohorts and another unfinished run without changing their snapshots', async t => {
+  for (const status of ['queued', 'running', 'cooldown']) {
+    const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A'], { owner: 'server', status }) });
+    const before = mock.store.read();
+    await assert.rejects(mock.runner.append(RUN, ['B']), { code: 'SUPPLIER_BUSY' });
+    assert.deepEqual(mock.store.read(), before); assert.equal(mock.calls.length, 0);
+  }
+  const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A']) });
+  mock.store.records.set('other', snapshot([product('Z')], ['Z'], { owner: 'server', status: 'paused' }));
+  mock.store.active = 'other';
+  await assert.rejects(mock.runner.append(RUN, ['B']), { code: 'SUPPLIER_BUSY' });
+  assert.equal(mock.store.writes.length, 0); assert.equal(mock.store.active, 'other');
+});
+
+test('append refuses a paused cohort while its in-flight result is still being saved', async t => {
+  const started = deferred(), release = deferred();
+  const mock = await setup(t, { snapshot: snapshot([product('A'), product('B')], ['A']),
+    search: async () => { started.resolve(); await release.promise; return { cost: 10 }; } });
+  const work = mock.runner.tick(); await started.promise;
+  await mock.runner.pause(RUN);
+  await assert.rejects(mock.runner.append(RUN, ['B']), { code: 'SUPPLIER_BUSY' });
+  release.resolve(); await work;
+  assert.deepEqual(mock.store.read().runState.supplier1688Pipeline.productIds, ['A']);
+  assert.equal(mock.calls.length, 1);
+});
+
+test('append merges against the transaction snapshot and leaves concurrent product edits and retry history intact', async t => {
+  const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B'), product('C')], ['A'], {
+    owner: 'server', status: 'paused', enabled: false, causeCode: 'USER_PAUSED', revision: 9,
+  }) });
+  const update = mock.store.updateSnapshot.bind(mock.store);
+  mock.store.updateSnapshot = (id, operation) => update(id, draft => {
+    draft.products[1].manualPurchaseCost = true; draft.products[1].purchaseCost = 77;
+    draft.runState.supplier1688Pipeline.revision = 12;
+    draft.runState.supplier1688Pipeline.tasks = { A: { status: 'pending', attempts: 4, failureCount: 2, taskId: TASK } };
+    return operation(draft);
+  });
+  const status = await mock.runner.append(RUN, ['B', 'C']);
+  assert.deepEqual(status.productIds, ['A', 'C']);
+  assert.equal(status.revision, 13);
+  assert.equal(status.causeCode, 'USER_PAUSED');
+  assert.deepEqual(status.tasks.A, { status: 'pending', attempts: 4, failureCount: 2, taskId: TASK });
+  assert.equal(mock.store.read().products[1].purchaseCost, 77);
+  assert.equal(mock.calls.length, 0);
+});
+
+test('a failed append save does not switch runner ownership or the active saved run', async t => {
+  const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A']) });
+  const other = snapshot([product('Z')], ['Z'], { owner: 'server', status: 'complete', revision: 7 });
+  mock.store.records.set('other', other); mock.store.active = 'other'; mock.runner.runId = 'other';
+  const beforeStatus = await mock.runner.status();
+  const before = mock.store.read();
+  mock.store.updateSnapshot = async () => { throw new Error('disk full'); };
+  await assert.rejects(mock.runner.append(RUN, ['B']), /disk full/);
+  assert.equal(mock.runner.runId, 'other'); assert.equal(mock.store.active, 'other');
+  assert.deepEqual(mock.runner.cachedStatus, beforeStatus);
+  assert.deepEqual(mock.store.read(), before);
+  assert.equal(mock.calls.length, 0);
+});
+test('append checks the persisted active run even when the runner still points at a completed earlier run', async t => {
+  const mock = await setup(t, { start: false, snapshot: snapshot([product('A'), product('B')], ['A']) });
+  mock.store.records.set('completed', snapshot([product('X')], ['X'], { owner: 'server', status: 'complete' }));
+  mock.store.records.set('active', snapshot([product('Y')], ['Y'], { owner: 'server', status: 'running' }));
+  mock.runner.runId = 'completed'; mock.store.active = 'active';
+  await assert.rejects(mock.runner.append(RUN, ['B']), { code: 'SUPPLIER_BUSY' });
+  assert.equal(mock.store.writes.length, 0); assert.equal(mock.store.active, 'active');
+  assert.equal(mock.runner.runId, 'completed'); assert.equal(mock.calls.length, 0);
+});
+test('append skips unverified or below-threshold sales while preserving old results, costs and task IDs', async t => {
+  const old = product('old', { sales30Evidence: null, supplierSearchStatus: 'complete', purchaseCost: 77,
+    supplierQuotes: [{ id: 'saved-offer', price: 77 }], supplierProcurementTaskId: TASK });
+  const items = [old, product('new'), product('numeric-only', { sales30: 200, sales30Evidence: null }),
+    product('below', { sales30: 49, sales30Evidence: { source: 'amazon_product_page', period: 'past_month',
+      kind: 'lower_bound', value: 49, rawText: '49+ bought in past month', asin: 'B012345678' } }),
+    product('wrong-asin', { sales30Evidence: { source: 'amazon_product_page', period: 'past_month',
+      kind: 'lower_bound', value: 100, rawText: '100+ bought in past month', asin: 'B098765432' } })];
+  const tasks = { old: { status: 'complete', taskId: TASK, attempts: 2, failureCount: 1 } };
+  const mock = await setup(t, { start: false, snapshot: snapshot(items, ['old'], {
+    owner: 'server', status: 'complete', enabled: false, selectionId: 'same-selection', tasks,
+  }) });
+  const status = await mock.runner.append(RUN, items.map(item => item.id));
+  assert.deepEqual(status.productIds, ['old', 'new']);
+  assert.equal(status.processed, 1); assert.equal(status.remaining, 1);
+  assert.equal(status.excludedMonthlySalesCount, 0); assert.equal(status.selectionId, 'same-selection');
+  assert.deepEqual(status.tasks, tasks); assert.deepEqual(mock.store.read().products, items);
+  const writes = mock.store.writes.length;
+  await mock.runner.append(RUN, items.map(item => item.id));
+  assert.equal(mock.store.writes.length, writes); assert.equal(mock.calls.length, 0);
+});
+
+test('restored queue skips historical products without qualifying sales without claiming they were matched', async t => {
+  const old = product('old', { sales30Evidence: null, supplierSearchStatus: 'complete', purchaseCost: 18,
+    supplierQuotes: [{ offerId: 'historical', price: 18 }], supplierProcurementTaskId: TASK });
+  const unverified = product('unverified', { sales30: 500, sales30Evidence: null, supplierProcurementTaskId: TASK });
+  const tasks = { old: { status: 'complete', taskId: TASK, attempts: 1 },
+    unverified: { status: 'pending', taskId: TASK, attempts: 2, failureCount: 1 } };
+  const store = new MemoryStore(snapshot([old, unverified, product('eligible')], ['old', 'unverified', 'eligible'], {
+    owner: 'server', status: 'queued', enabled: true, selectionId: 'original-selection', tasks,
+  }));
+  store.active = RUN;
+  const mock = await setup(t, { store, start: false });
+  assert.equal((await mock.runner.status()).remaining, 1);
+  await mock.runner.tick(); await mock.runner.tick();
+  assert.deepEqual(mock.calls.map(call => call.item.id), ['eligible']);
+  const saved = store.read();
+  assert.deepEqual(saved.products.slice(0, 2), [old, unverified]);
+  assert.deepEqual(saved.runState.supplier1688Pipeline.tasks.unverified, tasks.unverified);
+  assert.deepEqual(saved.runState.supplier1688Pipeline.tasks.old, tasks.old);
+  const status = await mock.runner.status();
+  assert.equal(status.processed, 2); assert.equal(status.remaining, 0);
+  assert.equal(status.excludedMonthlySalesCount, 1); assert.equal(status.matchableCount, 2);
+  assert.equal(status.lastReason, 'monthly_sales_filtered'); assert.equal(status.status, 'complete');
+  assert.equal(status.selectionId, 'original-selection');
+});
+
+test('sales exclusions never release manual pauses and do not issue runtime or supplier calls', async t => {
+  const items = [product('A', { sales30Evidence: null })];
+  const store = new MemoryStore(snapshot(items, ['A'], { owner: 'server', status: 'paused', enabled: false,
+    causeCode: 'USER_PAUSED', lastReason: 'user_paused', tasks: { A: { status: 'pending', taskId: TASK } } }));
+  store.active = RUN;
+  const mock = await setup(t, { store, start: false, getRuntime: async () => { throw new Error('must not check login'); } });
+  await mock.runner.tick();
+  const status = await mock.runner.status();
+  assert.equal(status.status, 'paused'); assert.equal(status.causeCode, 'USER_PAUSED');
+  assert.equal(status.lastReason, 'user_paused'); assert.equal(status.processed, 0);
+  assert.equal(status.remaining, 0); assert.equal(status.excludedMonthlySalesCount, 1);
+  assert.deepEqual(store.read().products, items); assert.equal(mock.calls.length, 0);
+});
+
+test('repeated resumes of a completed sales-filtered cohort explain exclusions without changing its checkpoint', async t => {
+  const done = product('done', { supplierSearchStatus: 'complete', purchaseCost: 12, suppliers: [{ unitPriceCny: 12 }] });
+  const excluded = Array.from({ length: 43 }, (_, index) => product(`excluded-${index}`, { sales30: null, sales30Evidence: null }));
+  const state = snapshot([done, ...excluded], ['done', ...excluded.map(item => item.id)], {
+    owner: 'server', status: 'complete', enabled: false, remaining: 0, processed: 1,
+    excludedMonthlySalesCount: 43, selectionId: 'original-selection', completedAt: new Date(EPOCH).toISOString(),
+    tasks: { done: { status: 'complete', taskId: TASK, attempts: 1 } },
+  });
+  const mock = await setup(t, { snapshot: state, start: false, getRuntime: async () => { throw new Error('No runtime call expected'); } });
+  const before = mock.store.read();
+  const writes = mock.store.writes.length;
+  for (let index = 0; index < 2; index++) {
+    await assert.rejects(mock.runner.start(RUN, { resume: true }), error => error.code === 'SUPPLIER_NO_PENDING_PRODUCTS' && /43.*50\+.*刷新页面/.test(error.message));
+  }
+  assert.deepEqual(mock.store.read(), before);
+  assert.equal(mock.store.writes.length, writes);
+  assert.deepEqual(mock.calls, []);
+  assert.equal(mock.store.active, null);
 });

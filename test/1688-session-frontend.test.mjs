@@ -8,6 +8,7 @@ import * as pieceCount from "../lib/title-piece-count.mjs";
 import * as handoff from "../lib/analysis-handoff.mjs";
 import * as coverage from "../lib/analysis-coverage.mjs";
 import * as detailRetry from "../lib/amazon-detail-retry.mjs";
+import * as salesPolicy from "../lib/amazon-sales-policy.mjs";
 
 const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const taskId = "task_synthetic_image_search";
@@ -28,7 +29,7 @@ function harness() {
   let resumeCount = 0;
   let respond = async (path) => { throw new Error(`Unexpected request ${path}`); };
   const context = vm.createContext({
-    ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry, structuredClone, AbortController, DOMException, URL,
+    ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry, ...salesPolicy, structuredClone, AbortController, DOMException, URL,
     document: { addEventListener() {}, getElementById: element, querySelector() { return null; }, querySelectorAll() { return []; } },
     window: { setInterval(callback, ms) { intervals.push({ callback, ms }); return intervals.length; }, clearInterval() {},
       setTimeout(callback, ms) { timeouts.push({ callback, ms, canceled: false }); return timeouts.length; },
@@ -51,6 +52,8 @@ function harness() {
     runState = { ...createIdleRunState(), id: 'synthetic-session-run', mode: 'live', marketplace: 'AU',
       supplier1688Pipeline: { status: 'paused', productIds: ['AU:B000000001'] } };
     products = [{ id: 'AU:B000000001', asin: 'B000000001', sourceAsin: 'B000000001', marketplace: 'AU',
+      sales30: 50, sales30Evidence: { source: 'amazon_product_page', period: 'past_month', kind: 'lower_bound',
+        value: 50, rawText: '50+ bought in past month', asin: 'B000000001' },
       imageUrl: 'https://m.media-amazon.com/images/I/fixture.jpg', supplierSearchStatus: 'queue_waiting',
       supplierProcurementTaskId: '${taskId}', manualPurchaseCost: false, reviewStatus: 'pending' }];
     globalThis.scout = {

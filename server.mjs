@@ -1,3 +1,4 @@
+import { amazonMonthlySalesValue } from "./lib/amazon-sales-policy.mjs";
 import "./lib/fetch-proxy.mjs";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -76,7 +77,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.43";
+const APP_VERSION = "0.9.48";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -115,6 +116,7 @@ const STATIC_FILES = new Map([
   ["/index.html", { file: "index.html", type: "text/html; charset=utf-8" }],
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
+  ["/lib/amazon-sales-policy.mjs", { file: "lib/amazon-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/profit-model.mjs", { file: "lib/profit-model.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-handoff.mjs", { file: "lib/analysis-handoff.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-coverage.mjs", { file: "lib/analysis-coverage.mjs", type: "text/javascript; charset=utf-8" }],
@@ -135,8 +137,7 @@ const NUMERIC_FILTERS = new Set([
   "minReviews",
 ]);
 
-// 亚马逊准则 2026-10-09：月销量 50 以下（含未显示销量标识）的竞品不再支持筛选，
-// 它们在采集源头（店铺卡片角标门控）就不会进入候选列表。
+// 采集保留全部已发现商品；只有当前 ASIN 具备 Amazon 50+ 月购买量证据才进入候选。
 const MONTHLY_SALES_FILTER_BANDS = new Set(["all", "50_to_100", "100_plus"]);
 
 class HttpError extends Error {
@@ -311,16 +312,17 @@ async function routeRequest(request, response, url, signal) {
     requireMethod(request, ["POST"]);
     requireContentType(request, ["application/json"]);
     if (draining || shuttingDown) throw new HttpError(503, "SERVICE_DRAINING", "服务正在更新，请稍后继续。");
-    const { runId, action } = await readJsonBody(request);
-    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(String(runId || "")) || !["start", "resume", "pause", "discard"].includes(action)) {
+    const { runId, action, productIds } = await readJsonBody(request);
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(String(runId || "")) || !["start", "resume", "pause", "discard", "append"].includes(action)) {
       throw new HttpError(422, "INVALID_SUPPLIER_CONTROL", "请指定已保存的匹配批次和有效操作。");
     }
     await supplierPipelineReady;
     const state = action === "pause" ? await supplierPipeline.pause(runId)
       : action === "discard" ? await supplierPipeline.discard(runId)
+      : action === "append" ? await supplierPipeline.append(runId, productIds)
       : await supplierPipeline.start(runId, { resume: true });
     sendJson(response, 200, { ok: true, data: state });
-    if (action !== "pause" && action !== "discard") void supplierPipeline.tick().catch(error => process.stderr.write(`Supplier pipeline: ${error.code || error.message}\n`));
+    if (action === "start" || action === "resume") void supplierPipeline.tick().catch(error => process.stderr.write(`Supplier pipeline: ${error.code || error.message}\n`));
     return;
   }
 
@@ -442,7 +444,7 @@ async function routeRequest(request, response, url, signal) {
       throw new HttpError(422, "INVALID_ANALYSIS_HANDOFF", "初筛商品或筛选条件格式无效。");
     }
     if (!handoff.products.length) {
-      throw new HttpError(422, "NO_REVIEWED_PRODUCTS", "当前没有人工初审通过的商品，未生成采购交接包。");
+      throw new HttpError(422, "NO_REVIEWED_PRODUCTS", "当前没有具备 Amazon 50+ 月购买量证据且人工初审通过的商品，未生成采购交接包。");
     }
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
     const market = body.runState.marketplace;
@@ -1155,7 +1157,11 @@ async function seedAmazonCollection(snapshot) {
   const targets = new Map(collectDiscoveredAsinTargets(discoveries).map(target => [target.asin, target]));
   for (const product of snapshot.products || []) {
     const asin = normalizeAsin(product.sourceAsin || product.asin);
-    if (asin && !targets.has(asin)) targets.set(asin, { asin, sourceStores: product.sourceStores || [{ sellerId: product.sellerId }] });
+    if (asin && !targets.has(asin)) targets.set(asin, {
+      asin, sales30: amazonMonthlySalesValue(product),
+      sales30Evidence: amazonMonthlySalesValue(product) === null ? null : product.sales30Evidence,
+      sourceStores: product.sourceStores || [{ sellerId: product.sellerId }],
+    });
   }
   const items = new Map();
   for (const batch of document?.searchBatches || []) {
@@ -1216,6 +1222,7 @@ async function loadAmazonCollectionDetails(job, asins, signal) {
       const sources = job.tasks[asin]?.sourceStores || [];
       return (sources.length ? sources : [{}]).map(sourceStore => ({
         asins: [asin], sourceStore, visit: { complete: true },
+        salesByAsin: { [asin]: { sales30: job.tasks[asin]?.sales30Evidence?.value, rawText: job.tasks[asin]?.sales30Evidence?.rawText } },
       }));
     });
     const result = await analyzeAmazonDiscoveredAsins(discoveries, {
@@ -1275,13 +1282,20 @@ export function discoveryFromAmazonCheckpoint(store, checkpoint) {
     sellerName: store.sellerName || checkpoint?.sellerName || null,
     rowNumbers: store.rowNumbers,
   };
-  const asins = [...new Set([...(store.asins || []), ...(checkpoint?.asins || [])])].slice(0, MAX_STORE_ASINS);
-  // 店铺卡片月销量角标读数（仅保留仍在候选列表中的 ASIN）。
+  const observedOnSuccessfulPages = (Array.isArray(checkpoint?.pageAudit) ? checkpoint.pageAudit : [])
+    .filter(page => page?.status === "success")
+    .flatMap(page => Array.isArray(page.observedAsins) ? page.observedAsins : []);
+  const asins = [...new Set([...(store.asins || []), ...(checkpoint?.asins || []), ...(checkpoint?.observedAsins || []), ...observedOnSuccessfulPages]
+    .map(normalizeAsin).filter(Boolean))].slice(0, MAX_STORE_ASINS);
+  // 断点保留全部已观察到的 ASIN；销量证据独立校验，缺标识不阻止详情采集。
   const cardSalesSource = isPlainObject(checkpoint?.salesByAsin) ? checkpoint.salesByAsin : {};
   const salesByAsin = {};
   for (const asin of asins) {
     const entry = cardSalesSource[asin];
-    if (entry && Number.isInteger(entry?.sales30) && entry.sales30 >= 0) {
+    if (entry && amazonMonthlySalesValue({ asin, sales30Evidence: {
+      source: "amazon_store_card", asin, period: "past_month", kind: "lower_bound",
+      value: entry.sales30, rawText: entry.rawText,
+    } }) !== null) {
       salesByAsin[asin] = String(entry.rawText || "").trim()
         ? { sales30: entry.sales30, rawText: String(entry.rawText).trim() }
         : { sales30: entry.sales30 };
@@ -1342,15 +1356,14 @@ function nonNegativeCountOrDefault(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
-// 店铺卡片未显示月销量角标（视为月销量 50 以下）而未纳入候选的商品数量，
-// 作为“未纳入”说明附加到 store visit 的 omissionReasons，供前端覆盖说明展示。
+// 此计数仅解释候选筛选，不表示商品未采集；详情页仍可能提供合格的月购买量证据。
 function buildDiscoveryOmissionReasons(checkpoint, reasons) {
   const excluded = nonNegativeCountOrDefault(checkpoint?.excludedUnder50Count);
   if (!excluded) return reasons;
   return [...reasons, {
     code: "AMAZON_STORE_MONTHLY_SALES_GATE",
     count: excluded,
-    message: "店铺首页卡片未显示月销量标识（视为月销量 50 以下）的商品未纳入候选列表。",
+    message: "店铺卡片暂未取得 50+ 月购买量证据的商品仍保留采集，详情完成后再按有效证据筛选候选。",
   }];
 }
 
@@ -1419,7 +1432,7 @@ export async function deferStoreAfterAmazonPause(store, checkpoint, input, pause
     sellerName: store.sellerName || checkpoint?.sellerName || null,
     rowNumbers: store.rowNumbers,
   };
-  const asins = [...new Set([...(store.asins || []), ...(checkpoint?.asins || [])])].slice(0, MAX_STORE_ASINS);
+  const { asins, salesByAsin } = discoveryFromAmazonCheckpoint(store, checkpoint);
   const retryAfterMs = retryAfterMsForAmazonCode(pause.code);
   const retryAt = new Date(Date.now() + retryAfterMs).toISOString();
   const canonicalUrl = checkpoint?.canonicalUrl || (store.sellerId ? buildSellerUrl(input.marketplace, store.sellerId, 1) : null);
@@ -1429,6 +1442,7 @@ export async function deferStoreAfterAmazonPause(store, checkpoint, input, pause
       ...sourceStore,
       ...amazonStoreCoverageFields(checkpoint, store, { complete: false, interruption: pause }),
       asins,
+      salesByAsin,
       pagesVisited: Number(checkpoint?.pagesVisited || 0),
       reportedTotalAsins: Number.isInteger(checkpoint?.reportedTotalAsins) ? checkpoint.reportedTotalAsins : null,
       notEnumeratedAsins: Number(checkpoint?.notEnumeratedAsins || 0),
@@ -1449,7 +1463,7 @@ export async function deferStoreAfterAmazonPause(store, checkpoint, input, pause
     store,
     sourceStore,
     asins,
-    salesByAsin: {},
+    salesByAsin,
     errors: [],
     visit: {
       ...sourceStore,
@@ -1732,14 +1746,13 @@ export async function discoverStore(store, amazonSession, amazonSessionError, si
         message: `The combined source-ASIN list exceeded the ${MAX_STORE_ASINS}-item safety limit.`,
       });
     }
-    // 亚马逊准则 2026-10-09：店铺卡片未显示月销量角标（视为 <50）的商品在采集源头被剔除，
-    // 数量记入“未纳入”说明，保证报告总数与候选数的差额可解释。
+    // 卡片月销量只影响候选资格，不影响全部已发现商品的详情采集。
     const excludedUnder50Count = nonNegativeCountOrDefault(result.excludedUnder50Count);
     if (excludedUnder50Count > 0) {
       omissionReasons.push({
         code: "AMAZON_STORE_MONTHLY_SALES_GATE",
         count: excludedUnder50Count,
-        message: "店铺首页卡片未显示月销量标识（视为月销量 50 以下）的商品未纳入候选列表。",
+        message: "店铺卡片暂未取得 50+ 月购买量证据的商品仍保留采集，详情完成后再按有效证据筛选候选。",
       });
     }
     const interruptionCode = resultInterruption?.code || null;
@@ -2193,7 +2206,9 @@ function normalizeAmazonProductItem(detail, target, input, collectedAt) {
     reviewCountEvidence: detail.reviewCountEvidence || null,
     hasAPlus: null,
     productWeightKg,
+    productWeightEvidence: directProductWeightKg !== null ? detail.productWeightEvidence || null : detail.packageWeightEvidence || null,
     fbaPackageWeightKg,
+    packageWeightEvidence: detail.packageWeightEvidence || null,
     productDimensionsCm: null,
     fbaPackageDimensionsCm: null,
     fulfillment: null,
@@ -2547,8 +2562,12 @@ export function collectDiscoveredAsinTargets(discoveries) {
       ].filter(Boolean));
       // 店铺首页卡片角标读数随 target 传递，供商品条目在详情采集前预填月销量下界。
       const cardSale = cardSales[normalizedAsin];
-      if (cardSale && firstNonNegativeInteger(target.sales30) === null && firstNonNegativeInteger(cardSale.sales30) !== null) {
-        target.sales30 = firstNonNegativeInteger(cardSale.sales30);
+      const verifiedCardSales = amazonMonthlySalesValue({ asin: normalizedAsin, sales30Evidence: {
+        source: "amazon_store_card", asin: normalizedAsin, period: "past_month", kind: "lower_bound",
+        value: cardSale?.sales30, rawText: cardSale?.rawText,
+      } });
+      if (verifiedCardSales !== null && firstNonNegativeInteger(target.sales30) === null) {
+        target.sales30 = verifiedCardSales;
         target.sales30Evidence = isPlainObject(cardSale)
           ? {
             source: "amazon_store_card",
@@ -2826,20 +2845,11 @@ export function candidateFilterExclusionReasons(item, filters) {
   const reasons = [];
   const detailPending = String(item?.detailStatus || "").toLowerCase() === "pending";
   const monthlySalesBand = filters.monthlySalesBand || "all";
-  const monthlySales = firstNonNegativeInteger(item.sales30);
-  // 亚马逊准则 2026-09-29：未采集到月销量的一律按"月销量 50 以下"处理（详情仍在采集中的除外，等待真实销量）。
-  // 亚马逊准则 2026-10-09：详情采集结束后仍未显示月销量标识（或数值 < 50）的竞品不再进入初筛，
-  // 只分析店铺首页/详情页显示 50+/100+/200+/1000+ 的产品。
-  const effectiveMonthlySales = monthlySales !== null
-    ? monthlySales
-    : detailPending
-      ? null
-      : 0;
-  if (!detailPending && effectiveMonthlySales !== null && effectiveMonthlySales < 50) {
+  const effectiveMonthlySales = amazonMonthlySalesValue(item);
+  if (effectiveMonthlySales === null || effectiveMonthlySales < 50) {
     reasons.push("MONTHLY_SALES_BELOW_50");
-  }
-  if (effectiveMonthlySales !== null) {
-    if (monthlySalesBand === "50_to_100" && !(effectiveMonthlySales >= 50 && effectiveMonthlySales < 100)) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
+  } else {
+    if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
     if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
   }
   if (filters.minRating !== null && (Number.isFinite(item.rating) ? item.rating < filters.minRating : !detailPending)) reasons.push("RATING_BELOW_MINIMUM");

@@ -32,6 +32,8 @@ const product = (overrides = {}) => ({
   analysisSourceMode: 'amazon_only', name: 'Reusable bag, 2 Pack', englishName: 'Reusable bag, 2 Pack',
   currentPrice: 20, currentPriceStatus: 'verified', detailStatus: 'success', detailParserVersion: 5,
   productWeight: 0.1, billingWeight: 0.1, rating: 4.2, reviews: 18, sales30: 50,
+  sales30Evidence: { source: 'amazon_product_page', period: 'past_month', kind: 'lower_bound',
+    value: 50, rawText: '50+ bought in past month', asin: ASIN },
   imageUrl: 'https://m.media-amazon.com/images/I/synthetic.jpg', sellerId: 'EXAMPLESELLER',
   purchaseUnitCostCny: 3, purchaseCost: 6, supplierAverageCny: 3,
   suppliers: [{ unitPriceCny: 3 }], supplierSearchStatus: 'complete',
@@ -96,7 +98,7 @@ test('saving a snapshot without a collection persists calculated profit before a
   const before = structuredClone(input);
   await store.saveSnapshot(input);
   const saved = (await diskSnapshot(store, input.runState.id)).products[0];
-  assert.equal(saved.salePrice, 18);
+  assert.equal(saved.salePrice, 20);
   assert.equal(saved.purchaseCost, 6);
   assert.equal(saved.pieceCount, 2);
   assertFormula(saved);
@@ -128,19 +130,21 @@ test('Amazon weight and a changed price each commit newly computed profit with t
   const store = await createStore('amazon-arrivals');
   const runId = 'amazon-arrivals';
   await store.saveSnapshot(snapshot(runId, [product({ productWeight: null, billingWeight: null })]));
-  // 亚马逊准则 2026-09-29：重量未采集的一律按最低运费档计算，利润立即可算（CA 按美国 SOP 最低计费档 3.86）。
+  // CA has no configured local minimum table; unknown weight must not invent one from US fees.
   const weightless = (await diskSnapshot(store, runId)).products[0];
-  assert.ok(Number.isFinite(weightless.margin));
-  assert.equal(weightless.fbaFee, 3.86);
-  assert.equal(weightless.fbaEstimate.weightSource, "重量未采集 · 按最低运费档估算");
+  assert.equal(weightless.margin, null);
+  assert.equal(weightless.fbaFee, null);
+  assert.equal(weightless.fbaEstimate, null);
+  assert.equal(weightless.productWeight, null);
+  assert.equal(weightless.profitInputs.actualWeightKg, null);
   await collect(store, runId);
   const weighted = (await diskSnapshot(store, runId)).products[0];
   assert.equal(weighted.productWeight, 0.3);
-  assert.equal(weighted.salePrice, 8.99);
+  assert.equal(weighted.salePrice, 9.99);
   assertFormula(weighted);
   await collect(store, runId, 2, rawAmazon({ currentPrice: 30 }));
   const repriced = (await diskSnapshot(store, runId)).products[0];
-  assert.equal(repriced.salePrice, 27);
+  assert.equal(repriced.salePrice, 30);
   assert.notEqual(repriced.margin, weighted.margin);
   assertFormula(repriced);
   assert.deepEqual((await store.getRunSnapshot(runId)).products[0], repriced);
@@ -192,7 +196,7 @@ test('source-update notifications expose already committed run and index data wi
   await collect(store, runId);
   await applyQuote(store, runId);
   assert.equal(events.length, 2);
-  assert.equal(events[0].document.snapshot.products[0].salePrice, 8.99);
+  assert.equal(events[0].document.snapshot.products[0].salePrice, 9.99);
   assert.equal(events[1].document.snapshot.products[0].purchaseCost, 14);
   for (const entry of events) {
     assert.deepEqual(entry.event, { runId });

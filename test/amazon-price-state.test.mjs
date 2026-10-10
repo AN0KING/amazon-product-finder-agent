@@ -1,3 +1,4 @@
+import * as salesPolicy from "../lib/amazon-sales-policy.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -136,7 +137,7 @@ function appHarness() {
     };
   })();`);
   const context = vm.createContext({
-    ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
     document: { addEventListener() {}, getElementById() { return null; } }, setTimeout() {}, structuredClone,
   });
   vm.runInContext(source, context, { filename: "app.js" });
@@ -219,7 +220,7 @@ test("actual candidate refresh recomputes the corrected price and keeps supplier
   app.setProducts([product]);
   app.merge([detail()]);
   assert.equal(product.currentPrice, 9.99);
-  assert.equal(product.salePrice, 8.99);
+  assert.equal(product.salePrice, 9.99);
   assert.equal(product.detailParserVersion, 5);
   assert.equal(product.priceEvidence.rawText, "$9.99");
   assert.equal(product.priceRevalidation.previousCurrentPrice, 279);
@@ -246,7 +247,7 @@ test("actual candidate merge respects manual competitor price and its source", (
   app.setProducts([product]);
   app.merge([detail({ currentPrice: null })]);
   assert.equal(product.currentPrice, 20);
-  assert.equal(product.salePrice, 18);
+  assert.equal(product.salePrice, 20);
   assert.equal(product.fieldSources.currentPrice, "manual");
   assert.equal(product.currentPriceStatus, "manual");
 });

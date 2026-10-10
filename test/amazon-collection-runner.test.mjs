@@ -709,3 +709,84 @@ test('a lease renewal queued during expiry recheck prevents stale expiry recover
   assert.equal(h.store.read().job.revision, renewed.revision);
   assert.equal(h.store.read().job.supplierPause.expiresAt, renewed.supplierPause.expiresAt);
 });
+
+test('qualifying store badge evidence survives seed, discovery, pause and service restart before detail loading', async t => {
+  const withSales = (asin, value) => ({ ...target(asin), sales30: value,
+    sales30Evidence: { source: 'amazon_store_card', period: 'past_month', kind: 'lower_bound',
+      value, rawText: `${value}+ bought in past month`, asin } });
+  const seededTarget = withSales(A, 50);
+  const refreshedTarget = withSales(A, 100);
+  const discoveredTarget = withSales(B, 200);
+  const h = await setup(t, { config: {
+    seed: async () => ({ discoveryComplete: false, targets: [seededTarget], items: [] }),
+    discover: async () => ({ complete: true, progressed: true, targets: [refreshedTarget, discoveredTarget], items: [] }),
+  } });
+  assert.deepEqual(h.store.read().job.tasks[A].sales30Evidence, seededTarget.sales30Evidence);
+  assert.equal(h.store.read().job.tasks[A].sales30, 50);
+  await h.runner.tick();
+  const discovered = h.store.read().job.tasks;
+  assert.deepEqual(discovered[A].sales30Evidence, refreshedTarget.sales30Evidence);
+  assert.equal(discovered[A].sales30, 100);
+  assert.deepEqual(discovered[B].sales30Evidence, discoveredTarget.sales30Evidence);
+  assert.equal(discovered[A].attempts, 0); assert.equal(discovered[B].attempts, 0);
+  assert.equal(discovered[A].status, 'pending'); assert.equal(discovered[B].status, 'pending');
+  await h.runner.command(RUN, 'pause');
+  const paused = h.store.read();
+  await h.runner.close();
+  const restarted = await setup(t, { store: h.store, clock: h.clock, loadDetails: async (job, asins) => {
+    assert.deepEqual(job.tasks[A].sales30Evidence, refreshedTarget.sales30Evidence);
+    assert.deepEqual(job.tasks[B].sales30Evidence, discoveredTarget.sales30Evidence);
+    return asins.map(completeItem);
+  } });
+  assert.equal(restarted.store.read().job.status, 'paused');
+  assert.deepEqual(restarted.store.read().job.tasks, paused.job.tasks);
+  await restarted.runner.tick(); assert.equal(restarted.calls.length, 0);
+  await restarted.runner.command(RUN, 'resume');
+  await restarted.runner.tick();
+  assert.deepEqual(restarted.calls, [[A, B]]);
+  assert.equal(restarted.store.read().job.status, 'completed');
+  assert.deepEqual(restarted.store.read().job.tasks[A].sales30Evidence, refreshedTarget.sales30Evidence);
+});
+
+test('target refresh copies only valid monthly evidence and never changes task progress or manual pause', async t => {
+  const h = await setup(t);
+  const evidence = { source: 'amazon_store_card', period: 'past_month', kind: 'lower_bound',
+    value: 50, rawText: '50+ bought in past month', asin: A };
+  const job = h.store.read().job;
+  job.status = 'paused'; job.enabled = false; job.causeCode = 'USER_PAUSED';
+  job.tasks[A] = { ...job.tasks[A], status: 'failed', attempts: 3, nextRetryAt: '2026-10-10T00:00:00Z' };
+  const before = copy(job.tasks[A]);
+  const source = { ...target(A), sales30: 999, sales30Evidence: evidence };
+  h.runner.addTarget(job, source);
+  assert.deepEqual(job.tasks[A], { ...before, sales30: 50, sales30Evidence: evidence });
+  source.sales30Evidence.rawText = 'mutated';
+  assert.equal(job.tasks[A].sales30Evidence.rawText, '50+ bought in past month');
+  const preserved = copy(job);
+  for (const invalid of [
+    { ...target(A), sales30: 500 },
+    { ...target(A), sales30Evidence: { ...evidence, value: 49, rawText: '50+ bought in past month' } },
+    { ...target(A), sales30Evidence: { ...evidence, value: 50, rawText: '50+ bought in past month', asin: B } },
+  ]) {
+    h.runner.addTarget(job, invalid);
+    assert.deepEqual(job, preserved);
+  }
+  h.runner.addTarget(job, { ...target(B), sales30: 500 });
+  assert.equal(job.tasks[B].sales30, undefined);
+  assert.equal(job.tasks[B].sales30Evidence, undefined);
+  assert.equal(job.status, 'paused'); assert.equal(job.causeCode, 'USER_PAUSED');
+});
+
+
+test('full collection retains and fetches low-sales and missing-sales products before candidate screening', async t => {
+  const evidence = { source: 'amazon_store_card', period: 'past_month', kind: 'lower_bound', value: 10, rawText: '10+ bought in past month', asin: A };
+  const h = await setup(t, { config: {
+    seed: async () => ({ discoveryComplete: true, targets: [{ ...target(A), sales30Evidence: evidence }, target(B)], items: [] }),
+  } });
+  assert.equal(h.store.read().job.counts.total, 2);
+  assert.equal(h.store.read().job.tasks[A].sales30, 10);
+  assert.deepEqual(h.store.read().job.tasks[A].sales30Evidence, evidence);
+  assert.equal(h.store.read().job.tasks[B].sales30Evidence, undefined);
+  await h.runner.tick();
+  assert.deepEqual(h.calls, [[A, B]]);
+  assert.equal(h.store.read().job.status, 'completed');
+});

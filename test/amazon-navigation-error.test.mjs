@@ -17,7 +17,7 @@ test('Amazon inline error counters do not turn a price-hidden product into a nav
 });
 
 test('inline browser error constants do not break a valid store result', () => {
-  const page = `<div id="search"><div data-component-type="s-search-result" data-asin="B0FQ161978"></div></div>
+  const page = `<div id="search"><div data-component-type="s-search-result" data-asin="B0FQ161978"><span class="social-proofing-faceout-title-text">50+ bought in past month</span></div></div>
     <script>var err_count=0;var code="ERR_CONNECTION_RESET";</script>`;
   const result = parseAmazonStorePage(page);
   assert.equal(result.navigationError, false);

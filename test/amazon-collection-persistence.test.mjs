@@ -61,7 +61,7 @@ test("successful automatic fields project without changing manual costs or suppl
   const merged = mergeAmazonCollectionProduct(saved, result());
   assert.deepEqual(saved, original);
   assert.equal(merged.currentPrice, 9.99);
-  assert.equal(merged.salePrice, 8.99);
+  assert.equal(merged.salePrice, 9.99);
   assert.equal(merged.name, "Collected title");
   assert.equal(merged.englishName, "Collected title");
   assert.equal(merged.productWeight, 0.3);
@@ -215,7 +215,7 @@ test("empty snapshots expose discovered and newly successful ASINs without recre
   assert.equal(existing.purchaseCost, 457);
   assert.deepEqual(existing.suppliers, [{ unitPriceCny: 457 }]);
   assert.equal(created.currentPrice, 9.99);
-  assert.equal(created.salePrice, 8.99);
+  assert.equal(created.salePrice, 9.99);
   assert.equal(created.detailStatus, "success");
   assert.equal(created.name, "Collected title");
   assert.equal(created.reviewStatus, "pending");

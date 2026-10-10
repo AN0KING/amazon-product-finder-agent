@@ -41,10 +41,16 @@ function assertPersistedProduct(actual, submitted, context) {
     assert.equal(actual.profitCalculation, null);
     assert.ok(actual.profitPendingReasons.includes("售价"));
   } else {
-    assert.equal(actual.salePrice, Math.round(submitted.currentPrice * 0.9 * 100) / 100);
-    // 亚马逊准则 2026-09-29：重量未采集的一律按最低运费档计算，不再有待定重量原因。
-    assert.deepEqual(actual.profitPendingReasons, []);
-    assert.ok(Number.isFinite(actual.margin));
+    assert.equal(actual.salePrice, Math.round(submitted.currentPrice * 100) / 100);
+    // Refreshing price does not supply a missing weight or a local CA minimum-fee table.
+    assert.ok(actual.profitPendingReasons.includes('商品重量'));
+    assert.ok(actual.profitPendingReasons.includes('FBA 配送费'));
+    assert.equal(actual.profitInputs.actualWeightKg, null);
+    assert.equal(actual.billingWeight, null);
+    assert.equal(actual.fbaFee, null);
+    assert.equal(actual.fbaEstimate, null);
+    assert.equal(actual.margin, null);
+    assert.equal(actual.profitCalculation, null);
   }
 }
 
@@ -147,8 +153,8 @@ function automaticPriceSnapshot(runId, extra = {}) {
     runState: { id: runId, marketplace: "CA", mode: "live", analysisSourceMode: "amazon_only" },
     products: [{
       id: "CA:B000000001", currentPrice: 279, detailParserVersion: 4,
-      // 重量未采集时重算会按最低运费档自动估算 FBA 配送费并记录其来源。
-      fieldSources: { currentPrice: "amazon_product_page", fbaFee: "fba_sop_product_weight" }, ...extra,
+      // Only the price was observed; weight and automatic FBA have no source yet.
+      fieldSources: { currentPrice: "amazon_product_page" }, ...extra,
     }],
   };
 }

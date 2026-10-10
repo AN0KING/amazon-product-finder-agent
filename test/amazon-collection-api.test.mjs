@@ -138,6 +138,7 @@ syncBuiltinESMExports();
     asin, sourceAsin: asin, marketplace: "CA", currency: "CAD",
     title: "Synthetic complete product", imageUrl: "https://m.media-amazon.com/images/I/synthetic.jpg",
     currentPrice: 9.99, productWeightKg: 0.06, rating: 4.1, reviewCount: 22,
+    sales30: 100, sales30Evidence: { source: "amazon_product_page", asin, period: "past_month", kind: "lower_bound", value: 100, rawText: "100+ bought in past month" },
     detailStatus: "success", detailParserVersion: AMAZON_PRODUCT_DETAIL_PARSER_VERSION, detailRetryable: false,
     detailErrorCode: null, detailError: null, collectedAt: "2026-09-24T01:00:00.000Z",
     sourceTool: "amazon_product_page", dataSource: "amazon-product-page",
@@ -148,12 +149,15 @@ syncBuiltinESMExports();
   await store.saveSnapshot({
     runState: { id: runId, marketplace: "CA", currency: "CAD", amazonDomain: "www.amazon.ca", analysisSourceMode: "amazon_only", mode: "live", criteria: { useSellerSprite: false } },
     products: [],
-    storeList: { stores: [{ sellerId: null, asins: [asin], rowNumbers: [2] }], audit: { marketplace: "CA" } },
+    storeList: { stores: [{ sellerId: "TESTSELLER01", asins: [asin], rowNumbers: [2] }], audit: { marketplace: "CA" } },
   });
   await store.appendSearchBatch(runId, {
     phase: "analyze", marketplace: "CA", status: "completed", productCount: 1,
     response: { items: [raw] },
   });
+  await store.saveAmazonStoreCheckpoint(runId, { marketplace: "CA", sellerId: "TESTSELLER01", asins: [asin],
+    salesByAsin: { [asin]: { sales30: 100, rawText: "100+ bought in past month" } },
+    complete: true, status: "complete", pagesVisited: 1, reportedTotalAsins: 1, notEnumeratedAsins: 0 });
   const staleSnapshot = await store.getRunSnapshot(runId);
 
   async function startServer() {
@@ -186,7 +190,27 @@ syncBuiltinESMExports();
     return handle;
   }
 
+  const supplierRunId = 'synthetic-api-supplier';
+  const matchedId = 'CA:B000000101';
+  const newId = 'CA:B000000102';
+  const originalTask = { status: 'complete', taskId: 'task_already_matched', attempts: 1, failureCount: 0 };
+  await store.saveSnapshot({
+    runState: { id: supplierRunId, marketplace: 'CA', currency: 'CAD', mode: 'live',
+      supplier1688Pipeline: { owner: 'server', enabled: false, status: 'complete', revision: 263,
+        selectionId: 'keep-original-selection', productIds: [matchedId], selectedCount: 1, matchableCount: 1,
+        tasks: { [matchedId]: originalTask } } },
+    products: [
+      { id: matchedId, asin: 'B000000101', marketplace: 'CA', supplierSearchStatus: 'manual_cost', manualPurchaseCost: true, purchaseCost: 8, purchaseUnitCostCny: 8, imageUrl: raw.imageUrl },
+      { id: newId, asin: 'B000000102', marketplace: 'CA', supplierSearchStatus: 'not_started', imageUrl: raw.imageUrl,
+        sales30: 100, sales30Evidence: { ...raw.sales30Evidence, asin: 'B000000102' } },
+    ],
+  });
+  await store.setActiveSupplierRunId(supplierRunId);
+
   const first = await startServer();
+  const policyAsset = await fetch(first.origin + "/lib/amazon-sales-policy.mjs");
+  assert.equal(policyAsset.status, 200);
+  assert.match(await policyAsset.text(), /hasQualifyingAmazonMonthlySales/);
   assert.equal((await callApi(first.origin, "/api/amazon/collection")).body.data, null);
   const started = await callApi(first.origin, "/api/amazon/collection/start", { method: "POST", body: { runId } });
   assert.equal(started.status, 202);
@@ -223,6 +247,26 @@ syncBuiltinESMExports();
   assert.equal(paused.body.data.status, "paused");
   assert.equal(paused.body.data.enabled, false);
   assert.equal(paused.body.data.causeCode, "USER_PAUSED");
+  const supplierBefore = (await callApi(first.origin, '/api/1688/pipeline')).body.data;
+  const invalidAppend = await callApi(first.origin, '/api/1688/pipeline/control', { method: 'POST', body: { runId: supplierRunId, action: 'append', productIds: [newId, 'CA:B000009999'] } });
+  assert.equal(invalidAppend.status, 422);
+  assert.equal((await callApi(first.origin, '/api/1688/pipeline')).body.data.revision, supplierBefore.revision);
+  const appended = await callApi(first.origin, '/api/1688/pipeline/control', { method: 'POST', body: { runId: supplierRunId, action: 'append', productIds: [matchedId, newId, newId] } });
+  assert.equal(appended.status, 200);
+  assert.equal(appended.body.data.runId, supplierRunId);
+  assert.equal(appended.body.data.status, 'paused');
+  assert.equal(appended.body.data.enabled, false);
+  assert.equal(appended.body.data.selectionId, 'keep-original-selection');
+  assert.deepEqual(appended.body.data.productIds, [matchedId, newId]);
+  assert.deepEqual(appended.body.data.tasks[matchedId], originalTask);
+  assert.equal(appended.body.data.remaining, 1);
+  assert.equal(appended.body.data.processed, 1);
+  const duplicateAppend = await callApi(first.origin, '/api/1688/pipeline/control', { method: 'POST', body: { runId: supplierRunId, action: 'append', productIds: [newId] } });
+  assert.equal(duplicateAppend.status, 200);
+  assert.equal(duplicateAppend.body.data.revision, appended.body.data.revision);
+  const supplierSnapshot = (await callApi(first.origin, `/api/runs/${supplierRunId}`)).body.data;
+  assert.equal(supplierSnapshot.products[0].purchaseCost, 8);
+  assert.equal((await callApi(first.origin, '/api/version')).body.data.active1688Requests, 0);
   await stopServer(first);
 
   const restarted = await startServer();
@@ -238,5 +282,11 @@ syncBuiltinESMExports();
   assert.equal(restoredSnapshot.products[0].purchaseCost, 457);
   assert.equal(restoredSnapshot.products[0].manualPurchaseCost, true);
   assert.equal(restoredSnapshot.amazonCollection.items[0].currentPrice, 9.99);
+  const resumedSupplier = (await callApi(restarted.origin, '/api/1688/pipeline')).body.data;
+  assert.equal(resumedSupplier.status, 'paused');
+  assert.equal(resumedSupplier.enabled, false);
+  assert.equal(resumedSupplier.selectionId, 'keep-original-selection');
+  assert.deepEqual(resumedSupplier.productIds, [matchedId, newId]);
+  assert.deepEqual(resumedSupplier.tasks[matchedId], originalTask);
   await stopServer(restarted);
 });

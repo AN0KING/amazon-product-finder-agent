@@ -1,3 +1,4 @@
+import { amazonMonthlySalesValue, hasQualifyingAmazonMonthlySales } from "./lib/amazon-sales-policy.mjs";
 import {
   DEFAULT_PROFIT_RATES,
   DOMESTIC_FREIGHT_RATE_RANGE_CNY_PER_KG,
@@ -5,6 +6,8 @@ import {
   calculateProductProfit,
   estimateAu2026FbaFeeByProductWeight,
   estimateUs2023FbaFeeByProductWeight,
+  isAmazonWeightUnavailable,
+  estimateMinimumFbaFee,
 } from "./lib/profit-model.mjs";
 import {
   TITLE_PIECE_COUNT_RULE_VERSION,
@@ -32,16 +35,11 @@ import {
 (() => {
   "use strict";
 
-  const COMPETITOR_PRICE_RATIO = 0.9;
-  const APP_VERSION = "0.9.39";
+  const COMPETITOR_PRICE_RATIO = 1;
+  const APP_VERSION = "0.9.48";
   const EXPORT_DIRECTORY_LABEL = "D:\\铺货筛选";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "auto";
-  // 亚马逊准则 2026-09-29：未采集到重量的一律按最低运费计算。取最低重量档上限 75g 作为计费重量代理——
-  // 澳洲 0-75g 小号信封档（3.64 AUD）、美国 20 lb 内大号标准件最低计费档（0.25 lb → 3.86 USD）均落在该档内，
-  // 空运与国内运费同样按该重量计，保证全部运费项取最低档。
-  const MISSING_WEIGHT_LOWEST_FREIGHT_KG = 0.075;
-  const MISSING_WEIGHT_LOWEST_FREIGHT_LABEL = "重量未采集 · 按最低运费档估算";
   const AMAZON_STORE_BATCH_SIZE = 20;
   const AMAZON_DETAIL_BATCH_SIZE = 20;
   const AMAZON_RETRY_FALLBACK_MS = 15_000;
@@ -597,18 +595,49 @@ import {
     return supplierPipelineState;
   }
 
+  function supplierNoPendingMessage(pipeline = runState.supplier1688Pipeline) {
+    const excluded = Number(pipeline?.excludedMonthlySalesCount || 0);
+    return excluded > 0
+      ? `当前没有可继续匹配的商品；${excluded} 个商品因缺少 Amazon 50+ 月购买量标识已跳过，已有结果保留。`
+      : '当前没有可继续匹配的商品，已有结果和任务记录已保留。';
+  }
+
   async function startServerSupplierPipeline() {
     const runId = runState.id;
-    if (!getPending1688ResumeProducts().length) return false;
+    if (!getPending1688ResumeProducts().length) {
+      renderSupplier1688Stage();
+      showToast(supplierNoPendingMessage(), 'info', 6200);
+      return false;
+    }
     try {
       supplierPipelineState = await apiRequest('/api/1688/pipeline/control', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ runId, action: 'resume' }), timeout: 30000,
       });
-      if (runState.id === runId) await refreshAmazonCollectionSnapshot();
-      showToast('原批次已交给后台继续；每件商品取得报价后立即计算利润并更新列表。', 'success', 6000);
+      if (runState.id !== runId) return false;
+      await refreshAmazonCollectionSnapshot();
+      if (runState.id !== runId) return false;
+      const latest = runState.supplier1688Pipeline || supplierPipelineState;
+      renderSupplier1688Stage();
+      if (latest?.status === 'complete' || Number(latest?.remaining) === 0) {
+        showToast(supplierNoPendingMessage(latest), 'info', 6200);
+        return false;
+      }
+      if (!['queued', 'running', 'cooldown'].includes(latest?.status) || latest.enabled === false) {
+        showToast(latest?.message || '匹配仍处于暂停状态，断点已保留，请查看批次状态后继续。', 'info', 6200);
+        return false;
+      }
+      showToast(latest.status === 'cooldown'
+        ? '原批次正在冷却，断点已保留，冷却结束后后台会继续。'
+        : '原批次已交给后台继续；每件商品取得报价后立即计算利润并更新列表。',
+        latest.status === 'cooldown' ? 'info' : 'success', 6000);
       return true;
     } catch (error) {
+      if (error.code === 'SUPPLIER_NO_PENDING_PRODUCTS') {
+        if (runState.id === runId) await refreshAmazonCollectionSnapshot().catch(() => {});
+        showToast(error.message, 'info', 6200);
+        return false;
+      }
       showToast(`匹配暂未继续：${error.message}`, 'error', 6000);
       return false;
     }
@@ -758,7 +787,7 @@ import {
       }
       if (profitAutoCommitTimer !== null) {
         clearProfitAutoCommit();
-        if (!commitProfitEdits(false, { preserveEditor: true })) return;
+        if (!commitProfitEdits(false, { preserveEditor: true, preliminaryReview: true })) return;
       }
       if (!await persistCurrentRun({ notify: true }) || runState.id !== controlledRunId || isCollectionWriteLocked()) return;
       closeManualCostDialog({ force: true, restoreFocus: false });
@@ -1040,7 +1069,7 @@ import {
   }
 
   function salePricePolicyLabel(market = activeMarket) {
-    return `竞品当前售价 ${market.currency} × 0.9`;
+    return `与竞品当前售价 ${market.currency} 相同`;
   }
 
   function fbaPolicyShortLabel(market = activeMarket) {
@@ -3987,8 +4016,8 @@ import {
         && existing.supplierSearchErrorCode === "MISSING_INPUTS";
       const refreshFields = [
         "parentAsin", "parentResolved",
-        "name", "englishName", "translatedTitleZh", "price30", "sales30", "rating", "reviews", "imageUrl",
-        "productWeight", "fbaWeight", "productDimensions", "fbaDimensions", "parameterSource", "fulfillment",
+        "name", "englishName", "translatedTitleZh", "price30", "sales30", "sales30Evidence", "rating", "reviews", "imageUrl",
+        "productWeight", "fbaWeight", "productWeightEvidence", "packageWeightEvidence", "collectionQuality", "productDimensions", "fbaDimensions", "parameterSource", "fulfillment",
         "collectedAt", "dataSource", "filterMatch", "filterExclusionReasons",
       ];
       refreshFields.forEach((field) => {
@@ -4046,9 +4075,9 @@ import {
   function mergeCandidateRecords(left, right) {
     const fields = [
       "title", "translatedTitle", "sellerId", "sellerName", "averagePrice30", "currentPrice", "sales30", "sales60",
-      "salesAmount30", "sales30UpdatedAt", "parentSales30", "parentSalesAmount30", "fbaFee", "fbaFeeSource", "primePrice", "deliveryPrice",
+      "salesAmount30", "sales30UpdatedAt", "sales30Evidence", "parentSales30", "parentSalesAmount30", "fbaFee", "fbaFeeSource", "primePrice", "deliveryPrice",
       "firstFbaAt", "listingAvailableAt", "rating", "reviewCount", "hasAPlus", "productWeightKg", "fbaPackageWeightKg",
-      "productDimensionsCm", "fbaPackageDimensionsCm", "fulfillment", "imageUrl",
+      "productDimensionsCm", "fbaPackageDimensionsCm", "productWeightEvidence", "packageWeightEvidence", "collectionQuality", "fulfillment", "imageUrl",
       "sourceMarketplace", "providerMarketplace", "providerMode", "detailParserVersion",
     ];
     const score = (item) => fields.filter((field) => item[field] !== null && item[field] !== undefined && item[field] !== "").length;
@@ -4157,6 +4186,9 @@ import {
       billingWeight: finiteOrNull(item.fbaPackageWeightKg ?? item.packageWeightKg ?? item.productWeightKg ?? item.weightKg),
       productWeight: finiteOrNull(item.productWeightKg ?? item.weightKg),
       fbaWeight: finiteOrNull(item.fbaPackageWeightKg ?? item.packageWeightKg),
+      productWeightEvidence: item.productWeightEvidence ? structuredClone(item.productWeightEvidence) : null,
+      packageWeightEvidence: item.packageWeightEvidence ? structuredClone(item.packageWeightEvidence) : null,
+      collectionQuality: item.collectionQuality ? structuredClone(item.collectionQuality) : null,
       productDimensions: formatDimensions(item.productDimensionsCm ?? item.dimensionsCm),
       fbaDimensions: formatDimensions(item.fbaPackageDimensionsCm ?? item.packageDimensionsCm),
       parameterSource: item.fbaPackageDimensionsCm || item.packageDimensionsCm
@@ -4257,7 +4289,7 @@ import {
     product.thresholdCostCny = Number.isFinite(product.targetCostCny)
       ? roundMoney(product.targetCostCny * SUPPLIER_PROFIT_THRESHOLD)
       : null;
-    if (!product.manualPurchaseCost) {
+    if (!isManualCostProduct(product)) {
       product.purchaseCost = null;
       product.purchaseUnitCostCny = null;
     }
@@ -4449,6 +4481,29 @@ import {
     };
   }
 
+  function resolvePurchasePriceInput(product, raw, baseline) {
+    const text = String(raw ?? "").trim();
+    const entered = numberOrNull(text);
+    const invalid = text !== "" && (entered === null || entered < 0);
+    const manuallyEdited = !invalid && text !== "" && entered !== finiteOrNull(baseline);
+    const pricing = product ? ensureProductPurchasePricing(product) : { unitCostCny: null };
+    return {
+      unitCostCny: invalid ? null : manuallyEdited ? entered : pricing.unitCostCny,
+      manuallyEdited,
+      manual: isManualCostProduct(product) || manuallyEdited,
+      invalid,
+    };
+  }
+
+  function purchasePriceInputNote(product, pricing) {
+    if (pricing.invalid) return "采购单价必须是大于或等于 0 的有效数字。";
+    if (pricing.unitCostCny === null) return "暂无 1688 采购均价，可先初审，采购成本稍后补充。";
+    if (pricing.manual) return "使用人工采购单价；后续 1688 报价不会覆盖。";
+    return Number.isFinite(product?.supplierAverageCny)
+      ? "默认使用 1688 单件采购均价；修改后使用人工单价。"
+      : "沿用已保存采购单价；修改后使用人工单价。";
+  }
+
   function calculateTargetCostCny(product) {
     const salePrice = calculateOurSalePrice(product);
     if (salePrice === null || salePrice <= 0) return null;
@@ -4483,7 +4538,7 @@ import {
     return getFilteredProducts().filter((product) => {
       if (isAnalysisReadOnly(product)) return false;
       if (!product || product.dataMode === "mock" || product.reviewStatus === "rejected") return false;
-      if (product.manualPurchaseCost) return false;
+      if (isManualCostProduct(product)) return false;
       if (!/^[A-Z0-9]{10}$/i.test(String(product.asin || product.sourceAsin || "").trim())) return false;
       if (!product.imageUrl) return false;
       return !["complete", "fallback_estimate", "manual_cost"].includes(String(product.supplierSearchStatus || "not_started"));
@@ -4620,40 +4675,36 @@ import {
     const selectionRunId = runState.id;
     try {
       if (!await prepareAmazonCollectionForSupplier()) return false;
-      const existingPending = getPending1688ResumeProducts();
-      let selectedProducts = getAmazonFilteredProductsFor1688();
-      if (existingPending.length && runState.supplier1688Pipeline?.status !== "complete") {
-        const pendingIds = new Set(existingPending.map((product) => product.id));
-        const filterDiffers = selectedProducts.length !== existingPending.length
-          || selectedProducts.some((product) => !pendingIds.has(product.id));
-        const reScope = filterDiffers
-          && selectedProducts.length > 0
-          && window.confirm(`上次批次仍有 ${existingPending.length} 个商品待处理，当前筛选可匹配 ${selectedProducts.length} 个。\n\n点击"确定"放弃旧批次、只匹配当前筛选的商品；点击"取消"继续上次的批次。`);
-        if (!reScope) {
-          if (!supplier1688LoggedIn) {
-            showToast(`上次筛选批次仍有 ${existingPending.length} 个商品待处理；登录并在线验证后将从断点继续。`, "info", 6200);
-            await start1688Session();
-            return false;
-          }
-          return await resumePending1688Candidates();
-        }
-        // The old batch checkpoint lives in the saved snapshot and, once owned
-        // by the server, rejects any replacement save (STALE_SUPPLIER_SNAPSHOT).
-        // Discard it on the server first: matched products keep their quotes,
-        // only the batch number is cleared so a new one can be generated.
+      const selectedProducts = getAmazonFilteredProductsFor1688();
+      if (runState.supplier1688Pipeline?.productIds?.length) {
+        // Extend the latest saved task on the server. Never replace its
+        // revision, historical results or per-product retry/task records.
         try {
-          await apiRequest('/api/1688/pipeline/control', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ runId: selectionRunId, action: 'discard' }), timeout: 30000,
-          });
-          supplierPipelineState = null;
+          if (selectedProducts.length) {
+            supplierPipelineState = await apiRequest('/api/1688/pipeline/control', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ runId: selectionRunId, action: 'append', productIds: [...new Set(selectedProducts.map(product => product.id))] }),
+              timeout: 30000,
+            });
+          }
+          if (runState.id !== selectionRunId) return false;
+          await refreshAmazonCollectionSnapshot();
+          if (runState.id !== selectionRunId) return false;
         } catch (error) {
-          showToast(`旧批次尚未清空：${error.message}`, 'error', 5600);
+          showToast(`续配范围尚未保存：${error.message}`, 'error', 6200);
           return false;
         }
-        if (runState.id !== selectionRunId) return false;
-        selectedProducts = getAmazonFilteredProductsFor1688();
-        showToast(`已清空旧批次，改用当前筛选：将只匹配 ${selectedProducts.length} 个商品，旧批次剩余部分不再继续。`, "info", 6200);
+        const remaining = getPending1688ResumeProducts().length;
+        if (!remaining) {
+          showToast(supplierNoPendingMessage(), 'info', 6200);
+          return true;
+        }
+        if (!supplier1688LoggedIn) {
+          showToast(`原任务已保存，${remaining} 个商品待继续匹配；已有结果保留，请先登录并验证 1688。`, 'info', 6200);
+          await start1688Session();
+          return false;
+        }
+        return await resumePending1688Candidates();
       }
       if (!selectedProducts.length) {
         showToast("当前已确认的 Amazon 筛选下没有可发起 1688 匹配的商品。", "info", 5200);
@@ -4697,7 +4748,7 @@ import {
       if (!saved) {
         supplier1688Pipeline.status = "paused";
         supplier1688Pipeline.lastReason = "checkpoint_save_failed";
-        showToast("筛选批次尚未保存，请重试；保存成功后才会调用 1688。", "error", 5200);
+        showToast(`筛选批次尚未保存：${persistenceLastError?.message || "请重试"}；保存成功后才会调用 1688。`, "error", 6200);
         return false;
       }
 
@@ -4720,6 +4771,8 @@ import {
       ? new Set(runState.supplier1688Pipeline.productIds)
       : null;
     if (!cohortIds?.size) return [];
+    if (runState.supplier1688Pipeline?.owner === 'server'
+      && Number(runState.supplier1688Pipeline.remaining) === 0) return [];
     return products.filter((product) => cohortIds.has(product.id) && isPending1688ResumeCandidate(product));
   }
 
@@ -4730,9 +4783,12 @@ import {
   }
 
   function isPending1688ResumeCandidate(product) {
+    if (!hasQualifyingAmazonMonthlySales(product)) return false;
+    if (runState.supplier1688Pipeline?.owner === "server"
+      && ["complete", "failed", "skipped"].includes(runState.supplier1688Pipeline.tasks?.[product.id]?.status)) return false;
     if (isAnalysisReadOnly(product)) return false;
     if (!product || product.dataMode === "mock" || product.reviewStatus === "rejected") return false;
-    if (product.manualPurchaseCost) return false;
+    if (isManualCostProduct(product)) return false;
     if (!/^[A-Z0-9]{10}$/i.test(String(product.asin || product.sourceAsin || "").trim())) return false;
     if (!product.imageUrl) return false;
     const status = String(product.supplierSearchStatus || "not_started");
@@ -5014,7 +5070,7 @@ import {
       const product = items[index];
       if (signal?.aborted) throw signal.reason || new DOMException("任务已取消。", "AbortError");
       if (isAnalysisReadOnly(product)) { audit.skipped += 1; onProgress(index + 1, items.length); await onCheckpoint(product, index + 1, items.length); continue; }
-      if (product.manualPurchaseCost) {
+      if (isManualCostProduct(product)) {
         audit.skipped += 1;
         product.supplierSearchStatus = "manual_cost";
         product.supplierSearchError = "已使用人工采购成本，后台 1688 不会覆盖。";
@@ -5030,7 +5086,7 @@ import {
         product.supplierSearchStatus = "missing_inputs";
         product.supplierSearchError = "商品主图缺失，无法发起 1688 图片搜索。";
         product.supplierSearchErrorCode = "MISSING_INPUTS";
-        if (!product.manualPurchaseCost) product.purchaseCost = null;
+        if (!isManualCostProduct(product)) product.purchaseCost = null;
         updateProductComputed(product);
         onProgress(index + 1, items.length);
         await onCheckpoint(product, index + 1, items.length);
@@ -5133,7 +5189,7 @@ import {
   }
 
   function apply1688SearchResult(product, data = {}) {
-    if (isAnalysisReadOnly(product)) return;
+    if (isAnalysisReadOnly(product) || isManualCostProduct(product)) return;
     const procurementTaskId = validProcurementTaskId(data.procurementTaskId || data.audit?.procurementTaskId);
     if (procurementTaskId) product.supplierProcurementTaskId = procurementTaskId;
     const rawQuotes = Array.isArray(data.quotes) ? data.quotes : Array.isArray(data.items) ? data.items : [];
@@ -5278,7 +5334,7 @@ import {
       : fallbackEnough
         ? "1688-image-search-low-confidence"
       : `1688-${product.supplierSearchStatus}`;
-    if (!product.manualPurchaseCost) {
+    if (!isManualCostProduct(product)) {
       product.purchaseUnitCostCny = averageCostCny;
       product.purchaseCost = totalAverageCostCny;
     }
@@ -5574,7 +5630,7 @@ import {
       product.roughMargin = Number.isFinite(totalAverageCostCny)
         ? ((product.targetCostCny - totalAverageCostCny) / product.targetCostCny) * 100
         : null;
-      if (!product.manualPurchaseCost) {
+      if (!isManualCostProduct(product)) {
         product.purchaseUnitCostCny = product.supplierAverageCny;
         product.purchaseCost = totalAverageCostCny;
       }
@@ -6097,9 +6153,9 @@ import {
   }
 
   function syncExportMenuCounts() {
-    setText("exportAllCandidateCount", products.length);
-    setText("exportApprovedProductCount", products.filter((product) => product.reviewStatus === "approved").length);
-    setText("analysisReviewedExportCount", products.filter((product) => product.reviewStatus === "approved").length);
+    setText("exportAllCandidateCount", products.filter(hasQualifyingAmazonMonthlySales).length);
+    setText("exportApprovedProductCount", products.filter((product) => product.reviewStatus === "approved" && hasQualifyingAmazonMonthlySales(product)).length);
+    setText("analysisReviewedExportCount", products.filter((product) => product.reviewStatus === "approved" && hasQualifyingAmazonMonthlySales(product)).length);
   }
 
   function resetResultFilters() {
@@ -6145,16 +6201,11 @@ import {
     const enabled = (value) => value !== null && value !== undefined && value !== "";
     const detailPending = String(product?.detailStatus || "").toLowerCase() === "pending";
     const monthlySalesBand = criteria.monthlySalesBand || "all";
-    const monthlySales = finiteOrNull(product?.sales30);
-    // 亚马逊准则 2026-09-29：未采集到月销量的一律按"月销量 50 以下"处理（详情仍在采集中的除外，等待真实销量）。
-    // 亚马逊准则 2026-10-09：50 以下档位已移除——月销量 50 以下（无销量角标）的竞品在采集源头即被排除。
-    const effectiveMonthlySales = monthlySales !== null && monthlySales >= 0
-      ? monthlySales
-      : detailPending
-        ? null
-        : 0;
-    if (effectiveMonthlySales !== null) {
-      if (monthlySalesBand === "50_to_100" && !(effectiveMonthlySales >= 50 && effectiveMonthlySales < 100)) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
+    const effectiveMonthlySales = amazonMonthlySalesValue(product);
+    if (effectiveMonthlySales === null || effectiveMonthlySales < 50) {
+      reasons.push("MONTHLY_SALES_BELOW_50");
+    } else {
+      if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
       if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
     }
     if (enabled(criteria.minReviews) && (Number.isFinite(product.reviews) ? product.reviews < criteria.minReviews : !detailPending)) reasons.push("REVIEWS_BELOW_MINIMUM");
@@ -6169,8 +6220,8 @@ import {
 
   function weightBandMatches(product, band) {
     if (!band) return true;
-    // 亚马逊准则 2026-09-29：未采集到重量的一律按最低运费档（75g）处理，仅匹配最低重量档。
-    const weightKg = productWeightKgForDisplay(product) ?? MISSING_WEIGHT_LOWEST_FREIGHT_KG;
+    const weightKg = productWeightKgForDisplay(product);
+    if (weightKg === null) return false;
     const grams = weightKg * 1_000;
     if (band === "under_100") return grams < 100;
     if (band === "100_150") return grams >= 100 && grams <= 150;
@@ -6294,7 +6345,7 @@ import {
   function currentFilterExclusionReasons() {
     const labels = {
       MONTHLY_SALES_AT_OR_ABOVE_50: "Amazon 月销量不在 50 以下（旧档位，已停用）",
-      MONTHLY_SALES_BELOW_50: "Amazon 月销量未达 50（未显示销量标识的按 50 以下处理）",
+      MONTHLY_SALES_BELOW_50: "Amazon 未明确显示 50+ 或更高月购买量标识",
       MONTHLY_SALES_OUTSIDE_50_TO_100: "Amazon 月销量不在 50–<100",
       MONTHLY_SALES_BELOW_100: "Amazon 月销量低于 100",
       RATING_BELOW_MINIMUM: "评价星级低于筛选值或缺失",
@@ -6323,6 +6374,8 @@ import {
     const pipeline = runState.supplier1688Pipeline;
     const pending = getPending1688ResumeProducts();
     const matchable = getAmazonFilteredProductsFor1688();
+    const excludedSalesNote = Number(pipeline?.excludedMonthlySalesCount || 0) > 0
+      ? `；另有 ${pipeline.excludedMonthlySalesCount} 个因无合格月销量标识而跳过` : "";
     const pendingIds = new Set(pending.map((product) => product.id));
     const filterDiffers = pending.length > 0
       && matchable.length > 0
@@ -6345,11 +6398,13 @@ import {
         ? `1688 匹配中 ${Number(pipeline?.processed || 0)}/${Number(pipeline?.matchableCount || pending.length)}`
         : supplier1688SelectionPending
           ? "正在保存筛选批次…"
+          : !pending.length && !matchable.length
+          ? "暂无待匹配商品"
           : filterDiffers
-          ? `改用当前筛选匹配 ${matchable.length} 个商品`
+          ? `继续匹配当前筛选 ${matchable.length} 个商品`
           : pending.length
             ? `继续匹配 ${pending.length} 个商品`
-            : `匹配当前筛选 ${matchable.length} 个商品`;
+            : `${pipeline?.productIds?.length ? "继续匹配当前筛选" : "匹配当前筛选"} ${matchable.length} 个商品`;
     }
 
     if (supplier1688SelectionPending && !running) {
@@ -6357,7 +6412,7 @@ import {
       return;
     }
     if (running) {
-      summary.textContent = `固定批次 ${Number(pipeline?.selectedCount || 0)} 个，已处理 ${Number(pipeline?.processed || 0)} 个，剩余 ${Number(pipeline?.remaining ?? pending.length)} 个；取得有效报价后立即按公式计算利润并更新列表。${pipeline?.message || ''}`;
+      summary.textContent = `本任务累计纳入 ${Number(pipeline?.selectedCount || 0)} 个，已处理 ${Number(pipeline?.processed || 0)} 个，剩余 ${Number(pipeline?.remaining ?? pending.length)} 个${excludedSalesNote}；取得有效报价后立即按公式计算利润并更新列表。${pipeline?.message || ''}`;
       return;
     }
     if (pipeline?.owner === 'server' && pipeline.status === 'needs_attention') {
@@ -6366,12 +6421,16 @@ import {
     }
     if (pending.length) {
       summary.textContent = filterDiffers
-        ? `上次批次仍有 ${pending.length} 个待处理，当前筛选为 ${matchable.length} 个商品；点击按钮可选择改用当前筛选重新匹配。`
+        ? `原任务仍有 ${pending.length} 个待处理，当前筛选可匹配 ${matchable.length} 个；点击继续将追加尚未加入的商品，保留已有结果并跳过重复商品。`
         : `上次确认的固定批次仍有 ${pending.length} 个待处理；${supplier1688LoggedIn ? "点击继续，不会加入筛选范围外的商品。" : "登录 1688 后可从断点继续。"}`;
       return;
     }
+    if (pipeline?.status === "complete" && !matchable.length) {
+      summary.textContent = supplierNoPendingMessage(pipeline);
+      return;
+    }
     if (pipeline?.status === "complete" && Number(pipeline.matchableCount || 0) > 0) {
-      summary.textContent = `上次固定批次 ${Number(pipeline.matchableCount)} 个已处理完成。当前筛选另有 ${matchable.length} 个可匹配商品。`;
+      summary.textContent = `本任务已处理 ${Number(pipeline.processed ?? pipeline.matchableCount)} 个${excludedSalesNote}，当前筛选另有 ${matchable.length} 个可匹配；继续匹配会保留已有结果。`;
       return;
     }
     const visibleCount = getFilteredProducts().length;
@@ -6420,9 +6479,10 @@ import {
     const pageProducts = currentVisibleProducts.slice(pageStart, pageStart + RESULTS_PAGE_SIZE);
     body.innerHTML = pageProducts.map(renderProductRow).join("");
     byId("visibleCount").textContent = String(currentVisibleProducts.length);
-    setText("totalCandidateCount", products.length);
+    const candidateCount = products.filter(hasQualifyingAmazonMonthlySales).length;
+    setText("totalCandidateCount", candidateCount);
     setText("sourceAsinCount", products.length);
-    byId("navCandidateCount").textContent = String(products.length);
+    byId("navCandidateCount").textContent = String(candidateCount);
     renderAsinCoverageSummary();
     renderSupplier1688Stage();
     syncExportMenuCounts();
@@ -6473,7 +6533,7 @@ import {
       hiddenIncomplete
         ? "这些商品已有大致数据，可手工补齐成本并初审；导出文件会明确标记完整度和缺失字段。"
         : hiddenByCriteria
-          ? "月销量、评价数量或星级未达当前条件（未显示月销量标识的按月销量 50 以下处理，不再采集分析）；具体原因见上方覆盖说明，ASIN 不会被删除。"
+          ? "月销量、评价数量或星级未达当前条件（仅保留 Amazon 明确显示 50+ 或更高月购买量标识的商品）；具体原因见上方覆盖说明，ASIN 不会被删除。"
         : "调整筛选条件后重新查看。",
     );
     if (emptyAction) {
@@ -6517,8 +6577,10 @@ import {
     if (productWeightKg !== null && productWeightKg > 0) {
       values.push(`<span><b>${weightLabel}</b>${formatWeightKg(productWeightKg)} kg · ${escapeHtml(productWeightBandLabel(productWeightKg))}</span>`);
     }
+    if (productWeightKg === null && isAmazonWeightUnavailable(product)) values.push("<span>页面未提供重量 · 可初审</span>");
     if (product.fulfillmentMode === "FBA" && fbaFee !== null) {
-      values.push(`<span class="candidate-fba-cost"><b>FBA 配送费</b>${currencyPairHtml(fbaFee, product.marketplace, { compact: true })}</span>`);
+      const feeLabel = product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee ? "FBA 最低档估算" : "FBA 配送费";
+      values.push(`<span class="candidate-fba-cost"><b>${feeLabel}</b>${currencyPairHtml(fbaFee, product.marketplace, { compact: true })}</span>`);
     }
     return values.length ? `<div class="candidate-logistics is-calculated">${values.join("")}</div>` : "";
   }
@@ -6675,7 +6737,7 @@ import {
   }
 
   function isLowConfidenceSupplierEstimate(product) {
-    return product?.manualPurchaseCost !== true
+    return !isManualCostProduct(product)
       && product?.supplierSearchStatus === "fallback_estimate"
       && product?.supplierCostMode === SUPPLIER_COST_MODE_FALLBACK
       && product?.supplierCostConfidence === "low";
@@ -6988,9 +7050,7 @@ import {
     if (!manualCostDraft || !product || manualCostDraft.activeMode !== "FBA") return null;
     if (product.manualFbaFee || manualCostDraft.feeTouched.FBA) return manualCostDraft.fbaEstimate || null;
     const weightKg = finiteOrNull(manualCostDraft.profitInputs?.actualWeightKg);
-    const market = MARKET_CONFIGS[String(product.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
-    const estimate = market.code === "AU" || (weightKg !== null && weightKg > 0)
-      ? estimateWeightOnlyFbaFee({
+    const estimate = estimateWeightOnlyFbaFee({
           ...product,
           fulfillmentMode: "FBA",
           productWeight: weightKg,
@@ -6998,8 +7058,7 @@ import {
           salePrice: manualCostDraft.salePrice,
           manualProfitInputs: true,
           weightSource: manualCostDraft.profitInputs.weightSource || "商品重量",
-        })
-      : null;
+        });
     manualCostDraft.fbaEstimate = estimate;
     manualCostDraft.fees.FBA = estimate ? valueOrBlank(estimate.fee) : "";
     const feeInput = byId("manualFulfillmentFee");
@@ -7038,9 +7097,12 @@ import {
         : "人工设置"
       : detectedPieceCount.evidence ? `Amazon 标题自动识别 · ${detectedPieceCount.evidence}` : "");
     const draftCurrentPrice = numberOrNull(manualCostDraft.amazon.currentPrice);
-    manualCostDraft.salePrice = draftCurrentPrice !== null && draftCurrentPrice > 0
-      ? roundMoney(draftCurrentPrice * COMPETITOR_PRICE_RATIO)
-      : null;
+    const product = products.find(item => item.id === manualCostDraft.productId);
+    manualCostDraft.salePrice = product?.manualSalePrice && finiteOrNull(product.currentPrice) === draftCurrentPrice
+      ? product.salePrice
+      : draftCurrentPrice !== null && draftCurrentPrice > 0
+        ? roundMoney(draftCurrentPrice * COMPETITOR_PRICE_RATIO)
+        : null;
     manualCostDraft.productDimensionsCm = [numberValue("manualProductLengthCm"), numberValue("manualProductWidthCm"), numberValue("manualProductHeightCm")];
     manualCostDraft.packageDimensionsCm = [numberValue("manualLengthCm"), numberValue("manualWidthCm"), numberValue("manualHeightCm")];
     manualCostDraft.profitInputs = {
@@ -7092,8 +7154,10 @@ import {
     if (!manualCostDraft) return false;
     captureManualCostDraft();
     const baseline = manualCostDraft.baseline;
+    const product = products.find(item => item.id === manualCostDraft.productId);
+    const pricing = resolvePurchasePriceInput(product, manualCostDraft.purchaseCost, baseline.purchaseUnitCostCny);
     return manualCostDraft.activeMode !== baseline.fulfillmentMode
-      || comparableManualNumber(manualCostDraft.purchaseCost) !== baseline.purchaseUnitCostCny
+      || pricing.invalid || pricing.manuallyEdited
       || comparableManualNumber(manualCostDraft.pieceCount) !== baseline.pieceCount
       || comparableManualNumber(manualCostDraft.fees.FBA) !== baseline.fbaFee
       || comparableManualNumber(manualCostDraft.fees.FBM) !== baseline.fbmFee
@@ -7155,12 +7219,18 @@ import {
     if (byId("manualProfitFormulaNote")) byId("manualProfitFormulaNote").hidden = true;
     const approveButton = byId("manualCostApproveButton");
     if (approveButton) {
-      approveButton.disabled = true;
-      approveButton.title = "填写有效成本并完成利润计算后可初审";
+      const product = products.find(item => item.id === manualCostDraft?.productId);
+      const reason = preliminaryReviewBlockingReason(product, manualCostDraft?.profitInputs?.actualWeightKg);
+      approveButton.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || product.supplierSearchStatus === "searching" || Boolean(reason);
+      approveButton.title = reason || "保存并初审；完整利润可后续计算";
     }
   }
 
-  function validateManualProfitInputs(profitInputs) {
+  function validateManualProfitInputs(profitInputs, product = null) {
+    const rawWeight = String(byId("manualActualWeightKg")?.value ?? "").trim();
+    if (rawWeight && (numberOrNull(rawWeight) === null || numberOrNull(rawWeight) <= 0)) {
+      return { id: "manualActualWeightKg", message: "实际重量必须是大于 0 的有效数字。" };
+    }
     const percentageFields = [
       ["commissionRate", "manualCommissionRate", "Amazon 佣金"],
       ["fxLossRate", "manualFxLossRate", "汇率折损"],
@@ -7175,8 +7245,8 @@ import {
         return { id, message: `${label}必须是 0-100% 的有效数字。` };
       }
     }
-    if (!Number.isFinite(profitInputs?.actualWeightKg) || profitInputs.actualWeightKg <= 0) {
-      return { id: "manualActualWeightKg", message: "实际重量必须是大于 0 的有效数字。" };
+    if (!(profitInputs?.actualWeightKg === null && isAmazonWeightUnavailable(product)) && (!Number.isFinite(profitInputs?.actualWeightKg) || profitInputs.actualWeightKg <= 0)) {
+      return { id: "manualActualWeightKg", message: "请填写真实重量，或完成详情采集以确认页面未提供重量。" };
     }
     if (!Number.isFinite(profitInputs?.airFreightRateCnyPerKg) || profitInputs.airFreightRateCnyPerKg < 0) {
       return { id: "manualAirFreightRate", message: "空运单价必须是大于或等于 0 的有效数字。" };
@@ -7210,14 +7280,13 @@ import {
     const purchaseRaw = manualCostDraft.purchaseCost;
     const pieceCount = normalizePieceCount(manualCostDraft.pieceCount);
     const feeRaw = manualCostDraft.fees[mode];
-    const purchaseUnitCostCny = numberOrNull(purchaseRaw);
+    const purchasePricing = resolvePurchasePriceInput(product, purchaseRaw, manualCostDraft.baseline.purchaseUnitCostCny);
+    const purchaseUnitCostCny = purchasePricing.unitCostCny;
+    setText("manualPurchaseCostSource", purchasePriceInputNote(product, purchasePricing));
     const purchaseCost = totalPurchaseCostCny(purchaseUnitCostCny, pieceCount);
     const fulfillmentFee = numberOrNull(feeRaw);
     const draftCurrentPrice = numberOrNull(manualCostDraft.amazon.currentPrice);
-    const salePrice = draftCurrentPrice !== null && draftCurrentPrice > 0
-      ? roundMoney(draftCurrentPrice * COMPETITOR_PRICE_RATIO)
-      : null;
-    manualCostDraft.salePrice = salePrice;
+    const salePrice = manualCostDraft.salePrice;
     if (byId("manualCostSalePrice")) byId("manualCostSalePrice").value = valueOrBlank(salePrice);
     setCurrencyConversionOutput("manualAmazonCurrentPriceCny", draftCurrentPrice, product.marketplace);
     setCurrencyConversionOutput("manualCostSalePriceCny", salePrice, product.marketplace);
@@ -7225,19 +7294,19 @@ import {
     if (byId("manualPurchaseTotal")) byId("manualPurchaseTotal").value = valueOrBlank(purchaseCost);
     ["manualVolumetricWeightKg", "manualChargeableWeightKg", "manualAirFreightCny", "manualPurchaseTaxCny", "manualDomesticFreightCny"].forEach((id) => setManualSummary(id, ""));
     resetManualCostProfitPreview();
-    if (purchaseRaw === "" || pieceCount === null || feeRaw === "") {
+    if (purchaseUnitCostCny === null || pieceCount === null || feeRaw === "") {
       setManualCostError(`填写1688单件采购价、标题件数和 ${mode} ${mode === "FBA" ? "配送费" : "履约费"}后立即显示利润。`);
       return;
     }
     if (draftCurrentPrice === null || draftCurrentPrice <= 0) {
-      setManualCostError("补填有效的竞品当前售价后，将自动按 0.9 倍生成我们的售价并计算利润。");
+      setManualCostError("补填有效的竞品当前售价后，我们的售价将与竞品当前售价相同，并自动计算利润。");
       return;
     }
     if (purchaseUnitCostCny === null || purchaseUnitCostCny < 0 || purchaseCost === null || fulfillmentFee === null || fulfillmentFee < 0) {
       setManualCostError("1688单件采购价、标题件数和履约费必须是有效数字。");
       return;
     }
-    const inputError = validateManualProfitInputs(manualCostDraft.profitInputs);
+    const inputError = validateManualProfitInputs(manualCostDraft.profitInputs, product);
     if (inputError) {
       setManualCostError(inputError.message);
       return;
@@ -7265,7 +7334,7 @@ import {
       const reason = !Number.isFinite(salePrice) || salePrice <= 0
         ? "销售价格缺失，暂时无法预览利润；成本仍可保存。"
         : !Number.isFinite(manualCostDraft.profitInputs.actualWeightKg) || manualCostDraft.profitInputs.actualWeightKg <= 0
-          ? "实际重量缺失，暂时无法预览利润；成本仍可保存。"
+          ? "重量缺失：FBA 可按最低档估算；头程及完整利润待补，仍可保存并初审。"
           : "当前利润参数不完整，暂时无法预览。";
       setManualCostError(reason);
       return;
@@ -7289,8 +7358,9 @@ import {
     }
     const approveButton = byId("manualCostApproveButton");
     if (approveButton) {
-      approveButton.disabled = product.supplierSearchStatus === "searching";
-      approveButton.title = "保存当前成本并初审通过";
+      const reason = preliminaryReviewBlockingReason(product, manualCostDraft.profitInputs.actualWeightKg);
+      approveButton.disabled = product.supplierSearchStatus === "searching" || Boolean(reason);
+      approveButton.title = reason || "保存当前成本并初审通过";
     }
     const confidence = byId("manualCostConfidenceNote");
     if (confidence) {
@@ -7323,6 +7393,8 @@ import {
         type: "info",
       };
     }
+    if (product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee) return { message: `${prefix}；页面未提供重量，FBA 配送费暂按最低档估算；头程及完整利润待补齐重量后计算。`, type: "info" };
+    if (!product.profitCalculation || product.profitCalculation.purchaseCostAssumedZero) return { message: `${prefix}；利润参数可后续补充，当前尚无完整利润。`, type: "info" };
     if (isLowConfidenceSupplierEstimate(product)) {
       return {
         message: `${prefix}；当前利润来自图片相似度最高 6 家真实报价的低置信度估算，其中可能包含低相似商品，运营导出前请复核。`,
@@ -7341,7 +7413,7 @@ import {
     };
   }
 
-  function saveManualCost({ approve = false } = {}) {
+  function saveManualCost({ approve = false, allowIncomplete = approve } = {}) {
     if (collectionWriteBlocked()) return;
     if (!manualCostDraft) return;
     captureManualCostDraft();
@@ -7358,8 +7430,8 @@ import {
     }
     const amazon = manualCostDraft.amazon;
     const currentPrice = numberOrNull(amazon.currentPrice);
-    if (currentPrice === null || currentPrice <= 0) {
-      setManualCostError("竞品当前售价必须是大于 0 的有效数字；我们的售价会自动按其 0.9 倍计算。");
+    if ((!allowIncomplete || String(amazon.currentPrice).trim()) && (currentPrice === null || currentPrice <= 0)) {
+      setManualCostError("竞品当前售价必须是大于 0 的有效数字；我们的售价会自动与其保持一致。");
       byId("manualAmazonCurrentPrice")?.focus();
       return;
     }
@@ -7378,11 +7450,12 @@ import {
         return;
       }
     }
-    const purchaseUnitCostCny = numberOrNull(manualCostDraft.purchaseCost);
+    const purchasePricing = resolvePurchasePriceInput(product, manualCostDraft.purchaseCost, manualCostDraft.baseline.purchaseUnitCostCny);
+    const purchaseUnitCostCny = purchasePricing.unitCostCny;
     const pieceCount = normalizePieceCount(manualCostDraft.pieceCount);
     const purchaseCost = totalPurchaseCostCny(purchaseUnitCostCny, pieceCount);
     const activeFee = numberOrNull(manualCostDraft.fees[manualCostDraft.activeMode]);
-    if (manualCostDraft.purchaseCost === "" || purchaseUnitCostCny === null || purchaseUnitCostCny < 0) {
+    if (purchasePricing.invalid || (!allowIncomplete && purchaseUnitCostCny === null)) {
       setManualCostError("1688单件采购价不能为空，且必须是大于或等于 0 的有效数字。");
       byId("manualPurchaseCost")?.focus();
       return;
@@ -7392,7 +7465,7 @@ import {
       byId("manualPieceCount")?.focus();
       return;
     }
-    if (manualCostDraft.fees[manualCostDraft.activeMode] === "" || activeFee === null || activeFee < 0) {
+    if ((!allowIncomplete || manualCostDraft.fees[manualCostDraft.activeMode] !== "") && (manualCostDraft.fees[manualCostDraft.activeMode] === "" || activeFee === null || activeFee < 0)) {
       setManualCostError(`${manualCostDraft.activeMode} ${manualCostDraft.activeMode === "FBA" ? "配送费" : "履约费"}不能为空，且必须是大于或等于 0 的有效数字。`);
       byId("manualFulfillmentFee")?.focus();
       return;
@@ -7404,13 +7477,13 @@ import {
       return;
     }
     const resolvedInputs = manualCostDraft.profitInputs;
-    const inputError = validateManualProfitInputs(resolvedInputs);
+    const inputError = validateManualProfitInputs(resolvedInputs, product);
     if (inputError) {
       setManualCostError(inputError.message);
       byId(inputError.id)?.focus();
       return;
     }
-    if (!Number.isFinite(resolvedInputs.actualWeightKg) || resolvedInputs.actualWeightKg <= 0) {
+    if (!(resolvedInputs.actualWeightKg === null && isAmazonWeightUnavailable(product)) && (!Number.isFinite(resolvedInputs.actualWeightKg) || resolvedInputs.actualWeightKg <= 0)) {
       setManualCostError("实际重量必须是大于 0 的有效数字。");
       byId("manualActualWeightKg")?.focus();
       return;
@@ -7437,47 +7510,38 @@ import {
       byId("manualUnitsPerCarton")?.focus();
       return;
     }
+    const currentPriceChanged = finiteOrNull(product.currentPrice) !== currentPrice;
+    const nextSalePrice = product.manualSalePrice && !currentPriceChanged ? product.salePrice : currentPrice === null ? null : roundMoney(currentPrice * COMPETITOR_PRICE_RATIO);
     const automaticFbaEstimate = estimateWeightOnlyFbaFee({
       ...product,
       fulfillmentMode: "FBA",
       productWeight: resolvedInputs.actualWeightKg,
       billingWeight: resolvedInputs.actualWeightKg,
-      salePrice: roundMoney(currentPrice * COMPETITOR_PRICE_RATIO),
+      salePrice: nextSalePrice,
       manualProfitInputs: true,
       weightSource: resolvedInputs.weightSource || "商品重量",
     });
     const manualFbaOverride = Boolean(product.manualFbaFee || manualCostDraft.feeTouched.FBA)
       && Number.isFinite(parsedFba.value);
     const next = {
-      salePrice: roundMoney(currentPrice * COMPETITOR_PRICE_RATIO),
+      salePrice: nextSalePrice,
       fulfillmentMode: manualCostDraft.activeMode,
-      purchaseUnitCostCny: roundMoney(purchaseUnitCostCny),
+      purchaseUnitCostCny,
       pieceCount,
-      purchaseCost: totalPurchaseCostCny(roundMoney(purchaseUnitCostCny), pieceCount),
+      purchaseCost: totalPurchaseCostCny(purchaseUnitCostCny, pieceCount),
       fbaFee: manualFbaOverride ? parsedFba.value : automaticFbaEstimate?.fee ?? parsedFba.value,
       fbmFee: parsedFbm.value,
       profitInputs: { ...resolvedInputs, updatedAt: new Date().toISOString() },
     };
-    const approvalCalculation = calculateProfit({
-      salePrice: next.salePrice,
-      purchaseCost: next.purchaseCost,
-      fulfillmentMode: next.fulfillmentMode,
-      fbaFee: next.fbaFee,
-      fbmFee: next.fbmFee,
-      billingWeight: next.profitInputs.actualWeightKg,
-      dimensionsCm: next.profitInputs.dimensionsCm,
-      cartonWeightKg: next.profitInputs.cartonWeightKg,
-      unitsPerCarton: next.profitInputs.unitsPerCarton,
-      resolvedProfitInputs: next.profitInputs,
-      marketplace: product.marketplace,
-    });
-    if (approve && !approvalCalculation) {
-      setManualCostError("利润率尚未计算完成，请先补齐有效售价、成本、履约费和计费重量。");
-      return;
+    const sales30Changed = finiteOrNull(product.sales30) !== numberOrNull(amazon.sales30);
+    if (approve) {
+      const reviewProduct = sales30Changed ? { ...product, sales30Evidence: null } : product;
+      const reason = preliminaryReviewBlockingReason(reviewProduct, resolvedInputs.actualWeightKg);
+      if (reason) { setManualCostError(reason); return; }
     }
     const baseline = manualCostDraft.baseline;
     const changed = (before, after) => before !== after;
-    const purchaseUnitCostChanged = changed(baseline.purchaseUnitCostCny, next.purchaseUnitCostCny);
+    const purchaseUnitCostChanged = purchasePricing.manuallyEdited;
     const decisionInputsChanged = changed(baseline.fulfillmentMode, next.fulfillmentMode)
       || changed(finiteOrNull(product.salePrice), next.salePrice)
       || changed(baseline.purchaseUnitCostCny, next.purchaseUnitCostCny)
@@ -7507,9 +7571,15 @@ import {
     product.pieceCount = next.pieceCount;
     product.pieceCountSource = manualCostDraft.pieceCountTouched ? "manual" : detectedPieceCount.source;
     product.currentPrice = currentPrice;
-    product.currentPriceStatus = "manual";
-    product.priceEvidence = null;
-    if (product.priceRevalidation) product.priceRevalidation.status = "manual";
+    if (currentPriceChanged && currentPrice !== null) {
+      product.currentPriceStatus = "manual";
+      product.priceEvidence = null;
+      if (product.priceRevalidation) product.priceRevalidation.status = "manual";
+    }
+    if (sales30Changed && product.sales30Evidence) {
+      product.sales30EvidenceHistory = [...(product.sales30EvidenceHistory || []), { ...structuredClone(product.sales30Evidence), supersededAt: new Date().toISOString(), reason: "manual_sales_override" }];
+      product.sales30Evidence = null;
+    }
     product.sales30 = numberOrNull(amazon.sales30);
     product.sales60 = numberOrNull(amazon.sales60);
     product.rating = numberOrNull(amazon.rating);
@@ -7518,12 +7588,12 @@ import {
     product.firstFba = amazon.firstFba || null;
     product.hasAPlus = amazon.hasAPlus === "" ? null : amazon.hasAPlus === "true";
     product.salePrice = next.salePrice;
-    product.manualSalePrice = false;
+    if (currentPriceChanged) product.manualSalePrice = false;
     product.manualAmazonOverride = true;
     product.manualAmazonFields = {
       title: Boolean(amazon.title),
-      currentPrice: true,
-      sales30: String(amazon.sales30).trim() !== "",
+      currentPrice: product.manualAmazonFields?.currentPrice || (currentPriceChanged && currentPrice !== null),
+      sales30: product.manualAmazonFields?.sales30 || sales30Changed,
       sales60: String(amazon.sales60).trim() !== "",
       rating: String(amazon.rating).trim() !== "",
       reviews: String(amazon.reviews).trim() !== "",
@@ -7549,7 +7619,7 @@ import {
     product.billingWeight = next.profitInputs.actualWeightKg;
     product.weightSource = next.profitInputs.weightSource;
     product.manualProfitInputs = true;
-    product.manualPurchaseCost = Boolean(product.manualPurchaseCost || purchaseUnitCostChanged);
+    product.manualPurchaseCost = Boolean(isManualCostProduct(product) || purchaseUnitCostChanged);
     if (manualCostDraft.productDimensionsCm.every((value) => Number.isFinite(value) && value > 0)) {
       product.productDimensions = formatDimensions(manualCostDraft.productDimensionsCm);
     }
@@ -7570,7 +7640,7 @@ import {
       delete product.fieldSources.fbaFee;
     }
     if (next.fulfillmentMode === "FBM" || changed(baseline.fbmFee, next.fbmFee)) product.manualFbmFee = Number.isFinite(next.fbmFee);
-    if (product.manualPurchaseCost) {
+    if (isManualCostProduct(product)) {
       if (!product.supplierSource) product.supplierSource = product.dataMode === "mock" ? "manual-demo-cost" : "manual-product-cost";
       product.costSource = "manual";
     }
@@ -7736,9 +7806,9 @@ import {
       ["SellerSprite 查竞品", !amazonOnly && product.competitorLookupStatus === "success" ? "成功" : null],
       ["竞品当前售价", moneyMetric(product.currentPrice)],
       ["售价核验状态", amazonPriceStatusLabel(product) || null],
-      ["我们的售价", moneyMetric(product.salePrice, product.manualSalePrice ? "人工覆盖" : "竞品售价 × 0.9")],
+      ["我们的售价", moneyMetric(product.salePrice, product.manualSalePrice ? "人工覆盖" : "与竞品售价相同")],
       ["Amazon 标题件数", product.pieceCountSource === "default" ? null : `${product.pieceCount} 件 · ${pieceCountSourceLabel(product)}`],
-      ["竞品 30 天销量", Number.isFinite(product.sales30) ? `${formatInteger(product.sales30)}${product.sales30Evidence?.kind === "lower_bound" ? "+" : ""} pcs${product.sales30Evidence?.source === "amazon_store_card" ? " · 店铺首页角标" : amazonOnly ? " · Amazon 购买量提示" : ""}` : amazonOnly ? `${auditedMissing("sales30")} · 未显示销量标识（按 50 以下处理）` : null],
+      ["竞品 30 天销量", Number.isFinite(product.sales30) ? `${formatInteger(product.sales30)}${product.sales30Evidence?.kind === "lower_bound" ? "+" : ""} pcs${product.sales30Evidence?.source === "amazon_store_card" ? " · 店铺首页角标" : amazonOnly ? " · Amazon 购买量提示" : ""}` : amazonOnly ? `${auditedMissing("sales30")} · 未显示月购买量标识，不符合候选条件` : null],
       ["竞品 60 天销量", Number.isFinite(product.sales60) ? `${formatInteger(product.sales60)} pcs` : null],
       ["竞品 30 天销售额", moneyMetric(product.salesAmount30, amazonOnly ? "数据来源见字段核验" : "SellerSprite 最近 30 天口径") || (amazonOnly ? `${auditedMissing("salesAmount30")}（准确销售额）` : null)],
       ["销量更新日期", product.sales30UpdatedAt || null],
@@ -7750,10 +7820,10 @@ import {
       ["SellerSprite 上架日期", !amazonOnly ? product.listingAvailableAt || null : null],
       ["商品参数", product.productDimensions || null],
       ["FBA 包装参数", product.fbaDimensions || null],
-      ["商品重量", Number.isFinite(product.productWeight) ? `${formatWeightKg(product.productWeight)} kg · ${productWeightBandLabel(product.productWeight)}` : isFba && product.fbaEstimate?.weightSource === MISSING_WEIGHT_LOWEST_FREIGHT_LABEL ? "未采集 · 利润按最低运费档估算" : null],
+      ["商品重量", Number.isFinite(product.productWeight) ? `${formatWeightKg(product.productWeight)} kg · ${productWeightBandLabel(product.productWeight)}` : isFba && product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? "页面未提供 · 可初审，完整利润待补" : null],
       [isAu ? "FBA 配送费（澳洲重量档）" : "FBA 配送费（按商品重量）", fbaFeeMetric],
       ...(!isAu ? [
-        ["FBA 计费输入", Number.isFinite(product.billingWeight) ? `${product.billingWeight.toFixed(2)} kg${product.weightSource && !/(?:缺失|未获取)/.test(product.weightSource) ? ` · ${product.weightSource}` : ""}` : product.fbaEstimate?.weightSource === MISSING_WEIGHT_LOWEST_FREIGHT_LABEL ? "重量未采集 · 按最低运费档（75g）估算" : null],
+        ["FBA 计费输入", Number.isFinite(product.billingWeight) ? `${product.billingWeight.toFixed(2)} kg${product.weightSource && !/(?:缺失|未获取)/.test(product.weightSource) ? ` · ${product.weightSource}` : ""}` : product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? "页面未提供重量 · FBA 配送费按最低档估算" : null],
         ["FBA 计费重", Number.isFinite(product.fbaEstimate?.billableWeightLb) ? `${product.fbaEstimate.billableWeightLb.toFixed(2)} lb` : null],
       ] : []),
       ["FBA 包装重量", Number.isFinite(product.fbaWeight) ? `${formatWeightKg(product.fbaWeight)} kg · ${productWeightBandLabel(product.fbaWeight)}` : null],
@@ -7798,6 +7868,7 @@ import {
     renderSupplierList(product);
     byId("editSalePrice").value = valueOrBlank(product.salePrice);
     byId("editPurchaseCost").value = valueOrBlank(purchasePricing.unitCostCny);
+    byId("editPurchaseCost").dataset.purchaseBaseline = valueOrBlank(purchasePricing.unitCostCny);
     byId("editPieceCount").value = valueOrBlank(purchasePricing.pieceCount);
     byId("editPurchaseTotal").value = valueOrBlank(purchasePricing.totalCostCny);
     setText("editPieceCountSource", pieceCountSourceLabel(product));
@@ -7913,7 +7984,8 @@ import {
     const product = products.find((item) => item.id === activeProductId);
     const billingWeight = numberOrNull(byId("editWeight").value);
     const pieceCount = normalizePieceCount(byId("editPieceCount")?.value);
-    const purchaseUnitCostCny = numberOrNull(byId("editPurchaseCost").value);
+    const purchasePricing = resolvePurchasePriceInput(product, byId("editPurchaseCost").value, byId("editPurchaseCost").dataset.purchaseBaseline ?? product?.purchaseUnitCostCny);
+    const purchaseUnitCostCny = purchasePricing.unitCostCny;
     const savedFulfillmentMode = normalizeFulfillmentMode(product?.fulfillmentMode);
     const fulfillmentMode = savedFulfillmentMode || (billingWeight !== null && billingWeight > 0 ? "FBA" : null);
     const fulfillmentFee = numberOrNull(byId("editFbaFee").value);
@@ -7921,6 +7993,7 @@ import {
     return {
       salePrice: numberOrNull(byId("editSalePrice").value),
       purchaseUnitCostCny,
+      purchasePricing,
       pieceCount,
       purchaseCost: totalPurchaseCostCny(purchaseUnitCostCny, pieceCount),
       fulfillmentMode,
@@ -7967,6 +8040,7 @@ import {
     const market = MARKET_CONFIGS[String(product.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     const isAu = market.code === "AU";
     const values = getEditorValues();
+    setText("editPurchaseCostSource", purchasePriceInputNote(product, values.purchasePricing));
     if (byId("editPurchaseTotal")) byId("editPurchaseTotal").value = valueOrBlank(values.purchaseCost);
     setCurrencyConversionOutput("editSalePriceCny", values.salePrice, product.marketplace);
     setCurrencyConversionOutput("editFbaFeeCny", values.fulfillmentFee, product.marketplace);
@@ -7974,7 +8048,10 @@ import {
     syncDrawerApprovalButton(product, values, calculation);
     const profitResult = byId("drawerProfitMargin")?.closest(".profit-result");
     if (!calculation) {
-      byId("costBreakdown").innerHTML = "";
+      const estimate = estimateFbaForEditor(product, values.billingWeight, values.salePrice);
+      byId("costBreakdown").innerHTML = estimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee
+        ? '<div class="fba-calculation-note"><strong>页面未提供重量 · 可初审</strong><p>FBA 配送费暂按最低档 ' + escapeHtml(formatCurrencyWithCnyText(estimate.fee, product.marketplace)) + ' 估算。头程及完整利润待补齐重量后计算。</p></div>'
+        : '<div class="fba-calculation-note">利润参数尚未齐全，可先完成候选初审。</div>';
       if (profitResult) profitResult.hidden = true;
       return;
     }
@@ -7985,7 +8062,7 @@ import {
     const automaticFbaLabel = isAu ? "澳洲 Excel 重量费率" : "FBA SOP 商品重量估算";
     const supplierCostLabel = calculation.purchaseCostAssumedZero
       ? "采购成本（待匹配，暂按 0 计算）"
-      : isManualCostProduct(product)
+      : values.purchasePricing.manual
       ? "整套采购成本（人工单价 × 件数）"
       : isLowConfidenceSupplierEstimate(product) ? "1688 整套采购成本（低置信度）" : "1688 整套采购成本";
     const exchangeRate = calculation.exchangeRate;
@@ -8004,7 +8081,7 @@ import {
       .filter((value) => value !== null);
     const supplierFormula = calculation.purchaseCostAssumedZero
       ? "采购成本尚未填写，仅预估时按 0；有效报价回填后自动重算"
-      : isManualCostProduct(product)
+      : values.purchasePricing.manual
       ? `${formatCny(values.purchaseUnitCostCny)} × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`
       : includedSupplierPrices.length
         ? `（${includedSupplierPrices.map(formatCny).join(" + ")}）÷ ${includedSupplierPrices.length} 家 = ${formatCny(values.purchaseUnitCostCny)}/件；${formatCny(values.purchaseUnitCostCny)} × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`
@@ -8064,13 +8141,31 @@ import {
     byId("drawerProfitValue").innerHTML = `${cnyCurrencyPairHtml(profitCny, product.marketplace, { suffix: " / 件", compact: true })}${calculation.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : ""}<small class="profit-formula">经营利润率 =（${escapeHtml(formatCny(salePriceCny))} - ${escapeHtml(formatCny(totalCostCny))}）÷ ${escapeHtml(formatCny(salePriceCny))} × 100% = ${escapeHtml(formatPercent(calculation.margin))}</small>`;
   }
 
+  function preliminaryReviewBlockingReason(product, weightKg = fbaEstimationWeightKg(product)) {
+    if (product?.dataMode !== "mock" && !hasQualifyingAmazonMonthlySales(product)) return "需有当前商品明确的 Amazon 50+ 月购买量标识，才可初审。";
+    if (!(Number.isFinite(weightKg) && weightKg > 0) && !isAmazonWeightUnavailable(product)) return "重量尚未核验；请完成商品详情采集。页面确认未提供重量后可按最低 FBA 配送费估算并初审。";
+    return "";
+  }
+
+  function editorValidationMessage(product, values, allowIncomplete = false) {
+    for (const [id, label, positive] of [["editSalePrice", "售价", true], ["editPurchaseCost", "1688 单件采购价", false], ["editFbaFee", "履约费用", false], ["editWeight", "重量", true]]) {
+      const raw = String(byId(id)?.value ?? "").trim();
+      const number = numberOrNull(raw);
+      if (raw && (number === null || (positive ? number <= 0 : number < 0))) return label + "必须是有效数字。";
+    }
+    if (values.pieceCount === null) return "标题件数必须是 1-10000 的整数。";
+    if (!allowIncomplete && [values.salePrice, values.purchaseUnitCostCny, values.purchaseCost, values.fulfillmentFee].some(value => value === null)) return "请补齐有效的售价、1688 单件采购价和履约费用。";
+    if (values.billingWeight === null && !isAmazonWeightUnavailable(product)) return "重量尚未核验，请完成商品详情采集或填写真实重量。";
+    return allowIncomplete ? preliminaryReviewBlockingReason(product, values.billingWeight) : "";
+  }
+
   function syncDrawerApprovalButton(product, values, calculation) {
     const button = byId("approveProductButton");
     if (!button) return;
     if (isCollectionWriteLocked()) { button.disabled = true; button.title = "采集管理期间可查看和筛选，完成后可编辑"; return; }
     if (isAnalysisReadOnly(product)) { button.disabled = true; button.title = "初筛资料已交接，请在采购端继续确认"; return; }
-    const changed = (before, after) => !Number.isFinite(before) || !Number.isFinite(after) || Math.abs(before - after) > 0.0001;
-    const decisionInputsChanged = Boolean(calculation) && (
+    const changed = (before, after) => before !== after && (before == null || after == null || Math.abs(before - after) > 0.0001);
+    const decisionInputsChanged = (
       changed(product.salePrice, values.salePrice)
       || changed(product.purchaseCost, values.purchaseCost)
       || normalizePieceCount(product.pieceCount, 1) !== values.pieceCount
@@ -8079,17 +8174,18 @@ import {
     );
     const alreadyApproved = product.reviewStatus === "approved" && !decisionInputsChanged;
     const productBusy = product.supplierSearchStatus === "searching";
-    button.disabled = productBusy || !calculation || calculation.purchaseCostAssumedZero || alreadyApproved;
+    const validationMessage = editorValidationMessage(product, values, true);
+    button.disabled = productBusy || Boolean(validationMessage) || alreadyApproved;
     button.title = productBusy
       ? "这个商品正在匹配 1688，完成后可初审"
-      : !calculation || calculation.purchaseCostAssumedZero
-        ? "补齐有效售价、采购成本、履约费和计费重量后可初审"
+      : validationMessage
+        ? validationMessage
         : alreadyApproved
           ? "当前商品已初审通过"
-          : product.reviewStatus === "approved" ? "保存修改并重新初审通过" : "保存当前利润参数并初审通过";
+          : product.reviewStatus === "approved" ? "保存修改并重新初审通过" : "初审通过；未齐全的利润参数可后续补充";
   }
 
-  function commitProfitEdits(showConfirmation, { preserveEditor = false, silentInvalid = false } = {}) {
+  function commitProfitEdits(showConfirmation, { preserveEditor = false, silentInvalid = false, preliminaryReview = false } = {}) {
     if (collectionWriteBlocked({ notify: !silentInvalid })) return false;
     const product = products.find((item) => item.id === activeProductId);
     if (!product) return false;
@@ -8099,22 +8195,23 @@ import {
       return false;
     }
     const values = getEditorValues();
-    const requiredValues = [values.salePrice, values.purchaseUnitCostCny, values.purchaseCost, values.fulfillmentFee, values.billingWeight];
-    if (requiredValues.some((value) => value === null || value < 0) || values.salePrice === 0 || values.billingWeight === 0) {
-      if (!silentInvalid) showToast("请补齐有效的售价、1688 单件采购价、标题件数、履约费用和计费重量。", "error");
+    const validationMessage = editorValidationMessage(product, values, preliminaryReview);
+    if (validationMessage) {
+      if (!silentInvalid) showToast(validationMessage, "error");
       return false;
     }
     const normalized = {
-      salePrice: roundMoney(values.salePrice),
-      purchaseUnitCostCny: roundMoney(values.purchaseUnitCostCny),
+      salePrice: values.salePrice === null ? null : roundMoney(values.salePrice),
+      purchaseUnitCostCny: values.purchaseUnitCostCny,
       pieceCount: values.pieceCount,
-      purchaseCost: totalPurchaseCostCny(roundMoney(values.purchaseUnitCostCny), values.pieceCount),
-      fulfillmentFee: roundMoney(values.fulfillmentFee),
+      purchaseCost: totalPurchaseCostCny(values.purchaseUnitCostCny, values.pieceCount),
+      fulfillmentFee: values.fulfillmentFee === null ? null : roundMoney(values.fulfillmentFee),
       billingWeight: values.billingWeight,
     };
-    const changed = (before, after) => !Number.isFinite(before) || Math.abs(before - after) > 0.0001;
+    const changed = (before, after) => before !== after && (before == null || after == null || Math.abs(before - after) > 0.0001);
     const salePriceChanged = changed(product.salePrice, normalized.salePrice);
     const purchaseUnitCostChanged = changed(product.purchaseUnitCostCny, normalized.purchaseUnitCostCny);
+    const purchaseManuallyEdited = values.purchasePricing.manuallyEdited;
     const pieceCountChanged = normalizePieceCount(product.pieceCount, 1) !== normalized.pieceCount;
     const purchaseCostChanged = changed(product.purchaseCost, normalized.purchaseCost);
     const weightChanged = changed(product.billingWeight, normalized.billingWeight);
@@ -8142,7 +8239,7 @@ import {
       product.manualProfitInputs = true;
     }
     product.manualSalePrice = product.manualSalePrice || salePriceChanged;
-    if (purchaseUnitCostChanged) {
+    if (purchaseManuallyEdited) {
       product.manualPurchaseCost = true;
       product.costSource = "manual";
       if (!product.supplierSource) product.supplierSource = product.dataMode === "mock" ? "manual-demo-cost" : "manual-product-cost";
@@ -8150,6 +8247,7 @@ import {
     refreshSupplierTarget(product);
     const automaticEstimate = product.fulfillmentMode === "FBA" ? estimateFbaForEditor(product, values.billingWeight) : null;
     const manualFbaOverride = product.fulfillmentMode === "FBA" && Boolean(product.manualFbaFee || drawerFbaTouched);
+    product.fbaEstimate = automaticEstimate;
     if (product.fulfillmentMode === "FBA") {
       if (manualFbaOverride) {
         product.fbaFee = normalized.fulfillmentFee;
@@ -8167,7 +8265,6 @@ import {
         product.fbaFeeSource = null;
         if (product.fieldSources) delete product.fieldSources.fbaFee;
       }
-      product.fbaEstimate = automaticEstimate;
     } else if (product.fulfillmentMode === "FBM") {
       product.manualFbmFee = true;
     }
@@ -8176,7 +8273,7 @@ import {
     const manualFulfillmentFeeChanged = product.fulfillmentMode === "FBM"
       ? fulfillmentFeeChanged
       : manualFbaOverride && fulfillmentFeeChanged;
-    if (purchaseUnitCostChanged) {
+    if (purchaseManuallyEdited) {
       if (product.dataMode !== "mock") {
         runState.mode = "mixed";
         runState.dataSource = "SellerSprite MCP + 人工采购成本与利润参数";
@@ -8196,6 +8293,7 @@ import {
       }
     }
     if (approvalInvalidated) product.reviewStatus = "pending";
+    byId("editPurchaseCost").dataset.purchaseBaseline = valueOrBlank(product.purchaseUnitCostCny);
     renderResults();
     if (preserveEditor) renderProfitPreview();
     else {
@@ -8218,11 +8316,8 @@ import {
       showToast("这个商品正在匹配 1688，完成后即可初审。", "info", 4200);
       return;
     }
-    if (!commitProfitEdits(false)) return;
-    if (!Number.isFinite(product.margin)) {
-      showToast("利润率尚未计算完成，请先补齐有效售价、成本、履约费和计费重量。", "error");
-      return;
-    }
+    clearProfitAutoCommit();
+    if (!commitProfitEdits(false, { preliminaryReview: true })) return;
     product.reviewStatus = "approved";
     renderResults();
     void persistCurrentRun();
@@ -8349,7 +8444,7 @@ import {
   function assumeFbaForWeightedProduct(product) {
     if (isAnalysisReadOnly(product)) return false;
     ensureFulfillmentState(product);
-    // 亚马逊准则 2026-09-29：未采集到重量的一律按最低运费计算，因此缺重量同样按 FBA 假设估算，不再阻断利润计算。
+    // Fulfillment may be estimated independently while full profit inputs are pending.
     if (product.fulfillmentMode) return false;
     product.fulfillmentMode = "FBA";
     product.fulfillmentModeSource = "assumed_fba_for_estimate";
@@ -8522,13 +8617,10 @@ import {
     product.profitPendingReasons = [];
     product.profitValue = calculation?.profit ?? null;
     product.totalCost = calculation?.totalCost ?? null;
-    // 亚马逊准则 2026-09-29：重量未采集的利润按最低运费估算，标记低置信度提醒复核。
-    const weightAssumedLowestFreight = ![product.actualWeightKg, product.productWeight, product.billingWeight, product.profitInputs?.actualWeightKg]
-      .some((value) => Number.isFinite(value) && value > 0);
     product.profitCalculation = {
       ...calculation,
       calculatedAt: new Date().toISOString(),
-      parameterConfidence: weightAssumedLowestFreight ? "低（重量未采集，按最低运费估算）" : calculation.airFreight?.confidence || "low",
+      parameterConfidence: calculation.airFreight?.confidence || "low",
     };
   }
 
@@ -8537,7 +8629,8 @@ import {
     const reasons = [];
     if (!Number.isFinite(product.salePrice) || product.salePrice <= 0) reasons.push('售价');
     if (product.purchaseCost != null && product.purchaseCost !== '' && (!Number.isFinite(product.purchaseCost) || product.purchaseCost < 0)) reasons.push('有效采购成本');
-    const weight = finiteOrNull(product.actualWeightKg
+    const weight = finiteOrNull((product.manualProfitInputs ? inputs.actualWeightKg ?? product.billingWeight : null)
+      ?? product.actualWeightKg
       ?? (inputs.airFreightActualWeightOnly ? product.productWeight : product.billingWeight)
       ?? inputs.actualWeightKg ?? product.billingWeight);
     if (weight === null || weight <= 0) reasons.push('商品重量');
@@ -8559,12 +8652,11 @@ import {
     const dimensionsCm = Array.isArray(subject.dimensionsCm)
       ? subject.dimensionsCm
       : inputs.dimensionsCm || parseDimensionsCm(subject.fbaDimensions) || parseDimensionsCm(subject.productDimensions);
-    const actualWeightKg = finiteOrNull(subject.actualWeightKg
+    const actualWeightKg = finiteOrNull((subject.manualProfitInputs ? inputs.actualWeightKg ?? subject.billingWeight : null)
+      ?? subject.actualWeightKg
       ?? (inputs.airFreightActualWeightOnly ? subject.productWeight : subject.billingWeight)
       ?? inputs.actualWeightKg
-      ?? subject.billingWeight)
-      // 亚马逊准则 2026-09-29：未采集到重量的一律按最低运费计算（75g 计费重量代理）。
-      ?? MISSING_WEIGHT_LOWEST_FREIGHT_KG;
+      ?? subject.billingWeight);
     const purchaseCostAssumedZero = subject.purchaseCost == null || subject.purchaseCost === '';
     const calculation = calculateProductProfit({
       ...inputs,
@@ -8581,6 +8673,7 @@ import {
   }
 
   function automaticFbaFeeSource(product) {
+    if (product.fbaEstimate?.assumption === 'missing_weight_minimum_fba_estimate') return 'missing_weight_minimum_fba_estimate';
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     return market.code === "AU" ? "au_workbook_weight_rate" : "fba_sop_product_weight";
   }
@@ -8611,7 +8704,7 @@ import {
 
   function estimateFbaForEditor(product, weightKg, salePrice = product.salePrice) {
     if (normalizeFulfillmentMode(product.fulfillmentMode) === "FBM") return null;
-    const sameWeight = Number.isFinite(product.billingWeight) && Math.abs(product.billingWeight - weightKg) < 0.0001;
+    const sameWeight = product.billingWeight === weightKg || (Number.isFinite(product.billingWeight) && Number.isFinite(weightKg) && Math.abs(product.billingWeight - weightKg) < 0.0001);
     return estimateWeightOnlyFbaFee({
       ...product,
       productWeight: weightKg,
@@ -8623,10 +8716,8 @@ import {
 
   function estimateWeightOnlyFbaFee(product) {
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
-    // 亚马逊准则 2026-09-29：未采集到重量的一律按最低运费档计算（75g 计费重量代理）。
-    const actualWeightKg = fbaEstimationWeightKg(product);
-    const weightMissing = actualWeightKg === null;
-    const weightKg = weightMissing ? MISSING_WEIGHT_LOWEST_FREIGHT_KG : actualWeightKg;
+    const weightKg = fbaEstimationWeightKg(product);
+    if (weightKg === null) return isAmazonWeightUnavailable(product) ? estimateMinimumFbaFee({ marketplace: market.code }) : null;
     if (market.code === "AU") {
       const estimate = estimateAu2026FbaFeeByProductWeight({
         actualWeightKg: weightKg,
@@ -8635,21 +8726,18 @@ import {
       if (!estimate) return null;
       return {
         ...estimate,
-        confidence: weightMissing ? "低" : "标准",
-        weightSource: weightMissing ? MISSING_WEIGHT_LOWEST_FREIGHT_LABEL : product.weightSource || "商品重量",
-        rateApplicability: weightMissing
-          ? "重量未采集 · 按最低运费档（0-75g 小号信封）估算"
-          : "《澳洲FBA运费.xlsx》Sheet1 · 按重量选择最小可用信封档",
+        confidence: "标准",
+        weightSource: product.weightSource || "商品重量",
+        rateApplicability: "《澳洲FBA运费.xlsx》Sheet1 · 按重量选择最小可用信封档",
       };
     }
-    const weightSource = weightMissing ? MISSING_WEIGHT_LOWEST_FREIGHT_LABEL : product.weightSource || "商品重量";
+    const weightSource = product.weightSource || "商品重量";
     const estimate = estimateUs2023FbaFeeByProductWeight({
       actualWeightKg: weightKg,
       standardSizePolicy: FBA_WEIGHT_STANDARD_SIZE_POLICY,
     });
     if (!estimate) return null;
-    const baseApplicability = (weightMissing ? "重量未采集 · 按最低运费档估算；" : "")
-      + (market.code === "US" ? "美国站 SOP 重量代理" : "非美国站按美国 SOP 费率名义估算");
+    const baseApplicability = (market.code === "US" ? "美国站 SOP 重量代理" : "非美国站按美国 SOP 费率名义估算");
     const promo = market.fbaFeePromo || null;
     const salePriceValue = Number(product.salePrice);
     const promoApplied = Boolean(
@@ -9014,7 +9102,7 @@ import {
     setText("analysisCoverageDetail", `店铺 ${counts.visited_stores}/${counts.requested_stores} · 已访问 ${counts.pages_visited} 页 · 详情成功 ${coverage.detail_counts.success}/${products.length}${counts.known_missing_asins ? ` · 逐店待枚举约 ${counts.known_missing_asins} 个` : ""}。Amazon 可见结果和全部变体范围不同，当前不声明全店全部采集完成。`);
     const button = byId("exportAnalysisHandoffButton");
     if (button) {
-      const reviewed = products.filter((product) => product.reviewStatus === "approved");
+      const reviewed = products.filter((product) => product.reviewStatus === "approved" && hasQualifyingAmazonMonthlySales(product));
       const updating = reviewed.some((product) => product.supplierSearchStatus === "searching");
       const disabledReason = isCollectionWriteLocked() ? "后台采集完成后可编辑、初审和导出。" : exportRunning ? "导出正在保存，请等待完成。" : analysisVersionPendingIds.size ? "新的分析版本正在保存，请等待完成。" : !runState.id ? "请先导入店铺并开始分析任务。" : runState.mode === "mock" ? "演示数据仅用于体验，不能导出采购交接资料。" : !reviewed.length ? "请先人工初审通过需要导出的商品。" : updating ? "已初审商品的报价正在更新，结束后即可导出。" : "";
       button.disabled = Boolean(disabledReason);
@@ -9029,7 +9117,7 @@ import {
     if (exportRunning || analysisVersionPendingIds.size) return;
     if (!runState.id || runState.mode === "idle" || runState.mode === "mock") { showToast("请先完成真实店铺采集和初步利润分析。", "info", 4800); return; }
     if (manualCostDraft && isManualCostDirty()) {
-      saveManualCost();
+      saveManualCost({ allowIncomplete: true });
       if (manualCostDraft && isManualCostDirty()) { showToast("请先保存正在填写的成本，再导出交接资料。", "info", 4800); return; }
     }
     if (profitAutoCommitTimer !== null) {
@@ -9038,8 +9126,8 @@ import {
     }
     const exportRunId = runState.id;
     const market = MARKET_CONFIGS[runState.marketplace];
-    const exportRows = products.filter((product) => product.reviewStatus === "approved");
-    if (!exportRows.length) { showToast("暂无已人工初审通过的商品，请先完成产品初审。", "info", 4800); return; }
+    const exportRows = products.filter((product) => product.reviewStatus === "approved" && hasQualifyingAmazonMonthlySales(product));
+    if (!exportRows.length) { showToast("暂无具备 Amazon 50+ 月购买量证据且已初审通过的商品。", "info", 4800); return; }
     if (!market || exportRows.some((product) => product.marketplace !== market.code)) { showToast("已初审商品存在站点不一致，未导出。", "error", 4800); return; }
     if (exportRows.some((product) => product.supplierSearchStatus === "searching")) { showToast("已初审商品的报价正在更新，结束后即可导出。", "info", 4800); return; }
     // Freeze the user's manual selection once; workbook and JSON share this same snapshot.
@@ -9091,8 +9179,8 @@ import {
     }
     const exportScope = scope === "all" ? "all" : "approved";
     const exportRows = exportScope === "all"
-      ? [...products]
-      : products.filter((product) => product.reviewStatus === "approved");
+      ? products.filter(hasQualifyingAmazonMonthlySales)
+      : products.filter((product) => product.reviewStatus === "approved" && hasQualifyingAmazonMonthlySales(product));
     if (!exportRows.length) {
       showToast(
         exportScope === "all" ? "当前任务暂无候选产品。" : "暂无已初审通过的产品，请先完成产品初审。",
@@ -9209,7 +9297,7 @@ import {
     if (!product.sellerId) add("Seller ID", "Amazon 店铺页未返回");
     if (!product.imageUrl) add("商品主图", amazonReason);
     if (!hasNumber(product.currentPrice) || product.currentPrice <= 0) add("竞品当前售价", amazonReason, { blocking: true });
-    if (!hasNumber(product.salePrice) || product.salePrice <= 0) add("我们的售价", "竞品当前售价不可用，无法按 90% 生成", { blocking: true });
+    if (!hasNumber(product.salePrice) || product.salePrice <= 0) add("我们的售价", "竞品当前售价不可用，无法生成同价售价", { blocking: true });
     if (!hasNumber(product.rating)) add("评分", amazonReason);
     if (!hasNumber(product.reviews)) add("评价数", amazonReason);
 

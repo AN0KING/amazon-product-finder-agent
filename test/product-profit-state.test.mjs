@@ -45,7 +45,7 @@ function appProfitOracle(product, context = {}) {
     let activeMarket = MARKET_CONFIGS[code] || MARKET_CONFIGS.NL;
     const analysisHandoffPendingIds = new Set();
     const analysisVersionPendingIds = new Set();
-    const COMPETITOR_PRICE_RATIO = 0.9;
+    const COMPETITOR_PRICE_RATIO = 1;
     const FBA_WEIGHT_STANDARD_SIZE_POLICY = 'large';
     const AU_FBA_ENVELOPE_SIZE_POLICY = 'auto';
     const MISSING_WEIGHT_LOWEST_FREIGHT_KG = 0.075;
@@ -108,10 +108,10 @@ for (const [marketplace, exchangeRate] of Object.entries({
   FR: 7.85, IT: 7.85, ES: 7.85, PL: 1.85, MX: 0.42, BR: 1.35,
 })) {
   test(`${marketplace} uses the same market defaults, automatic sale price and FBA result as the app`, () => {
-    const product = canonicalProduct({ marketplace, sourceMarketplace: marketplace, profitInputs: undefined, manualSalePrice: false, salePrice: null, manualFbaFee: false, fbaFee: null });
+    const product = canonicalProduct({ marketplace, sourceMarketplace: marketplace, profitInputs: undefined, manualSalePrice: false, salePrice: 8.99, manualFbaFee: false, fbaFee: null });
     const result = assertParity(product);
     assert.equal(result.profitInputs.exchangeRate, exchangeRate);
-    assert.equal(result.salePrice, 8.99);
+    assert.equal(result.salePrice, 9.99);
     assert.ok(Number.isFinite(result.margin));
   });
 }
@@ -226,7 +226,7 @@ test('FBA-only formula migrations preserve existing manual operating rates', () 
   assert.equal(result.profitInputs.returnsRate, 8);
 });
 
-test('missing price still blocks profit while missing weight now estimates at the lowest freight tier', () => {
+test('missing price still blocks profit while a successful weightless page estimates only its minimum FBA fee', () => {
   const product = canonicalProduct({ currentPrice: null, salePrice: null, manualSalePrice: false, productWeight: null, billingWeight: null, fbaWeight: null, purchaseCost: null, purchaseUnitCostCny: null, manualPurchaseCost: false, suppliers: [], manualFbaFee: false, fbaFee: null });
   product.profitInputs.actualWeightKg = null;
   const result = assertParity(product);
@@ -235,7 +235,7 @@ test('missing price still blocks profit while missing weight now estimates at th
   assert.equal(result.totalCost, null);
   assert.ok(result.profitPendingReasons.includes('售价'));
   assert.equal(result.profitPendingReasons.includes('采购成本'), false);
-  // 亚马逊准则 2026-09-29：重量未采集按 FBA 假设 + 最低运费档自动估算配送费，不再阻断。
+  // A confirmed absent weight allows a minimum FBA estimate, not a fabricated weight.
   assert.ok(Number.isFinite(result.fbaFee));
   assert.equal(result.profitPendingReasons.includes('FBA 配送费'), false);
 });
@@ -259,18 +259,20 @@ for (const purchaseCost of [null, undefined, '']) {
   });
 }
 
-test('the existing collection fixture estimates profit at the lowest freight tier before weight arrives without losing manual rates', () => {
+test('a confirmed weightless page keeps full profit pending and preserves manual rates until actual weight arrives', () => {
   const product = canonicalProduct({ manualSalePrice: false, salePrice: null, productWeight: null, fbaWeight: null, billingWeight: null, manualFbaFee: false, fbaFee: null });
   product.profitInputs = { ...product.profitInputs, actualWeightKg: null, commissionRate: 9, marketingRate: 7, airFreightRateCnyPerKg: 52, airFreightRateSource: 'product_manual' };
   const incomplete = assertParity(product);
-  assert.equal(incomplete.salePrice, 8.99);
-  // 亚马逊准则 2026-09-29：重量未采集的一律按最低运费档计算（AU 0-75g 小号信封 3.64 AUD）。
-  assert.ok(Number.isFinite(incomplete.margin));
+  assert.equal(incomplete.salePrice, 9.99);
+  assert.equal(incomplete.margin, null);
   assert.equal(incomplete.fbaFee, 3.64);
-  assert.equal(incomplete.fbaEstimate.weightSource, '重量未采集 · 按最低运费档估算');
-  assert.equal(incomplete.profitCalculation.airFreight.chargeableWeightKg, 0.075);
-  assert.equal(incomplete.profitCalculation.parameterConfidence, '低（重量未采集，按最低运费估算）');
-  assert.deepEqual(incomplete.profitPendingReasons, []);
+  assert.equal(incomplete.fbaEstimate.weightSource, '页面未提供重量 · FBA 配送费按最低档估算');
+  assert.equal(incomplete.fbaEstimate.actualWeightKg, null);
+  assert.equal(incomplete.profitCalculation, null);
+  assert.equal(incomplete.productWeight, null);
+  assert.equal(incomplete.billingWeight, null);
+  assert.equal(incomplete.profitInputs.actualWeightKg, null);
+  assert.deepEqual(incomplete.profitPendingReasons, ['商品重量']);
   const complete = assertParity({ ...incomplete, productWeight: 0.12, billingWeight: 0.12 });
   assert.equal(complete.profitInputs.commissionRate, 9);
   assert.equal(complete.profitInputs.marketingRate, 7);
