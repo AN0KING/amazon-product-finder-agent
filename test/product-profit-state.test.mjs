@@ -337,3 +337,39 @@ test('recomputed nested outputs cannot mutate the source product or context', ()
   result.suppliers[0].unitPriceCny = 999;
   assert.deepEqual({ product, context }, before);
 });
+
+
+test('legacy manual weight sources and explicit billing flags match frontend recomputation', () => {
+  const cases = [
+    { billingWeight: 0.7, profitInputs: { actualWeightKg: 0.2, weightSource: 'product_manual' } },
+    { billingWeight: 0.2, weightSource: '产品手工覆盖', profitInputs: { actualWeightKg: 0.7 } },
+    { billingWeight: 0.2, manualBillingWeight: true, profitInputs: { actualWeightKg: 0.7 } },
+    { billingWeight: 0.7, productWeight: 0.2, fieldSources: { productWeightKg: 'manual' } },
+  ];
+  for (const override of cases) {
+    const result = assertParity(canonicalProduct({ productWeight: 0.7, manualFbaFee: false, fbaFee: null, ...override }));
+    assert.equal(result.billingWeight, 0.2);
+    assert.equal(result.profitInputs.actualWeightKg, 0.2);
+    assert.equal(result.profitCalculation.domesticFreightWeightKg, 0.2);
+    assert.equal(result.fbaFee, 4.35);
+  }
+});
+
+test('legacy manual FBA fee provenance and zero fees match frontend recomputation', () => {
+  for (const fee of [0, 9.87]) {
+    for (const marker of [{ fbaFeeSource: 'manual' }, { fieldSources: { fbaFee: 'manual' } }]) {
+      const result = assertParity(canonicalProduct({ manualFbaFee: false, fbaFee: fee, ...marker }));
+      assert.equal(result.manualFbaFee, true);
+      assert.equal(result.fbaFee, fee);
+      assert.equal(result.profitCalculation.fulfillmentFee, fee);
+    }
+  }
+});
+
+test('general manual-profit marker keeps automatic weights refreshable in both runtimes', () => {
+  const result = assertParity(canonicalProduct({ manualProfitInputs: true, productWeight: 0.7,
+    billingWeight: 0.2, profitInputs: { actualWeightKg: 0.2, weightSource: 'Amazon 商品重量', marketingRate: 7 } }));
+  assert.equal(result.billingWeight, 0.7);
+  assert.equal(result.profitInputs.actualWeightKg, 0.7);
+  assert.equal(result.profitInputs.marketingRate, 7);
+});

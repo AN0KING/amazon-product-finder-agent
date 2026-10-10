@@ -55,7 +55,7 @@ function harness() {
   const elements = new Map();
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, { value: "", checked: false, disabled: false, hidden: false, textContent: "", innerHTML: "", title: "", dataset: {}, scrollTop: 0, scrollLeft: 0,
-      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {}, scrollIntoView() {}, focus() {}, closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }, addEventListener() {} });
+      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {}, scrollIntoView() {}, focus() {}, closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }, listeners: {}, addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); } });
     return elements.get(id);
   };
   const calls = [], timers = [], toasts = [], events = [];
@@ -95,6 +95,8 @@ function harness() {
       mutate: () => { approveActiveProduct(); rejectActiveProduct(); rematchActiveProduct(); saveManualCost(); commitProfitEdits(false); exportProducts(); exportAnalysisHandoff(); },
       approve: approveActiveProduct, saveEditor: commitProfitEdits, mapCandidate: mapCandidateProduct, mergeCandidates: mergeAnalyzedCandidateProducts,
       editor: getEditorValues, preview: renderProfitPreview, manualPreview: renderManualCostPreview,
+      bindEditor: bindDrawer, saveEditorToDisk: saveProfitEditor, settleSaves: () => persistenceSaveQueue,
+      useRealDrawer: () => { populateDrawer = originalPopulateDrawer; },
       openManual: openManualCostDialog, approveManual: () => saveManualCost({ approve: true }), saveManualDraft: () => saveManualCost({ allowIncomplete: true }),
       filtered: getFilteredProducts, matching: getAmazonFilteredProductsFor1688, pending: getPending1688ResumeProducts,
       startMatching: startFiltered1688Matching, renderSupplier: renderSupplier1688Stage,
@@ -113,7 +115,9 @@ function harness() {
     };
   })();`);
   vm.runInContext(source, context, { filename: "app.js" });
-  return { app: context.scout, element, calls, timers, toasts, events, respond(fn) { respond = fn; } };
+  return { app: context.scout, element, calls, timers, toasts, events,
+    fire(id, type) { return Promise.all((element(id).listeners[type] || []).map(callback => callback({ target: element(id), preventDefault() {} }))); },
+    respond(fn) { respond = fn; } };
 }
 
 test("managed restore never restarts legacy browser collection and retains canonical manual fields", async () => {
@@ -1515,4 +1519,504 @@ test("successive auto-saves can change a manual unit price back to the original 
   assert.equal(product.purchaseUnitCostCny, original);
   assert.equal(product.manualPurchaseCost, true);
   assert.equal(product.reviewStatus, "approved");
+});
+
+
+const editableProfitInputs = ["editSalePrice", "editPurchaseCost", "editPieceCount", "editPurchaseTotal", "editFbaFee", "editWeight"];
+
+function editableProfitFixture(product = canonicalProduct(), collectionJob = job("completed")) {
+  const fixture = harness();
+  fixture.app.restore(snapshot(collectionJob, [product]), { persistMigrations: false });
+  fixture.respond(async (path) => { assert.equal(path, "/api/runs"); return { runs: [] }; });
+  fixture.app.openLocalDrawer(productId);
+  fixture.app.bindEditor();
+  return fixture;
+}
+
+const profitEditCases = [
+  { id: "editSalePrice", raw: "25.50", field: "salePrice", value: 25.5, marker: "manualSalePrice" },
+  { id: "editPurchaseCost", raw: "2.34567", field: "purchaseUnitCostCny", value: 2.34567, marker: "manualPurchaseCost" },
+  { id: "editPieceCount", raw: "7", field: "pieceCount", value: 7, marker: "pieceCountSource", markerValue: "manual" },
+  { id: "editPurchaseTotal", raw: "10", field: "purchaseCost", value: 10, marker: "manualPurchaseCost" },
+  { id: "editFbaFee", raw: "7.35", field: "fbaFee", value: 7.35, marker: "manualFbaFee" },
+  { id: "editWeight", raw: "0.25", field: "billingWeight", value: 0.25, marker: "manualBillingWeight" },
+];
+
+test("the six profit fields are editable markup with an explicit non-submit save button", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  for (const id of editableProfitInputs) {
+    const input = html.match(new RegExp('<input\\b[^>]*\\bid="' + id + '"[^>]*>'))?.[0];
+    assert.ok(input, id);
+    assert.doesNotMatch(input, /\breadonly\b|\bdisabled\b/, id);
+  }
+  assert.match(html, /<button[^>]*type="button"[^>]*id="saveProfitEditsButton"/);
+});
+
+for (const edit of profitEditCases) test(edit.id + " change auto-saves a manual value, updates profit and survives reload", async () => {
+  const initial = { ...canonicalProduct(), pieceCount: 3, purchaseCost: 9 };
+  const { app, element, fire, calls } = editableProfitFixture(initial);
+  const originalQuotes = JSON.stringify(app.state().products[0].suppliers);
+  element(edit.id).value = edit.raw;
+  await fire(edit.id, "input");
+  const preview = app.editor();
+  if (edit.id === "editPurchaseTotal") assert.equal(preview.purchaseUnitCostCny, 10 / 3);
+  await fire(edit.id, "change");
+  await app.settleSaves();
+  assert.ok(calls.length >= 1, "the real change handler must persist without clicking initial review");
+  const saved = calls.at(-1).body;
+  const product = saved.products[0];
+  assert.equal(product[edit.field], edit.value);
+  assert.equal(product[edit.marker], edit.markerValue ?? true);
+  assert.equal(product.purchaseCost, pieceCount.calculatePieceAdjustedPurchaseCostCny(product.purchaseUnitCostCny, product.pieceCount));
+  assert.equal(product.reviewStatus, "pending");
+  assert.equal(product.currentPrice, initial.currentPrice, "our sale price must not overwrite the Amazon price");
+  assert.equal(JSON.stringify(product.suppliers), originalQuotes);
+  const expected = profitModel.calculateProductProfit({ ...product.profitInputs, salePrice: product.salePrice,
+    purchaseCostCny: product.purchaseCost, fulfillmentMode: "FBA", fulfillmentFee: product.fbaFee, actualWeightKg: product.billingWeight });
+  assert.ok(expected);
+  assert.equal(product.margin, expected.margin);
+  const reloaded = harness();
+  reloaded.app.restore(saved, { persistMigrations: false });
+  reloaded.app.openLocalDrawer(productId);
+  const restored = reloaded.app.state().products[0];
+  assert.equal(restored[edit.field], edit.value);
+  assert.equal(restored[edit.marker], edit.markerValue ?? true);
+  assert.equal(restored.margin, product.margin);
+  if (edit.id === "editPurchaseTotal") {
+    assert.equal(restored.purchaseUnitCostCny, 10 / 3);
+    assert.equal(Number(reloaded.element("editPurchaseTotal").value), 10);
+  }
+});
+
+for (const edit of profitEditCases) test(edit.id + " saves independently while other profit inputs and monthly evidence are missing", async () => {
+  const initial = imageCandidate(1, { pieceCount: 3, pieceCountSource: "manual", fulfillmentMode: null,
+    sales30: null, sales30Evidence: null });
+  const { app, element, fire, calls } = editableProfitFixture(initial);
+  element(edit.id).value = edit.raw;
+  await fire(edit.id, "input");
+  await fire(edit.id, "change");
+  await app.settleSaves();
+  assert.ok(calls.length >= 1, "an incomplete draft must save");
+  const saved = calls.at(-1).body;
+  assert.equal(saved.products[0][edit.field], edit.value);
+  assert.equal(saved.products[0][edit.marker], edit.markerValue ?? true);
+  assert.equal(saved.products[0].reviewStatus, "pending");
+  const reloaded = harness().app;
+  reloaded.restore(saved, { persistMigrations: false });
+  assert.equal(reloaded.state().products[0][edit.field], edit.value);
+  app.approve();
+  assert.equal(app.state().products[0].reviewStatus, "pending", "saving a draft must not waive review requirements");
+});
+
+test("manual total conversion retains unit precision across later unit and quantity edits", async () => {
+  const { app, element, fire } = editableProfitFixture({ ...canonicalProduct(), pieceCount: 3, purchaseCost: 9 });
+  element("editPurchaseTotal").value = "10";
+  await fire("editPurchaseTotal", "input");
+  assert.equal(Number(element("editPurchaseCost").value), 10 / 3);
+  assert.equal(await app.saveEditorToDisk(), true);
+  element("editPieceCount").value = "7";
+  await fire("editPieceCount", "input");
+  assert.equal(Number(element("editPurchaseTotal").value), 23.33);
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(app.state().products[0].purchaseUnitCostCny, 10 / 3);
+  element("editPurchaseCost").value = "1.23456789";
+  await fire("editPurchaseCost", "input");
+  assert.equal(Number(element("editPurchaseTotal").value), 8.64);
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(app.state().products[0].purchaseUnitCostCny, 1.23456789);
+  const restarted = harness().app;
+  restarted.restore(app.capture(), { persistMigrations: false });
+  assert.equal(restarted.state().products[0].purchaseUnitCostCny, 1.23456789);
+  assert.equal(restarted.state().products[0].purchaseCost, 8.64);
+});
+
+test("zero total and zero manual delivery fee remain deliberate manual inputs", async () => {
+  const { app, element, fire } = editableProfitFixture();
+  for (const id of ["editPurchaseTotal", "editFbaFee"]) { element(id).value = "0"; await fire(id, "input"); }
+  assert.equal(await app.saveEditorToDisk(), true);
+  const reloaded = harness().app;
+  reloaded.restore(app.capture(), { persistMigrations: false });
+  const product = reloaded.state().products[0];
+  assert.equal(product.purchaseCost, 0);
+  assert.equal(product.purchaseUnitCostCny, 0);
+  assert.equal(product.fbaFee, 0);
+  assert.equal(product.manualPurchaseCost, true);
+  assert.equal(product.manualFbaFee, true);
+});
+
+for (const [id, raw] of [["editSalePrice", "0"], ["editPurchaseCost", "-1"], ["editPieceCount", "2.5"], ["editPurchaseTotal", "-3"], ["editFbaFee", "-2"], ["editWeight", "0"]]) {
+  test(id + " invalid input cannot save or overwrite a previous value", async () => {
+    const { app, element, fire, calls } = editableProfitFixture();
+    const before = JSON.stringify(app.state().products);
+    element(id).value = raw;
+    await fire(id, "input");
+    assert.equal(await app.saveEditorToDisk(), false);
+    assert.equal(JSON.stringify(app.state().products), before);
+    assert.equal(calls.length, 0);
+    assert.match(element("profitEditorStatus").textContent, /未保存/);
+  });
+}
+
+test("transient browser badInput does not clear the saved numeric value", async () => {
+  const { app, element, fire, calls } = editableProfitFixture();
+  element("editSalePrice").value = "";
+  element("editSalePrice").validity = { badInput: true };
+  await fire("editSalePrice", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(app.state().products[0].salePrice, 18);
+  assert.equal(calls.length, 0);
+});
+
+test("an empty weight edit retains an existing manual weight while other edits save", async () => {
+  const { app, element, fire } = editableProfitFixture({ ...canonicalProduct(), billingWeight: 0.25,
+    manualBillingWeight: true, manualProfitInputs: true,
+    profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.25, weightSource: "product_manual" } });
+  element("editWeight").value = "";
+  await fire("editWeight", "input");
+  element("editSalePrice").value = "22";
+  await fire("editSalePrice", "input");
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(app.state().products[0].billingWeight, 0.25);
+  assert.equal(app.state().products[0].profitInputs.actualWeightKg, 0.25);
+});
+
+for (const status of ["queued", "running", "cooldown"]) test(status + " collection protects all six fields and explicit save", async () => {
+  const { app, element, fire, calls } = editableProfitFixture(canonicalProduct(), job(status));
+  for (const id of editableProfitInputs) assert.equal(element(id).disabled, true, id);
+  assert.equal(element("saveProfitEditsButton").disabled, true);
+  const before = JSON.stringify(app.state().products);
+  element("editPurchaseTotal").value = "100";
+  await fire("editPurchaseTotal", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(JSON.stringify(app.state().products), before);
+  assert.equal(calls.length, 0);
+});
+
+for (const status of ["paused", "needs_attention"]) test(status + " fields unlock only after the active worker has stopped", () => {
+  const collection = { ...job(status), workerActive: true };
+  const { app, element } = editableProfitFixture(canonicalProduct(), collection);
+  for (const id of editableProfitInputs) assert.equal(element(id).disabled, true, id);
+  app.apply({ ...collection, workerActive: false });
+  for (const id of editableProfitInputs) assert.equal(element(id).disabled, false, id);
+  assert.equal(element("saveProfitEditsButton").disabled, false);
+});
+
+test("handed-off product and active supplier work retain six-field edit protection", async () => {
+  for (const overrides of [{ analysisHandoff: { owner: "procurement" } }, { supplierSearchStatus: "searching" }]) {
+    const { app, element, calls } = editableProfitFixture({ ...canonicalProduct(), ...overrides });
+    Object.assign(app.state().products[0], overrides);
+    app.render();
+    for (const id of editableProfitInputs) assert.equal(element(id).disabled, true, id);
+    assert.equal(element("saveProfitEditsButton").disabled, true);
+    const before = JSON.stringify(app.state().products);
+    element("editSalePrice").value = "100";
+    assert.equal(await app.saveEditorToDisk(), false);
+    assert.equal(JSON.stringify(app.state().products), before);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("a storage failure is shown as unsaved and the explicit save button retries the same edits", async () => {
+  const fixture = editableProfitFixture();
+  fixture.respond(async () => { throw new Error("Synthetic storage unavailable"); });
+  fixture.element("editSalePrice").value = "23";
+  await fixture.fire("editSalePrice", "input");
+  assert.equal(await fixture.app.saveEditorToDisk(), false);
+  assert.match(fixture.element("profitEditorStatus").textContent, /尚未保存/);
+  fixture.respond(async () => ({ runs: [] }));
+  await fixture.fire("saveProfitEditsButton", "click");
+  assert.match(fixture.element("profitEditorStatus").textContent, /已保存/);
+  assert.equal(fixture.calls.at(-1).body.products[0].salePrice, 23);
+});
+
+
+for (const edit of profitEditCases) test(edit.id + " survives a real drawer refresh after a stale save and retries against the new snapshot", async () => {
+  const initial = { ...canonicalProduct(), pieceCount: 3, purchaseCost: 9 };
+  const fixture = editableProfitFixture(initial);
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  const newer = snapshot(job("completed", 2), [{ ...initial, currentPrice: 12.55, reviews: 44,
+    suppliers: [{ name: "New backend supplier", unitPriceCny: 4 }] }, imageCandidate(2)]);
+  let rejectSave = true;
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") {
+      if (rejectSave) throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+      return { runs: [] };
+    }
+    assert.equal(path, `/api/runs/${runId}`);
+    return structuredClone(newer);
+  });
+  element(edit.id).value = edit.raw;
+  await fire(edit.id, "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(Number(element(edit.id).value), Number(edit.raw));
+  assert.equal(app.state().revision, 2);
+  assert.equal(app.state().products[0].salePrice, 18, "pending edits must not replace the new canonical snapshot");
+  assert.match(element("profitEditorStatus").textContent, /尚未保存/);
+  assert.equal(calls.filter(call => call.path === "/api/runs").length, 1, "a conflict never replays the old snapshot automatically");
+  rejectSave = false;
+  assert.equal(await app.saveEditorToDisk(), true);
+  const retried = calls.at(-1).body;
+  assert.equal(retried.amazonCollectionRevision, 2);
+  assert.equal(retried.products[0][edit.field], edit.value);
+  assert.equal(retried.products[0][edit.marker], edit.markerValue ?? true);
+  assert.equal(retried.products[0].currentPrice, 12.55);
+  assert.equal(retried.products[0].reviews, 44);
+  assert.equal(retried.products[0].suppliers[0].name, "New backend supplier");
+  assert.equal(retried.products[1].id, imageCandidate(2).id);
+  assert.match(element("profitEditorStatus").textContent, /已保存/);
+});
+
+test("a sale-only draft preserves new backend weight, automatic purchase average and untouched price fields", async () => {
+  const initial = { ...serverPricedSnapshot({ score: 0.98, count: 10 }).saved.products[0], pieceCount: 2, pieceCountSource: "manual",
+    manualFbaFee: false, fulfillmentModeSource: "amazon_product_page" };
+  const fixture = editableProfitFixture(initial);
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  const newer = { ...initial, currentPrice: 19, productWeight: 0.35, billingWeight: 0.35, supplierAverageCny: 7.25,
+    purchaseUnitCostCny: 7.25, purchaseCost: 14.5, suppliers: initial.suppliers.map(quote => ({ ...quote, name: "New automatic quote", unitPriceCny: 7.25, price: 7.25 })),
+    profitInputs: { ...initial.profitInputs, actualWeightKg: 0.35 } };
+  let rejectSave = true;
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") {
+      if (rejectSave) throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+      return { runs: [] };
+    }
+    return snapshot(job("completed", 2), [newer]);
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(Number(element("editSalePrice").value), 23);
+  assert.equal(Number(element("editWeight").value), 0.35);
+  assert.equal(Number(element("editPurchaseCost").value), 7.25);
+  assert.equal(Number(element("editPurchaseTotal").value), 14.5);
+  rejectSave = false;
+  assert.equal(await app.saveEditorToDisk(), true);
+  const product = calls.at(-1).body.products[0];
+  assert.equal(product.salePrice, 23);
+  assert.equal(product.currentPrice, 19);
+  assert.equal(product.billingWeight, 0.35);
+  assert.equal(product.manualBillingWeight, undefined);
+  assert.equal(product.purchaseUnitCostCny, 7.25);
+  assert.equal(product.manualPurchaseCost, false);
+  assert.equal(product.manualFbaFee, false);
+  assert.equal(product.fbaFee, product.fbaEstimate.fee);
+});
+
+test("a total-cost draft rebases on a newer backend quantity without turning it into a manual quantity", async () => {
+  const initial = { ...canonicalProduct(), name: "Blue clips Pack of 2", englishName: "Blue clips Pack of 2", pieceCountSource: "amazon_title" };
+  const fixture = editableProfitFixture(initial);
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+    return snapshot(job("completed", 2), [{ ...initial, name: "Blue clips Pack of 3", englishName: "Blue clips Pack of 3", pieceCount: 3, purchaseCost: 9 }]);
+  });
+  element("editPurchaseTotal").value = "10";
+  await fire("editPurchaseTotal", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(Number(element("editPieceCount").value), 3);
+  assert.equal(Number(element("editPurchaseTotal").value), 10);
+  assert.equal(Number(element("editPurchaseCost").value), 10 / 3);
+  fixture.respond(async () => ({ runs: [] }));
+  assert.equal(await app.saveEditorToDisk(), true);
+  const product = calls.at(-1).body.products[0];
+  assert.equal(product.purchaseCost, 10);
+  assert.equal(product.purchaseUnitCostCny, 10 / 3);
+  assert.equal(product.pieceCount, 3);
+  assert.equal(product.pieceCountSource, "amazon_title");
+});
+
+test("ordinary snapshot refreshes preserve pending input and clear its draft only after a successful save", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  let newer = snapshot(job("completed", 2));
+  fixture.respond(async (path) => path === "/api/runs" ? { runs: [] } : structuredClone(newer));
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  await app.refresh();
+  assert.equal(Number(element("editSalePrice").value), 23);
+  assert.equal(app.state().products[0].salePrice, 18);
+  assert.equal(calls.some(call => call.path === "/api/runs"), false);
+  assert.equal(await app.saveEditorToDisk(), true);
+  newer = snapshot(job("completed", 3), [{ ...canonicalProduct(), salePrice: 25 }]);
+  await app.refresh();
+  assert.equal(Number(element("editSalePrice").value), 25, "saved draft must not override later backend changes");
+});
+
+test("a stale save cannot overwrite a newer input entered while its snapshot read is in flight", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire } = fixture;
+  app.useRealDrawer();
+  let releaseRead, readStarted;
+  const started = new Promise(resolve => { readStarted = resolve; });
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+    readStarted();
+    return new Promise(resolve => { releaseRead = resolve; });
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  const saving = app.saveEditorToDisk();
+  await started;
+  element("editSalePrice").value = "27";
+  await fire("editSalePrice", "input");
+  releaseRead(snapshot(job("completed", 2)));
+  assert.equal(await saving, false);
+  assert.equal(Number(element("editSalePrice").value), 27);
+  assert.notEqual(element("profitEditorStatus").dataset.state, "saved");
+  fixture.respond(async () => ({ runs: [] }));
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(fixture.calls.at(-1).body.products[0].salePrice, 27);
+});
+
+test("an older successful save does not clear newer pending input before a subsequent snapshot refresh", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire } = fixture;
+  app.useRealDrawer();
+  let releaseSave, saveStarted;
+  const started = new Promise(resolve => { saveStarted = resolve; });
+  fixture.respond(async () => {
+    saveStarted();
+    return new Promise(resolve => { releaseSave = resolve; });
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  const saving = app.saveEditorToDisk();
+  await started;
+  element("editSalePrice").value = "27";
+  await fire("editSalePrice", "input");
+  releaseSave({ runs: [] });
+  assert.equal(await saving, true);
+  assert.notEqual(element("profitEditorStatus").dataset.state, "saved");
+  fixture.respond(async () => snapshot(job("completed", 2), [{ ...canonicalProduct(), salePrice: 23 }]));
+  await app.refresh();
+  assert.equal(Number(element("editSalePrice").value), 27);
+});
+
+test("a pending conflict refresh never restores a former product draft into a different drawer", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire } = fixture;
+  app.useRealDrawer();
+  const second = { ...imageCandidate(2), manualSalePrice: true, salePrice: 31 };
+  app.state().products.push(second);
+  let releaseRead, readStarted;
+  const started = new Promise(resolve => { readStarted = resolve; });
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+    readStarted();
+    return new Promise(resolve => { releaseRead = resolve; });
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  const saving = app.saveEditorToDisk();
+  await started;
+  app.openLocalDrawer(second.id);
+  releaseRead(snapshot(job("completed", 2), [canonicalProduct(), second]));
+  assert.equal(await saving, false);
+  assert.equal(app.state().activeProductId, second.id);
+  assert.equal(Number(element("editSalePrice").value), 31);
+  assert.doesNotMatch(element("profitEditorStatus").textContent, /尚未保存/);
+});
+
+test("a draft restored after a conflict remains locked when the backend collection resumes", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+    return snapshot(job("running", 2));
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(Number(element("editSalePrice").value), 23);
+  for (const id of editableProfitInputs) assert.equal(element(id).disabled, true, id);
+  assert.equal(element("saveProfitEditsButton").disabled, true);
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(calls.filter(call => call.path === "/api/runs").length, 1);
+  assert.equal(app.state().products[0].salePrice, 18);
+});
+
+
+test("editing only quantity preserves the newer automatic unit price and its source after a conflict", async () => {
+  const initial = serverPricedSnapshot({ score: 0.98, count: 10 }).saved.products[0];
+  const fixture = editableProfitFixture(initial);
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") throw Object.assign(new Error("Newer collection revision"), { code: "STALE_COLLECTION_SNAPSHOT" });
+    return snapshot(job("completed", 2), [{ ...initial, supplierAverageCny: 9, purchaseUnitCostCny: 9, purchaseCost: 9,
+      suppliers: initial.suppliers.map(quote => ({ ...quote, unitPriceCny: 9, price: 9 })) }]);
+  });
+  element("editPieceCount").value = "7";
+  await fire("editPieceCount", "input");
+  assert.equal(await app.saveEditorToDisk(), false);
+  assert.equal(Number(element("editPieceCount").value), 7);
+  assert.equal(Number(element("editPurchaseCost").value), 9);
+  assert.equal(Number(element("editPurchaseTotal").value), 63);
+  fixture.respond(async () => ({ runs: [] }));
+  assert.equal(await app.saveEditorToDisk(), true);
+  const product = calls.at(-1).body.products[0];
+  assert.equal(product.purchaseUnitCostCny, 9);
+  assert.equal(product.purchaseCost, 63);
+  assert.equal(product.manualPurchaseCost, false);
+  assert.equal(product.pieceCountSource, "manual");
+});
+
+test("a snapshot racing a successful profit save cannot leave the canonical model with the old price", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  let releaseSave, saveStarted, storedPrice = 18;
+  const started = new Promise(resolve => { saveStarted = resolve; });
+  fixture.respond(async (path) => {
+    if (path !== "/api/runs") return snapshot(job("completed"), [{ ...canonicalProduct(), salePrice: storedPrice, reviews: storedPrice === 23 ? 45 : 33 }]);
+    saveStarted();
+    return new Promise(resolve => { releaseSave = resolve; });
+  });
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  const saving = app.saveEditorToDisk();
+  await started;
+  await app.refresh();
+  storedPrice = 23;
+  releaseSave({ runs: [] });
+  assert.equal(await saving, true);
+  await app.settleSnapshots();
+  assert.equal(Number(element("editSalePrice").value), 23);
+  assert.equal(app.state().products[0].salePrice, 23);
+  assert.equal(app.state().products[0].reviews, 45, "the deferred refresh catches up new backend fields");
+  assert.equal(calls.filter(call => call.path === `/api/runs/${runId}`).length, 2, "one deferred read follows the discarded read");
+  fixture.respond(async () => ({ runs: [] }));
+  assert.equal(await app.save(), true);
+  assert.equal(calls.at(-1).body.products[0].salePrice, 23);
+});
+
+test("a snapshot started before a profit save cannot arrive after success and roll back the edited price", async () => {
+  const fixture = editableProfitFixture();
+  const { app, element, fire, calls } = fixture;
+  app.useRealDrawer();
+  let releaseRead, readStarted;
+  const started = new Promise(resolve => { readStarted = resolve; });
+  fixture.respond(async (path) => {
+    if (path === "/api/runs") return { runs: [] };
+    readStarted();
+    return new Promise(resolve => { releaseRead = resolve; });
+  });
+  const refreshing = app.refresh();
+  await started;
+  element("editSalePrice").value = "23";
+  await fire("editSalePrice", "input");
+  assert.equal(await app.saveEditorToDisk(), true);
+  fixture.respond(async () => snapshot(job("completed"), [{ ...canonicalProduct(), salePrice: 23, reviews: 45 }]));
+  releaseRead(snapshot(job("completed")));
+  await refreshing;
+  await app.settleSnapshots();
+  assert.equal(Number(element("editSalePrice").value), 23);
+  assert.equal(app.state().products[0].salePrice, 23);
+  assert.equal(app.state().products[0].reviews, 45);
+  assert.equal(calls.filter(call => call.path === `/api/runs/${runId}`).length, 2);
 });

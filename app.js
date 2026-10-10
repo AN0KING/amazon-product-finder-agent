@@ -7,6 +7,8 @@ import {
   estimateAu2026FbaFeeByProductWeight,
   estimateUs2023FbaFeeByProductWeight,
   isAmazonWeightUnavailable,
+  resolveManualWeightOverride,
+  hasManualFulfillmentFee,
   estimateMinimumFbaFee,
 } from "./lib/profit-model.mjs";
 import {
@@ -36,7 +38,7 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.48";
+  const APP_VERSION = "0.9.49";
   const EXPORT_DIRECTORY_LABEL = "D:\\铺货筛选";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "auto";
@@ -504,6 +506,14 @@ import {
   const analysisVersionPendingIds = new Set();
   let toastTimer = null;
   let drawerFbaTouched = false;
+  let drawerPurchaseInput = "unit";
+  let drawerProfitSaveVersion = 0;
+  let drawerProfitDraft = null;
+  let drawerProfitBaseline = null;
+  let profitEditorPendingSaves = 0;
+  let profitEditorPersistenceEpoch = 0;
+  let profitEditorSnapshotDeferred = false;
+  const PROFIT_EDITOR_INPUT_IDS = ["editSalePrice", "editPurchaseCost", "editPieceCount", "editPurchaseTotal", "editFbaFee", "editWeight"];
   let profitAutoCommitTimer = null;
   let lastFocusedElement = null;
   let drawerReturnPosition = null;
@@ -731,12 +741,19 @@ import {
   async function refreshAmazonCollectionSnapshot() {
     if (amazonCollectionSnapshotPromise) return amazonCollectionSnapshotPromise;
     const requestedRunId = runState.id;
+    const requestedProfitEpoch = profitEditorPersistenceEpoch;
     if (!requestedRunId) return;
     amazonCollectionSnapshotPromise = (async () => {
       const snapshot = await apiRequest(`/api/runs/${encodeURIComponent(requestedRunId)}`, { timeout: 30000 });
       if (runState.id !== requestedRunId) return;
+      // A read racing a profit save may still contain the old inputs. The next poll catches up.
+      if (profitEditorPendingSaves || requestedProfitEpoch !== profitEditorPersistenceEpoch) {
+        profitEditorSnapshotDeferred = true;
+        return;
+      }
       const view = {
         criteria: { ...activeRunCriteria }, page: resultPage, productId: activeProductId,
+        profitDraft: isCurrentProfitEditorDraft(drawerProfitDraft) ? captureProfitEditorDraft() : null,
         filters: ["resultSearch", "resultMinMargin", "resultWeightBand", "resultsCompleteToggle", "monthlySalesBand", "minReviews", "minRating"].map((id) => {
           const input = byId(id); return { id, value: input?.value, checked: input?.checked };
         }),
@@ -753,11 +770,12 @@ import {
       if (view.productId && products.some((product) => product.id === view.productId)) {
         activeProductId = view.productId;
         populateDrawer(products.find((product) => product.id === activeProductId));
+        restoreProfitEditorDraft(view.profitDraft);
       }
       renderResults();
       view.scroll.forEach(({ element, top, left }) => { element.scrollTop = top; element.scrollLeft = left; });
       renderAmazonCollection();
-    })().finally(() => { amazonCollectionSnapshotPromise = null; });
+    })().finally(() => { amazonCollectionSnapshotPromise = null; flushDeferredProfitEditorSnapshot(); });
     return amazonCollectionSnapshotPromise;
   }
 
@@ -816,10 +834,11 @@ import {
   function renderAmazonCollection() {
     const editingLocked = isCollectionWriteLocked();
     const activeProduct = products.find((product) => product.id === activeProductId);
-    ["editSalePrice", "editPurchaseCost", "editPieceCount", "editFbaFee", "editWeight"].forEach((id) => {
+    PROFIT_EDITOR_INPUT_IDS.forEach((id) => {
       const input = byId(id);
-      if (input) input.disabled = editingLocked || isAnalysisReadOnly(activeProduct);
+      if (input) input.disabled = editingLocked || isAnalysisReadOnly(activeProduct) || activeProduct?.supplierSearchStatus === "searching";
     });
+    syncProfitEditorSaveButton(activeProduct);
     if (editingLocked) {
       clearProfitAutoCommit();
       ["approveProductButton", "rejectProductButton", "rematchProductButton"].forEach((id) => {
@@ -2331,7 +2350,7 @@ import {
     };
   }
 
-  async function persistCurrentRun({ notify = false } = {}) {
+  async function persistCurrentRun({ notify = false, onSettled = null } = {}) {
     if (isCollectionWriteLocked()) {
       persistenceLastError = createRunError("COLLECTION_MANAGED_READ_ONLY", "后台任务正在管理本任务数据，已停止页面快照写入。");
       if (notify) collectionWriteBlocked();
@@ -2360,6 +2379,7 @@ import {
     persistenceSaveQueue = pending.catch(() => {});
     try {
       const data = await pending;
+      onSettled?.();
       runHistory = Array.isArray(data?.runs) ? data.runs : runHistory;
       updateSellerSpriteCallCount(data?.totalSellerSpriteCalls);
       if (data?.summary?.id === runState.id) {
@@ -2371,8 +2391,11 @@ import {
       updateHistorySummary();
       return true;
     } catch (error) {
+      onSettled?.();
       persistenceLastError = error;
       if (error?.code === "STALE_COLLECTION_SNAPSHOT") {
+        // Finish an older read before requesting the post-conflict canonical state.
+        if (amazonCollectionSnapshotPromise) await amazonCollectionSnapshotPromise.catch(() => {});
         await refreshAmazonCollectionSnapshot().catch(() => {});
         persistenceLastError = error;
       }
@@ -4255,14 +4278,10 @@ import {
 
   function refreshProductWeightState(product) {
     if (isAnalysisReadOnly(product)) return;
-    const manualSource = [product.profitInputs?.weightSource, product.weightSource]
-      .find((source) => /(?:人工|手工)覆盖/.test(String(source || "")));
-    const manualWeight = [product.profitInputs?.actualWeightKg, product.billingWeight]
-      .map(finiteOrNull)
-      .find((weight) => weight !== null && weight > 0);
-    if (manualSource && manualWeight !== undefined) {
-      product.billingWeight = manualWeight;
-      product.weightSource = manualSource;
+    const manualWeight = resolveManualWeightOverride(product);
+    if (manualWeight) {
+      product.billingWeight = manualWeight.weightKg;
+      product.weightSource = manualWeight.source;
       product.manualProfitInputs = true;
       return;
     }
@@ -6774,10 +6793,17 @@ import {
       scheduleProfitAutoCommit();
     });
     byId("editPurchaseCost")?.addEventListener("input", () => {
+      drawerPurchaseInput = "unit";
+      renderProfitPreview();
+      scheduleProfitAutoCommit();
+    });
+    byId("editPurchaseTotal")?.addEventListener("input", () => {
+      drawerPurchaseInput = "total";
       renderProfitPreview();
       scheduleProfitAutoCommit();
     });
     byId("editPieceCount")?.addEventListener("input", () => {
+      drawerPurchaseInput = "unit";
       setText("editPieceCountSource", "人工设置");
       renderProfitPreview();
       scheduleProfitAutoCommit();
@@ -6798,9 +6824,10 @@ import {
       renderProfitPreview();
       scheduleProfitAutoCommit();
     });
-    ["editPurchaseCost", "editPieceCount", "editFbaFee", "editWeight"].forEach((id) => {
+    PROFIT_EDITOR_INPUT_IDS.forEach((id) => {
       byId(id)?.addEventListener("change", () => flushProfitAutoCommit({ force: true }));
     });
+    byId("saveProfitEditsButton")?.addEventListener("click", saveProfitEditor);
     byId("approveProductButton")?.addEventListener("click", approveActiveProduct);
     byId("rejectProductButton")?.addEventListener("click", rejectActiveProduct);
     byId("rematchProductButton")?.addEventListener("click", rematchActiveProduct);
@@ -7689,6 +7716,11 @@ import {
     };
     activeProductId = productId;
     drawerFbaTouched = false;
+    drawerPurchaseInput = "unit";
+    drawerProfitSaveVersion += 1;
+    drawerProfitDraft = null;
+    drawerProfitBaseline = null;
+    setProfitEditorStatus("修改后自动保存，也可点击保存修改。");
     populateDrawer(product);
     setDrawerTab("amazon");
     const backdrop = byId("drawerBackdrop");
@@ -7708,6 +7740,8 @@ import {
     const returnPosition = drawerReturnPosition;
     const returnElement = lastFocusedElement;
     flushProfitAutoCommit();
+    drawerProfitDraft = null;
+    drawerProfitSaveVersion += 1;
     backdrop.classList.remove("is-open");
     document.body.classList.remove("drawer-open");
     setTimeout(() => {
@@ -7866,6 +7900,7 @@ import {
     }
 
     renderSupplierList(product);
+    drawerPurchaseInput = "unit";
     byId("editSalePrice").value = valueOrBlank(product.salePrice);
     byId("editPurchaseCost").value = valueOrBlank(purchasePricing.unitCostCny);
     byId("editPurchaseCost").dataset.purchaseBaseline = valueOrBlank(purchasePricing.unitCostCny);
@@ -7882,13 +7917,16 @@ import {
         : product.fulfillmentMode === "FBM" ? "FBM 履约费（可覆盖）" : "FBA 配送费（输入重量后自动估算，可覆盖）";
     }
     byId("editWeight").value = valueOrBlank(product.billingWeight);
+    drawerFbaTouched = false;
+    drawerProfitBaseline = profitEditorInputValues();
     renderProfitPreview();
     const handedOff = isAnalysisReadOnly(product);
     const editingLocked = handedOff || isCollectionWriteLocked();
     byId("rejectProductButton").disabled = editingLocked || product.reviewStatus === "rejected";
     byId("rematchProductButton").disabled = editingLocked || analysisRunning || product.supplierSearchStatus === "searching";
     if (byId("openManualCostButton")) byId("openManualCostButton").disabled = editingLocked || product.supplierSearchStatus === "searching";
-    ["editSalePrice", "editPurchaseCost", "editPieceCount", "editFbaFee", "editWeight"].forEach((id) => { if (byId(id)) byId(id).disabled = editingLocked; });
+    PROFIT_EDITOR_INPUT_IDS.forEach((id) => { if (byId(id)) byId(id).disabled = editingLocked || product.supplierSearchStatus === "searching"; });
+    syncProfitEditorSaveButton(product);
     const handoffNotice = byId("drawerAnalysisHandoffNote");
     if (handoffNotice) handoffNotice.hidden = !handedOff;
     renderAnalysisVersionActions(product);
@@ -7982,13 +8020,24 @@ import {
 
   function getEditorValues() {
     const product = products.find((item) => item.id === activeProductId);
-    const billingWeight = numberOrNull(byId("editWeight").value);
+    const weightRaw = String(byId("editWeight").value).trim();
+    const billingWeight = weightRaw ? numberOrNull(weightRaw) : finiteOrNull(product?.billingWeight);
     const pieceCount = normalizePieceCount(byId("editPieceCount")?.value);
-    const purchasePricing = resolvePurchasePriceInput(product, byId("editPurchaseCost").value, byId("editPurchaseCost").dataset.purchaseBaseline ?? product?.purchaseUnitCostCny);
+    let purchasePricing = resolvePurchasePriceInput(product, byId("editPurchaseCost").value, byId("editPurchaseCost").dataset.purchaseBaseline ?? product?.purchaseUnitCostCny);
+    if (drawerPurchaseInput === "total") {
+      const rawTotal = String(byId("editPurchaseTotal").value).trim();
+      const enteredTotal = numberOrNull(rawTotal);
+      if (rawTotal) {
+        const invalid = enteredTotal === null || enteredTotal < 0;
+        // Keep the quotient at full precision: e.g. 10 / 3 must still total 10 after reload.
+        const unitCostCny = !invalid && pieceCount !== null ? roundMoney(enteredTotal) / pieceCount : null;
+        purchasePricing = { unitCostCny, invalid, manuallyEdited: unitCostCny !== null, manual: true };
+      }
+    }
     const purchaseUnitCostCny = purchasePricing.unitCostCny;
-    const savedFulfillmentMode = normalizeFulfillmentMode(product?.fulfillmentMode);
-    const fulfillmentMode = savedFulfillmentMode || (billingWeight !== null && billingWeight > 0 ? "FBA" : null);
     const fulfillmentFee = numberOrNull(byId("editFbaFee").value);
+    const savedFulfillmentMode = normalizeFulfillmentMode(product?.fulfillmentMode);
+    const fulfillmentMode = savedFulfillmentMode || ((billingWeight !== null && billingWeight > 0) || fulfillmentFee !== null ? "FBA" : null);
     const profitInputs = product ? ensureProductProfitInputs(product) : getDefaultProfitInputs();
     return {
       salePrice: numberOrNull(byId("editSalePrice").value),
@@ -8014,9 +8063,120 @@ import {
     profitAutoCommitTimer = null;
   }
 
+  function setProfitEditorStatus(message, state = "") {
+    const status = byId("profitEditorStatus");
+    if (status) { status.textContent = message; status.dataset.state = state; }
+  }
+
+  function syncProfitEditorSaveButton(product) {
+    const button = byId("saveProfitEditsButton");
+    if (button) button.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || product.supplierSearchStatus === "searching";
+    if (isCollectionWriteLocked()) setProfitEditorStatus("后台任务执行中；暂停并等待当前请求结束后可编辑。");
+    else if (isAnalysisReadOnly(product)) setProfitEditorStatus("已交接资料受保护；创建新的分析版本后可编辑。");
+    else if (product?.supplierSearchStatus === "searching") setProfitEditorStatus("当前商品正在匹配，完成后可编辑。");
+  }
+
+  function profitEditorInputValues() {
+    return Object.fromEntries(PROFIT_EDITOR_INPUT_IDS.map((id) => [id, String(byId(id)?.value ?? "")]));
+  }
+
+  function isCurrentProfitEditorDraft(draft) {
+    return Boolean(draft && draft.runId === runState.id && draft.productId === activeProductId
+      && draft.transitionId === drawerTransitionId && draft.version === drawerProfitSaveVersion);
+  }
+
+  function captureProfitEditorDraft() {
+    if (!activeProductId) return null;
+    const previous = drawerProfitDraft?.runId === runState.id && drawerProfitDraft.productId === activeProductId
+      && drawerProfitDraft.transitionId === drawerTransitionId ? drawerProfitDraft : null;
+    const inputs = profitEditorInputValues();
+    const changedInputs = new Set(previous?.changedInputs || []);
+    if (drawerPurchaseInput === "total") changedInputs.delete("editPurchaseCost");
+    else if (previous?.purchaseInput === "total" && changedInputs.delete("editPurchaseTotal")) changedInputs.add("editPurchaseCost");
+    for (const id of PROFIT_EDITOR_INPUT_IDS) {
+      if (id === "editPurchaseTotal" && drawerPurchaseInput !== "total") continue;
+      if (id === "editPurchaseCost" && drawerPurchaseInput === "total") continue;
+      // Automatic fee updates are derived from the latest price/weight, never a manual override.
+      if (id === "editFbaFee" && !drawerFbaTouched) continue;
+      if (inputs[id] !== String(drawerProfitBaseline?.[id] ?? "")) changedInputs.add(id);
+    }
+    if (!changedInputs.size) return null;
+    return {
+      runId: runState.id, productId: activeProductId, transitionId: drawerTransitionId,
+      version: drawerProfitSaveVersion, inputs, changedInputs: [...changedInputs],
+      purchaseInput: drawerPurchaseInput, fbaTouched: drawerFbaTouched,
+      purchaseBaseline: previous?.purchaseBaseline ?? byId("editPurchaseCost").dataset.purchaseBaseline,
+    };
+  }
+
+  function restoreProfitEditorDraft(draft) {
+    if (!isCurrentProfitEditorDraft(draft)) return;
+    const product = products.find((item) => item.id === draft.productId);
+    if (!product) return;
+    // Keep the new canonical snapshot intact; only restore pending editor fields for a normal retry.
+    for (const id of draft.changedInputs) byId(id).value = draft.inputs[id];
+    drawerPurchaseInput = draft.purchaseInput;
+    drawerFbaTouched = draft.fbaTouched;
+    if (draft.changedInputs.includes("editPurchaseCost") || draft.changedInputs.includes("editPurchaseTotal")) {
+      byId("editPurchaseCost").dataset.purchaseBaseline = draft.purchaseBaseline;
+    }
+    if (!drawerFbaTouched && !product.manualFbaFee && product.fulfillmentMode !== "FBM") {
+      const values = getEditorValues();
+      const estimate = estimateFbaForEditor(product, values.billingWeight, values.salePrice);
+      byId("editFbaFee").value = estimate ? estimate.fee : "";
+    }
+    drawerProfitDraft = draft;
+    renderProfitPreview();
+    drawerProfitDraft = captureProfitEditorDraft();
+    setProfitEditorStatus("修改尚未保存；后台数据已更新，请点击保存修改重试。", "error");
+    syncProfitEditorSaveButton(product);
+  }
+
+  function flushDeferredProfitEditorSnapshot() {
+    if (!profitEditorSnapshotDeferred || profitEditorPendingSaves || amazonCollectionSnapshotPromise) return;
+    profitEditorSnapshotDeferred = false;
+    snapshotRefreshPending = true;
+    void flushSnapshotUpdate();
+  }
+
+  async function persistProfitEditorEdits(productId) {
+    const version = ++drawerProfitSaveVersion;
+    const savedRunId = runState.id;
+    const transitionId = drawerTransitionId;
+    if (drawerProfitDraft) drawerProfitDraft.version = version;
+    setProfitEditorStatus("正在保存修改…");
+    profitEditorPendingSaves += 1;
+    profitEditorPersistenceEpoch += 1;
+    let settled = false;
+    const settleSave = () => {
+      if (settled) return;
+      settled = true;
+      profitEditorPendingSaves -= 1;
+      profitEditorPersistenceEpoch += 1;
+    };
+    let saved;
+    try { saved = await persistCurrentRun({ notify: true, onSettled: settleSave }); }
+    finally { settleSave(); flushDeferredProfitEditorSnapshot(); }
+    if (runState.id === savedRunId && activeProductId === productId && transitionId === drawerTransitionId && version === drawerProfitSaveVersion) {
+      if (saved) { drawerProfitDraft = null; drawerProfitBaseline = profitEditorInputValues(); }
+      setProfitEditorStatus(saved ? "修改已保存，利润按当前参数重算。" : "修改尚未保存，请查看提示后点击保存修改重试。", saved ? "saved" : "error");
+      syncProfitEditorSaveButton(products.find((product) => product.id === productId));
+    }
+    return saved;
+  }
+
+  async function saveProfitEditor() {
+    clearProfitAutoCommit();
+    if (!commitProfitEdits(false, { preserveEditor: true, persist: false })) return false;
+    return persistProfitEditorEdits(activeProductId);
+  }
+
   function scheduleProfitAutoCommit() {
     if (isCollectionWriteLocked()) { clearProfitAutoCommit(); return; }
     clearProfitAutoCommit();
+    drawerProfitSaveVersion += 1;
+    drawerProfitDraft = captureProfitEditorDraft();
+    setProfitEditorStatus("修改待保存…");
     const productId = activeProductId;
     if (!productId) return;
     profitAutoCommitTimer = setTimeout(() => {
@@ -8041,7 +8201,10 @@ import {
     const isAu = market.code === "AU";
     const values = getEditorValues();
     setText("editPurchaseCostSource", purchasePriceInputNote(product, values.purchasePricing));
-    if (byId("editPurchaseTotal")) byId("editPurchaseTotal").value = valueOrBlank(values.purchaseCost);
+    if (drawerPurchaseInput === "total") {
+      if (!values.purchasePricing.invalid && values.purchaseUnitCostCny !== null) byId("editPurchaseCost").value = valueOrBlank(values.purchaseUnitCostCny);
+    } else if (byId("editPurchaseTotal")) byId("editPurchaseTotal").value = valueOrBlank(values.purchaseCost);
+    syncProfitEditorSaveButton(product);
     setCurrencyConversionOutput("editSalePriceCny", values.salePrice, product.marketplace);
     setCurrencyConversionOutput("editFbaFeeCny", values.fulfillmentFee, product.marketplace);
     const calculation = isAnalysisReadOnly(product) ? calculateProfit(product) : calculateProfit(values);
@@ -8147,16 +8310,16 @@ import {
     return "";
   }
 
-  function editorValidationMessage(product, values, allowIncomplete = false) {
-    for (const [id, label, positive] of [["editSalePrice", "售价", true], ["editPurchaseCost", "1688 单件采购价", false], ["editFbaFee", "履约费用", false], ["editWeight", "重量", true]]) {
-      const raw = String(byId(id)?.value ?? "").trim();
+  function editorValidationMessage(product, values, preliminaryReview = false) {
+    for (const [id, label, positive] of [["editSalePrice", "售价", true], ["editPurchaseCost", "1688 单件采购价", false], ["editPurchaseTotal", "整套采购成本", false], ["editFbaFee", "履约费用", false], ["editWeight", "重量", true]]) {
+      const input = byId(id);
+      const raw = String(input?.value ?? "").trim();
       const number = numberOrNull(raw);
-      if (raw && (number === null || (positive ? number <= 0 : number < 0))) return label + "必须是有效数字。";
+      if (input?.validity?.badInput || (raw && (number === null || (positive ? number <= 0 : number < 0)))) return label + "必须是有效数字。";
     }
     if (values.pieceCount === null) return "标题件数必须是 1-10000 的整数。";
-    if (!allowIncomplete && [values.salePrice, values.purchaseUnitCostCny, values.purchaseCost, values.fulfillmentFee].some(value => value === null)) return "请补齐有效的售价、1688 单件采购价和履约费用。";
-    if (values.billingWeight === null && !isAmazonWeightUnavailable(product)) return "重量尚未核验，请完成商品详情采集或填写真实重量。";
-    return allowIncomplete ? preliminaryReviewBlockingReason(product, values.billingWeight) : "";
+    // Saving a draft is independent of eligibility for initial review and complete profit.
+    return preliminaryReview ? preliminaryReviewBlockingReason(product, values.billingWeight) : "";
   }
 
   function syncDrawerApprovalButton(product, values, calculation) {
@@ -8185,7 +8348,7 @@ import {
           : product.reviewStatus === "approved" ? "保存修改并重新初审通过" : "初审通过；未齐全的利润参数可后续补充";
   }
 
-  function commitProfitEdits(showConfirmation, { preserveEditor = false, silentInvalid = false, preliminaryReview = false } = {}) {
+  function commitProfitEdits(showConfirmation, { preserveEditor = false, silentInvalid = false, preliminaryReview = false, persist = true } = {}) {
     if (collectionWriteBlocked({ notify: !silentInvalid })) return false;
     const product = products.find((item) => item.id === activeProductId);
     if (!product) return false;
@@ -8197,9 +8360,11 @@ import {
     const values = getEditorValues();
     const validationMessage = editorValidationMessage(product, values, preliminaryReview);
     if (validationMessage) {
+      setProfitEditorStatus("修改未保存：" + validationMessage, "error");
       if (!silentInvalid) showToast(validationMessage, "error");
       return false;
     }
+    drawerProfitDraft = captureProfitEditorDraft();
     const normalized = {
       salePrice: values.salePrice === null ? null : roundMoney(values.salePrice),
       purchaseUnitCostCny: values.purchaseUnitCostCny,
@@ -8237,6 +8402,7 @@ import {
       profitInputs.weightSource = "产品手工覆盖";
       profitInputs.updatedAt = new Date().toISOString();
       product.manualProfitInputs = true;
+      product.manualBillingWeight = true;
     }
     product.manualSalePrice = product.manualSalePrice || salePriceChanged;
     if (purchaseManuallyEdited) {
@@ -8303,7 +8469,7 @@ import {
     if (showConfirmation) {
       showToast(approvalInvalidated ? "成本已更新，原初审通过状态已撤回。" : "商品成本已更新，利润结果已重新计算。", approvalInvalidated ? "info" : "success");
     }
-    void persistCurrentRun();
+    if (persist) void persistProfitEditorEdits(product.id);
     return true;
   }
 
@@ -8413,8 +8579,8 @@ import {
     product.fulfillmentMode = normalizeFulfillmentMode(product.fulfillmentMode || product.fulfillment);
     product.fbaFee = finiteOrNull(product.fbaFee);
     product.fbmFee = finiteOrNull(product.fbmFee);
-    product.manualFbaFee = Boolean(product.manualFbaFee);
-    product.manualFbmFee = Boolean(product.manualFbmFee);
+    product.manualFbaFee = hasManualFulfillmentFee(product, "FBA");
+    product.manualFbmFee = hasManualFulfillmentFee(product, "FBM");
     const savedSource = String(product.fulfillmentModeSource || "").trim().toLowerCase();
     if (savedSource) {
       product.fulfillmentModeSource = savedSource;
@@ -8578,14 +8744,14 @@ import {
         ? resolved.airFreightActualWeightOnly ? "au_workbook_45_cny_per_kg" : existing.airFreightRateSource || "market_default_air_freight"
         : existing.airFreightRateSource || "legacy_custom";
     const existingWeightKg = finiteOrNull(existing.actualWeightKg);
-    const manualWeight = /(?:人工|手工)覆盖/.test(String(existing.weightSource || ""));
+    const manualWeight = resolveManualWeightOverride(product);
     resolved.actualWeightKg = manualWeight
-      ? existingWeightKg
+      ? manualWeight.weightKg
       : automaticWeight ?? existingWeightKg;
     resolved.dimensionsCm = dimensionsCm;
     resolved.dimensionSource = existing.dimensionSource || (packageDimensions ? "SellerSprite FBA 包装参数" : productDimensions ? "SellerSprite 商品参数回退" : "参数缺失");
     resolved.weightSource = manualWeight
-      ? existing.weightSource
+      ? manualWeight.source
       : automaticWeight !== null
         ? product.weightSource || "商品重量"
         : existing.weightSource || "商品重量缺失";

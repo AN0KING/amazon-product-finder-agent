@@ -88,7 +88,7 @@
               </button>
             </div>
           </div>
-          <p id="sidebarVersion" data-market-version>NL v0.9.48 · 单次任务</p>
+          <p id="sidebarVersion" data-market-version>NL v0.9.49 · 单次任务</p>
         </div>
       </aside>
 
@@ -578,13 +578,14 @@
 
           <section class="detail-tab-panel" id="profitPanel" role="tabpanel" aria-labelledby="profitTab" aria-hidden="true" data-detail-panel="profit">
             <div class="profit-editor">
-              <label class="currency-input-field"><span>我们的售价（与竞品相同）</span><span class="input-with-unit"><input id="editSalePrice" type="number" step="0.01" readonly aria-readonly="true" aria-describedby="editSalePriceCny" /><b id="salePriceCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editSalePriceCny" for="editSalePrice">人民币 --</output></label>
+              <label class="currency-input-field"><span>我们的售价（可修改）</span><span class="input-with-unit"><input id="editSalePrice" type="number" min="0.01" step="0.01" inputmode="decimal" aria-describedby="editSalePriceCny" /><b id="salePriceCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editSalePriceCny" for="editSalePrice">人民币 --</output></label>
               <label><span>1688 单件采购均价</span><span class="input-with-unit"><input id="editPurchaseCost" type="number" min="0" step="0.01" aria-describedby="editPurchaseCostSource" /><b>CNY</b></span><small class="piece-count-source" id="editPurchaseCostSource">默认使用 1688 单件采购均价；修改后使用人工单价。</small></label>
               <label><span>Amazon 标题件数</span><span class="input-with-unit"><input id="editPieceCount" type="number" min="1" max="10000" step="1" inputmode="numeric" aria-describedby="editPieceCountSource" /><b>件</b></span><small class="piece-count-source" id="editPieceCountSource"></small></label>
-              <label><span>整套采购成本</span><span class="input-with-unit is-readonly"><input id="editPurchaseTotal" type="number" step="0.01" readonly aria-readonly="true" /><b>CNY</b></span></label>
+              <label><span>整套采购成本</span><span class="input-with-unit"><input id="editPurchaseTotal" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="editPurchaseTotalSource" /><b>CNY</b></span><small class="piece-count-source" id="editPurchaseTotalSource">修改总额后按件数换算人工单价；修改单价或件数会更新总额。</small></label>
               <label class="currency-input-field"><span>FBA 配送费</span><span class="input-with-unit"><input id="editFbaFee" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="editFbaFeeCny" /><b id="fbaFeeCurrencyUnit" data-market-currency>EUR</b></span><output class="currency-conversion-output" id="editFbaFeeCny" for="editFbaFee">人民币 --</output></label>
               <label><span>计费重量</span><span class="input-with-unit"><input id="editWeight" type="number" min="0.001" step="0.001" inputmode="decimal" /><b>kg</b></span></label>
             </div>
+            <div class="profit-editor-actions"><span id="profitEditorStatus" role="status" aria-live="polite">修改后自动保存，也可点击保存修改。</span><button class="secondary-button" type="button" id="saveProfitEditsButton">保存修改</button></div>
             <div class="cost-breakdown" id="costBreakdown"></div>
             <div class="profit-result" aria-live="polite" aria-atomic="true"><span>预估经营利润率</span><strong id="drawerProfitMargin">0%</strong><div class="profit-result-value" id="drawerProfitValue">-- / 件</div></div>
           </section>

@@ -3200,6 +3200,26 @@ input[type="checkbox"]:checked {
   background: var(--surface-muted);
 }
 
+.profit-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0 16px;
+}
+
+.profit-editor-actions [role="status"] {
+  flex: 1 1 180px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.profit-editor-actions [data-state="error"] {
+  color: var(--danger);
+}
+
 .piece-count-source {
   display: block;
   min-height: 14px;
