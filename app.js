@@ -5,6 +5,7 @@ import {
   PROFIT_FORMULA_VERSION,
   calculateProductProfit,
   estimateAu2026FbaFeeByProductWeight,
+  estimateCa2026FbaFeeByProductWeight,
   estimateUs2023FbaFeeByProductWeight,
   isAmazonWeightUnavailable,
   resolveManualWeightOverride,
@@ -38,10 +39,10 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.49";
+  const APP_VERSION = "0.9.50";
   const EXPORT_DIRECTORY_LABEL = "D:\\铺货筛选";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
-  const AU_FBA_ENVELOPE_SIZE_POLICY = "auto";
+  const AU_FBA_ENVELOPE_SIZE_POLICY = "standard";
   const AMAZON_STORE_BATCH_SIZE = 20;
   const AMAZON_DETAIL_BATCH_SIZE = 20;
   const AMAZON_RETRY_FALLBACK_MS = 15_000;
@@ -109,7 +110,6 @@ import {
       defaultExchangeRate: 5.2,
       defaultAirFreightRateCnyPerKg: 45,
       defaultReturnsRate: 4,
-      fbaFeePromo: Object.freeze({ maxSalePrice: 14, discount: 0.8 }),
       deliveryRegion: "多伦多 M5V 2T6",
       enabled: true,
     }),
@@ -1077,7 +1077,7 @@ import {
 
   function profitPolicyLabel(market = activeMarket) {
     if (market.code === "AU") return "AUD 澳洲铺货公式 · 佣金 11% · 采购税 4% · 空运 ¥0.045/g · 管理费 6% · 退货预留 4% · VAT 0%";
-    if (market.code === "CA") return "CAD 单品公式 · 采购税 4% + 国内运费按商品重量估算 + 空运 ¥0.045/g · 退货预留 4% · 售价≤14 CAD 时 FBA 运费减 0.8 CAD";
+    if (market.code === "CA") return "CAD 单品公式 · 采购税 4% + 国内运费按商品重量估算 + 空运 ¥0.045/g · 退货预留 4% · 售价＜14 CAD 减 0.8 后加收 3.5% FBA 附加费";
     return `${market.currency} 单品公式 · 采购税 4% + 国内运费按商品重量估算 + 空运头程`;
   }
 
@@ -1092,15 +1092,16 @@ import {
   }
 
   function fbaPolicyShortLabel(market = activeMarket) {
-    if (market.code === "AU") return "FBA Excel · 商品重量";
+    if (market.code === "AU") return "澳洲 FBA · 标准信封";
+    if (market.code === "CA") return "加拿大 FBA · 旺季信封";
     return market.code === "US" ? "FBA SOP · 商品重量" : "美国 FBA SOP · 商品重量代理";
   }
 
   function fbaPolicyDetail(market = activeMarket) {
-    if (market.code === "AU") return "按《澳洲FBA运费.xlsx》计费重量选择最小可用档：0-75g 3.64 AUD、76-225g 4.35 AUD、226-475g 4.70 AUD、476-975g 6.33 AUD；不按售价分档，可手工覆盖";
+    if (market.code === "AU") return "标准信封≤33×23×2.5cm、≤475g；0–75g、76–225g、226–475g 售价≤13 AUD 分别为3.67、4.35、4.70，＞13 AUD 为4.58、5.26、5.61；尺寸未提供时按标准信封暂估，可手工覆盖";
     const standardPolicy = FBA_WEIGHT_STANDARD_SIZE_POLICY === "small" ? "1 lb 内按小号标准件" : "20 lb 内按大号标准件保守档";
     if (market.code === "US") return `仅按商品重量套用 FBA 物流费用计算 SOP（${standardPolicy}），不使用尺寸或 SellerSprite FBA 原值，可手工覆盖`;
-    if (market.code === "CA") return `仅按商品重量套用美国 FBA 物流费用计算 SOP（${standardPolicy}），费率数值按 ${market.currency} 名义估算；商品售价≤14 CAD 时自动减 0.8 CAD 优惠运费，可手工覆盖`;
+    if (market.code === "CA") return `固定按加拿大旺季信封表暂估，≤500g；售价＜14 CAD 减0.8，恰好14不减；（基础费－优惠）×1.035，计算保留精度、显示两位小数，可手工覆盖`;
     return `仅按商品重量套用美国 FBA 物流费用计算 SOP（${standardPolicy}），费率数值按 ${market.currency} 名义估算，可手工覆盖`;
   }
 
@@ -2014,6 +2015,7 @@ import {
         product.currentPrice = finiteOrNull(product.price30);
       }
       const previousFormulaVersion = product.profitInputs?.formulaVersion || null;
+      ensureFulfillmentState(product);
       const previousAutomaticFbaFee = product.manualFbaFee === true ? null : finiteOrNull(product.fbaFee);
       ensureProductProfitInputs(product, legacyProfitDefaults);
       if (previousFormulaVersion !== PROFIT_FORMULA_VERSION) profitFormulaMigrated = true;
@@ -2027,6 +2029,7 @@ import {
       const previousVersionHasOnlyFbaMigration = [
         "profit-workbook-au-2026-weight-fba-rates-v6",
         "profit-workbook-au-2026-smallest-envelope-fba-v7",
+        "profit-workbook-au-weight-only-fba-v9",
       ].includes(previousFormulaVersion);
       // FBA-only upgrades invalidate approval only when the automatic fee actually changes below.
       const formulaChangeAffectsProduct = !previousVersionHasOnlyFbaMigration
@@ -6785,9 +6788,9 @@ import {
       const product = products.find((item) => item.id === activeProductId);
       const weight = numberOrNull(byId("editWeight")?.value);
       const salePrice = numberOrNull(byId("editSalePrice")?.value);
-      if (product && product.fulfillmentMode !== "FBM" && !product.manualFbaFee && !drawerFbaTouched && weight !== null && weight > 0) {
+      if (product && product.fulfillmentMode !== "FBM" && !product.manualFbaFee && !drawerFbaTouched) {
         const estimate = estimateFbaForEditor(product, weight, salePrice);
-        byId("editFbaFee").value = estimate ? estimate.fee : "";
+        byId("editFbaFee").value = feeInputValue(estimate?.fee);
       }
       renderProfitPreview();
       scheduleProfitAutoCommit();
@@ -6819,7 +6822,7 @@ import {
       const fulfillmentMode = normalizeFulfillmentMode(product?.fulfillmentMode);
       if (product && fulfillmentMode !== "FBM" && !product.manualFbaFee && !drawerFbaTouched && weight !== null && weight > 0) {
         const estimate = estimateFbaForEditor(product, weight, numberOrNull(byId("editSalePrice")?.value));
-        byId("editFbaFee").value = estimate ? estimate.fee : "";
+        byId("editFbaFee").value = feeInputValue(estimate?.fee);
       }
       renderProfitPreview();
       scheduleProfitAutoCommit();
@@ -6883,10 +6886,10 @@ import {
     fulfillmentModeInputs.forEach((input, index) => {
       input.addEventListener("change", () => {
         if (!input.checked || !manualCostDraft) return;
-        manualCostDraft.fees[manualCostDraft.activeMode] = byId("manualFulfillmentFee").value.trim();
+        captureManualCostDraft();
         manualCostDraft.activeMode = normalizeFulfillmentMode(input.value);
         manualCostDraft.fulfillmentModeTouched = true;
-        byId("manualFulfillmentFee").value = manualCostDraft.fees[manualCostDraft.activeMode] || "";
+        byId("manualFulfillmentFee").value = feeInputValue(manualCostDraft.fees[manualCostDraft.activeMode]);
         syncManualDraftAutomaticFbaFee(products.find((item) => item.id === manualCostDraft.productId));
         updateManualCostModeUi();
         renderManualCostPreview();
@@ -7002,7 +7005,7 @@ import {
     setText("manualPieceCountSource", pieceCountSourceLabel(product));
     byId("manualCostFbaMode").checked = activeMode === "FBA";
     byId("manualCostFbmMode").checked = activeMode === "FBM";
-    byId("manualFulfillmentFee").value = manualCostDraft.fees[activeMode];
+    byId("manualFulfillmentFee").value = feeInputValue(manualCostDraft.fees[activeMode]);
     const amazonValues = {
       manualAmazonTitle: manualCostDraft.amazon.title,
       manualAmazonCurrentPrice: manualCostDraft.amazon.currentPrice,
@@ -7066,7 +7069,7 @@ import {
     const product = products.find((item) => item.id === manualCostDraft.productId);
     const automaticFba = mode === "FBA" && !product?.manualFbaFee && !manualCostDraft.feeTouched.FBA;
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
-    const automaticFbaLabel = market.code === "AU" ? "澳洲 Excel 重量档自动，可覆盖" : "SOP 自动，可覆盖";
+    const automaticFbaLabel = market.code === "AU" ? "澳洲标准信封自动，可覆盖" : market.code === "CA" ? "加拿大旺季信封自动，可覆盖" : "SOP 自动，可覆盖";
     setText("manualFulfillmentFeeLabel", mode === "FBA"
       ? `FBA 配送费（${automaticFba ? automaticFbaLabel : "人工"}）`
       : "FBM 履约费");
@@ -7084,12 +7087,13 @@ import {
           billingWeight: weightKg,
           salePrice: manualCostDraft.salePrice,
           manualProfitInputs: true,
+          profitInputs: manualCostDraft.profitInputs,
           weightSource: manualCostDraft.profitInputs.weightSource || "商品重量",
         });
     manualCostDraft.fbaEstimate = estimate;
     manualCostDraft.fees.FBA = estimate ? valueOrBlank(estimate.fee) : "";
     const feeInput = byId("manualFulfillmentFee");
-    if (feeInput) feeInput.value = manualCostDraft.fees.FBA;
+    if (feeInput) feeInput.value = feeInputValue(manualCostDraft.fees.FBA);
     updateManualCostModeUi();
     return estimate;
   }
@@ -7098,7 +7102,11 @@ import {
     if (!manualCostDraft) return;
     manualCostDraft.purchaseCost = byId("manualPurchaseCost")?.value.trim() || "";
     manualCostDraft.pieceCount = byId("manualPieceCount")?.value.trim() || "";
-    manualCostDraft.fees[manualCostDraft.activeMode] = byId("manualFulfillmentFee")?.value.trim() || "";
+    const displayedFee = byId("manualFulfillmentFee")?.value.trim() || "";
+    if (manualCostDraft.feeTouched[manualCostDraft.activeMode]
+      || displayedFee !== feeInputValue(manualCostDraft.fees[manualCostDraft.activeMode])) {
+      manualCostDraft.fees[manualCostDraft.activeMode] = displayedFee;
+    }
     const numberValue = (id) => numberOrNull(byId(id)?.value);
     manualCostDraft.amazon = {
       title: byId("manualAmazonTitle")?.value.trim() || "",
@@ -7546,6 +7554,7 @@ import {
       billingWeight: resolvedInputs.actualWeightKg,
       salePrice: nextSalePrice,
       manualProfitInputs: true,
+      profitInputs: resolvedInputs,
       weightSource: resolvedInputs.weightSource || "商品重量",
     });
     const manualFbaOverride = Boolean(product.manualFbaFee || manualCostDraft.feeTouched.FBA)
@@ -7862,7 +7871,7 @@ import {
       ] : []),
       ["FBA 包装重量", Number.isFinite(product.fbaWeight) ? `${formatWeightKg(product.fbaWeight)} kg · ${productWeightBandLabel(product.fbaWeight)}` : null],
       ...(!isAu ? [
-        ["FBA SOP 重量代理档位", product.fbaEstimate?.tierLabel || null],
+        ["FBA 估费档位", product.fbaEstimate?.tierLabel || null],
         ["FBA 来源置信度", product.fbaEstimate ? `${product.fbaEstimate.confidence} · 仅按${product.fbaEstimate.weightSource}` : null],
       ] : []),
       ...fulfillmentMetrics,
@@ -7909,11 +7918,11 @@ import {
     setText("editPieceCountSource", pieceCountSourceLabel(product));
     const purchaseInputLabel = byId("editPurchaseCost")?.closest("label")?.querySelector(":scope > span:first-child");
     if (purchaseInputLabel) purchaseInputLabel.textContent = isManualCostProduct(product) ? "1688 单件采购价（人工）" : "1688 单件采购均价";
-    byId("editFbaFee").value = valueOrBlank(getFulfillmentFee(product));
+    byId("editFbaFee").value = feeInputValue(getFulfillmentFee(product));
     const fbaInputLabel = byId("editFbaFee")?.closest("label")?.querySelector(":scope > span:first-child");
     if (fbaInputLabel) {
       fbaInputLabel.textContent = product.fulfillmentMode === "FBA"
-        ? `FBA 配送费（${isAu && !product.manualFbaFee ? "澳洲 Excel 重量档自动，可覆盖" : isAssumedFba(product) ? "假设估算，可覆盖" : "可覆盖"}）`
+        ? `FBA 配送费（${isAu && !product.manualFbaFee ? "澳洲标准信封自动，可覆盖" : isAssumedFba(product) ? "假设估算，可覆盖" : "可覆盖"}）`
         : product.fulfillmentMode === "FBM" ? "FBM 履约费（可覆盖）" : "FBA 配送费（输入重量后自动估算，可覆盖）";
     }
     byId("editWeight").value = valueOrBlank(product.billingWeight);
@@ -8018,6 +8027,11 @@ import {
       : "图片相似度未核验";
   }
 
+  function feeInputValue(value) {
+    const fee = finiteOrNull(value);
+    return fee === null ? "" : fee.toFixed(2);
+  }
+
   function getEditorValues() {
     const product = products.find((item) => item.id === activeProductId);
     const weightRaw = String(byId("editWeight").value).trim();
@@ -8035,12 +8049,20 @@ import {
       }
     }
     const purchaseUnitCostCny = purchasePricing.unitCostCny;
-    const fulfillmentFee = numberOrNull(byId("editFbaFee").value);
+    const feeRaw = String(byId("editFbaFee").value);
+    let fulfillmentFee = numberOrNull(feeRaw);
+    const salePrice = numberOrNull(byId("editSalePrice").value);
     const savedFulfillmentMode = normalizeFulfillmentMode(product?.fulfillmentMode);
     const fulfillmentMode = savedFulfillmentMode || ((billingWeight !== null && billingWeight > 0) || fulfillmentFee !== null ? "FBA" : null);
+    if (product && fulfillmentMode === "FBA" && !drawerFbaTouched && !product.manualFbaFee) {
+      // The displayed cents must never replace the full-precision automatic fee.
+      fulfillmentFee = estimateFbaForEditor(product, billingWeight, salePrice)?.fee ?? null;
+    } else if (product && !drawerFbaTouched && feeRaw === feeInputValue(getFulfillmentFee(product))) {
+      fulfillmentFee = getFulfillmentFee(product);
+    }
     const profitInputs = product ? ensureProductProfitInputs(product) : getDefaultProfitInputs();
     return {
-      salePrice: numberOrNull(byId("editSalePrice").value),
+      salePrice,
       purchaseUnitCostCny,
       purchasePricing,
       pieceCount,
@@ -8123,7 +8145,7 @@ import {
     if (!drawerFbaTouched && !product.manualFbaFee && product.fulfillmentMode !== "FBM") {
       const values = getEditorValues();
       const estimate = estimateFbaForEditor(product, values.billingWeight, values.salePrice);
-      byId("editFbaFee").value = estimate ? estimate.fee : "";
+      byId("editFbaFee").value = feeInputValue(estimate?.fee);
     }
     drawerProfitDraft = draft;
     renderProfitPreview();
@@ -8221,8 +8243,8 @@ import {
     if (profitResult) profitResult.hidden = false;
     const isFbm = values.fulfillmentMode === "FBM";
     const estimate = isFbm ? null : estimateFbaForEditor(product, values.billingWeight, values.salePrice);
-    const isManualFba = !isFbm && (!estimate || Math.abs(values.fulfillmentFee - estimate.fee) > 0.005);
-    const automaticFbaLabel = isAu ? "澳洲 Excel 重量费率" : "FBA SOP 商品重量估算";
+    const isManualFba = !isFbm && (product.manualFbaFee || drawerFbaTouched || !estimate || Math.abs(values.fulfillmentFee - estimate.fee) > 0.005);
+    const automaticFbaLabel = isAu ? "澳洲标准信封费率" : market.code === "CA" ? "加拿大旺季信封费率" : "FBA SOP 商品重量估算";
     const supplierCostLabel = calculation.purchaseCostAssumedZero
       ? "采购成本（待匹配，暂按 0 计算）"
       : values.purchasePricing.manual
@@ -8250,7 +8272,9 @@ import {
         ? `（${includedSupplierPrices.map(formatCny).join(" + ")}）÷ ${includedSupplierPrices.length} 家 = ${formatCny(values.purchaseUnitCostCny)}/件；${formatCny(values.purchaseUnitCostCny)} × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`
         : `${formatCny(values.purchaseUnitCostCny)}/件 × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`;
     const fulfillmentFormula = isAu && estimate && !isManualFba
-      ? `${estimate.priceBandLabel} · ${estimate.tierLabel} · ${estimate.billableWeightG}g（${estimate.weightBand}）= ${formatCurrency(calculation.fulfillment, product.marketplace)} AUD；${formatCurrency(calculation.fulfillment, product.marketplace)} AUD × 汇率 ${formatNumber(exchangeRate)} = ${formatCny(fulfillmentCny)}`
+      ? `${estimate.priceBandLabel} · ${estimate.tierLabel}${estimate.dimensionsAssumption ? "（尺寸待核验）" : ""} · ${estimate.billableWeightG}g（${estimate.weightBand}）= ${formatCurrency(calculation.fulfillment, product.marketplace)} AUD；${formatCurrency(calculation.fulfillment, product.marketplace)} AUD × 汇率 ${formatNumber(exchangeRate)} = ${formatCny(fulfillmentCny)}`
+      : market.code === "CA" && estimate && !isManualFba
+        ? `（${formatCurrency(estimate.baseFee, product.marketplace)} − ${formatCurrency(estimate.discount, product.marketplace)}）×1.035 = ${formatCurrency(calculation.fulfillment, product.marketplace)} CAD（显示值；计算保留完整精度）`
       : `${formatCurrency(calculation.fulfillment, product.marketplace)} ${MARKET_CONFIGS[product.marketplace]?.currency || activeMarket.currency} × 汇率 ${formatNumber(exchangeRate)} = ${formatCny(fulfillmentCny)}`;
     const airFreightFormula = calculation.airFreight.source === "product_weight"
       ? `${formatNumber(calculation.airFreight.actualWeightKg * 1_000)} g × ${formatCny(calculation.airFreight.airFreightRateCnyPerGram)}/g = ${formatCny(calculation.airFreight.airFreightCny)}；${formatCny(calculation.airFreight.airFreightCny)} ÷ 汇率 ${formatNumber(exchangeRate)} = ${formatCurrency(calculation.parts.freight, product.marketplace)} ${MARKET_CONFIGS[product.marketplace]?.currency || activeMarket.currency}`
@@ -8293,8 +8317,8 @@ import {
     if (estimate && !isAu) {
       byId("costBreakdown").insertAdjacentHTML("afterbegin", `
         <div class="fba-calculation-note">
-          <span><b>美国档位</b>${escapeHtml(estimate.tierLabel)}</span>
-          <span><b>计费重量</b>${Number.isFinite(estimate.billableWeightLb) ? `${estimate.billableWeightLb.toFixed(2)} lb` : "--"}</span>
+          <span><b>${market.code === "CA" ? "加拿大档位" : "美国档位"}</b>${escapeHtml(estimate.tierLabel)}</span>
+          <span><b>计费重量</b>${market.code === "CA" ? `${estimate.billableWeightG} g` : Number.isFinite(estimate.billableWeightLb) ? `${estimate.billableWeightLb.toFixed(2)} lb` : "--"}</span>
           <span><b>参数置信度</b>${escapeHtml(estimate.confidence)}</span>
           <small>仅按${escapeHtml(estimate.weightSource)} · ${escapeHtml(fbaPolicyDetail(MARKET_CONFIGS[product.marketplace] || activeMarket))}${isManualFba ? ` · 自动值 ${escapeHtml(formatCurrencyWithCnyText(estimate.fee, product.marketplace))}` : ""}</small>
         </div>`);
@@ -8370,7 +8394,7 @@ import {
       purchaseUnitCostCny: values.purchaseUnitCostCny,
       pieceCount: values.pieceCount,
       purchaseCost: totalPurchaseCostCny(values.purchaseUnitCostCny, values.pieceCount),
-      fulfillmentFee: values.fulfillmentFee === null ? null : roundMoney(values.fulfillmentFee),
+      fulfillmentFee: values.fulfillmentFee,
       billingWeight: values.billingWeight,
     };
     const changed = (before, after) => before !== after && (before == null || after == null || Math.abs(before - after) > 0.0001);
@@ -8646,7 +8670,8 @@ import {
     if (product.fulfillmentMode === "FBA") {
       if (product.manualFbaFee) return "人工输入";
       const market = MARKET_CONFIGS[product.marketplace] || activeMarket;
-      if (market.code === "AU" && product.fbaEstimate) return `澳洲 Excel 重量费率 · ${product.fbaEstimate.tierLabel}`;
+      if (market.code === "AU" && product.fbaEstimate) return `澳洲标准信封 · ${product.fbaEstimate.priceBandLabel}`;
+      if (market.code === "CA" && product.fbaEstimate) return `加拿大旺季信封 · ${product.fbaEstimate.priceBandLabel} · 含3.5%附加费`;
       if (isAssumedFba(product) && product.fbaEstimate) return "按 FBA 假设估算 · FBA SOP 商品重量";
       return product.fbaEstimate ? "FBA SOP 商品重量自动估算" : "未计算";
     }
@@ -8703,10 +8728,12 @@ import {
       "profit-workbook-au-2026-weight-fba-rates-v6",
       "profit-workbook-au-2026-smallest-envelope-fba-v7",
       "profit-workbook-au-weight-only-fba-v8",
+      "profit-workbook-au-weight-only-fba-v9",
     ].includes(existing.formulaVersion);
     const previousVersionHasOnlyFbaMigration = [
       "profit-workbook-au-2026-weight-fba-rates-v6",
       "profit-workbook-au-2026-smallest-envelope-fba-v7",
+      "profit-workbook-au-weight-only-fba-v9",
     ].includes(existing.formulaVersion);
     const marketplace = String(product.marketplace || activeMarket.code).toUpperCase();
     const rateKeys = ["exchangeRate", "commissionRate", "fxLossRate", "marketingRate", "managementRate", "returnsRate", "purchaseTaxRate", "domesticFreightRateCnyPerKg", "airFreightRateCnyPerKg", "volumetricDivisor"];
@@ -8841,7 +8868,7 @@ import {
   function automaticFbaFeeSource(product) {
     if (product.fbaEstimate?.assumption === 'missing_weight_minimum_fba_estimate') return 'missing_weight_minimum_fba_estimate';
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
-    return market.code === "AU" ? "au_workbook_weight_rate" : "fba_sop_product_weight";
+    return market.code === "AU" ? "au_standard_envelope_price_rate" : market.code === "CA" ? "ca_peak_envelope_price_rate" : "fba_sop_product_weight";
   }
 
   function applyAutomaticFba(product) {
@@ -8851,7 +8878,7 @@ import {
     if (product.fulfillmentMode !== "FBA") return;
     const market = MARKET_CONFIGS[String(product.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     if (product.manualFbaFee) {
-      if (market.code === "AU") product.fbaEstimate = estimateWeightOnlyFbaFee(product);
+      if (market.code === "AU" || market.code === "CA") product.fbaEstimate = estimateWeightOnlyFbaFee(product);
       return;
     }
     const estimate = estimateWeightOnlyFbaFee(product);
@@ -8883,47 +8910,29 @@ import {
   function estimateWeightOnlyFbaFee(product) {
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     const weightKg = fbaEstimationWeightKg(product);
-    if (weightKg === null) return isAmazonWeightUnavailable(product) ? estimateMinimumFbaFee({ marketplace: market.code }) : null;
-    if (market.code === "AU") {
-      const estimate = estimateAu2026FbaFeeByProductWeight({
-        actualWeightKg: weightKg,
-        envelopeSizePolicy: AU_FBA_ENVELOPE_SIZE_POLICY,
-      });
-      if (!estimate) return null;
-      return {
-        ...estimate,
-        confidence: "标准",
-        weightSource: product.weightSource || "商品重量",
-        rateApplicability: "《澳洲FBA运费.xlsx》Sheet1 · 按重量选择最小可用信封档",
-      };
-    }
+    const dimensionsCm = product.profitInputs?.dimensionsCm || product.dimensionsCm
+      || parseDimensionsCm(product.fbaDimensions) || parseDimensionsCm(product.productDimensions);
+    if (weightKg === null) return isAmazonWeightUnavailable(product)
+      ? estimateMinimumFbaFee({ marketplace: market.code, salePrice: product.salePrice, dimensionsCm }) : null;
     const weightSource = product.weightSource || "商品重量";
+    if (market.code === "AU" || market.code === "CA") {
+      const estimate = market.code === "AU"
+        ? estimateAu2026FbaFeeByProductWeight({ actualWeightKg: weightKg, itemPriceAud: product.salePrice,
+            envelopeSizePolicy: AU_FBA_ENVELOPE_SIZE_POLICY, dimensionsCm })
+        : estimateCa2026FbaFeeByProductWeight({ actualWeightKg: weightKg, itemPriceCad: product.salePrice });
+      return estimate ? { ...estimate, weightSource } : null;
+    }
     const estimate = estimateUs2023FbaFeeByProductWeight({
       actualWeightKg: weightKg,
       standardSizePolicy: FBA_WEIGHT_STANDARD_SIZE_POLICY,
     });
     if (!estimate) return null;
-    const baseApplicability = (market.code === "US" ? "美国站 SOP 重量代理" : "非美国站按美国 SOP 费率名义估算");
-    const promo = market.fbaFeePromo || null;
-    const salePriceValue = Number(product.salePrice);
-    const promoApplied = Boolean(
-      promo
-      && Number.isFinite(salePriceValue)
-      && salePriceValue > 0
-      && salePriceValue <= promo.maxSalePrice,
-    );
-    const fee = promoApplied
-      ? Math.max(0, Math.round((estimate.fee - promo.discount) * 100) / 100)
-      : estimate.fee;
     return {
       ...estimate,
-      fee,
       weightSource,
       confidence: estimate.confidence === "standard" ? "标准" : "低",
-      rateApplicability: promoApplied
-        ? `${baseApplicability}；售价≤${promo.maxSalePrice} ${market.currency}，FBA 运费已减 ${promo.discount} ${market.currency} 优惠`
-        : baseApplicability,
-      fbaPromoApplied: promoApplied,
+      rateApplicability: market.code === "US" ? "美国站 SOP 重量代理" : "非美国站按美国 SOP 费率名义估算",
+      fbaPromoApplied: false,
     };
   }
 
@@ -9482,7 +9491,7 @@ import {
     const hasBillingWeight = hasNumber(product.billingWeight) && product.billingWeight > 0;
     if (!hasProductWeight && !hasFbaWeight && !hasBillingWeight) add("商品重量", amazonReason, { blocking: true });
     if (!product.productDimensions) add("商品参数", amazonReason);
-    if (!product.fbaDimensions) add("FBA 包装参数", product.fbaEstimate ? (isAu ? "未获取；澳洲站已按重量选择最小可用信封档" : "未获取，已用商品重量代理") : sellerSpriteReason);
+    if (!product.fbaDimensions) add("FBA 包装参数", product.fbaEstimate ? (isAu ? "未获取；按用户指定标准信封暂估，尺寸待核验" : "未获取，已用商品重量代理") : sellerSpriteReason);
     if (!hasFbaWeight && product.fulfillmentMode === "FBA") {
       add("FBA 包装重量", product.fbaEstimate ? (isAu ? "未获取；已采用商品重量" : "未获取，已用商品重量代理") : sellerSpriteReason);
     }
@@ -9492,7 +9501,7 @@ import {
     }
     const fulfillmentMode = normalizeFulfillmentMode(product.fulfillmentMode);
     if (!fulfillmentMode) add("履约方式", "Amazon / SellerSprite 未返回且未人工选择", { blocking: true });
-    if (fulfillmentMode === "FBA" && !hasNumber(product.fbaFee)) add("FBA 配送费", isAu ? "商品重量缺失或超出《澳洲FBA运费.xlsx》范围（975g 以内）；未套用表外费率" : "无法根据有效商品重量套用 FBA SOP", { blocking: true });
+    if (fulfillmentMode === "FBA" && !hasNumber(product.fbaFee)) add("FBA 配送费", isAu ? "请补齐售价、重量，或核实是否超出标准信封范围（≤475g、≤33×23×2.5cm）" : product.marketplace === "CA" ? "请补齐售价、重量，或核实是否超出加拿大旺季信封500g上限" : "无法根据有效商品重量套用 FBA SOP", { blocking: true });
     if (fulfillmentMode === "FBM" && !hasNumber(product.fbmFee)) add("FBM 履约费", "未人工填写", { blocking: true });
 
     const profitInputs = product.profitInputs && typeof product.profitInputs === "object" ? product.profitInputs : {};

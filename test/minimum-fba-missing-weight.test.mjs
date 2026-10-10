@@ -15,9 +15,9 @@ const product = (overrides = {}) => ({
   ...overrides,
 });
 
-test('configured AU and US minimum fees do not claim a collected or chargeable product weight', () => {
-  for (const [marketplace, fee, currency] of [['AU', 3.64, 'AUD'], ['US', 3.22, 'USD']]) {
-    const estimate = estimateMinimumFbaFee({ marketplace });
+test('configured AU, CA and US minimum fees do not claim a collected or chargeable product weight', () => {
+  for (const [marketplace, fee, currency] of [['AU', 4.58, 'AUD'], ['CA', 4.73 * 1.035, 'CAD'], ['US', 3.22, 'USD']]) {
+    const estimate = estimateMinimumFbaFee({ marketplace, salePrice: 25 });
     assert.equal(estimate.fee, fee);
     assert.equal(estimate.currency, currency);
     assert.equal(estimate.actualWeightKg, null);
@@ -32,7 +32,7 @@ test('configured AU and US minimum fees do not claim a collected or chargeable p
     assert.equal(updated.profitCalculation, null);
     assert.equal(updated.margin, null);
   }
-  for (const marketplace of ['CA', 'NL', 'UK', 'DE', 'UNKNOWN']) {
+  for (const marketplace of ['NL', 'UK', 'DE', 'UNKNOWN']) {
     assert.equal(estimateMinimumFbaFee({ marketplace }), null);
     assert.equal(recomputeProductProfit(product({ marketplace })).fbaFee, null);
   }
@@ -62,7 +62,7 @@ test('a later sourced weight replaces minimum FBA and enables complete profit wi
   const weighted = recomputeProductProfit({ ...pending, productWeight: 0.3, billingWeight: 0.3,
     fieldSources: { productWeightKg: 'amazon_product_details' },
     collectionQuality: { fields: { weight: { status: 'verified', value: 0.3 } } } });
-  assert.equal(weighted.fbaFee, 4.7);
+  assert.equal(weighted.fbaFee, 5.61);
   assert.equal(weighted.profitInputs.actualWeightKg, 0.3);
   assert.equal(weighted.profitCalculation.airFreight.actualWeightKg, 0.3);
   assert.ok(Number.isFinite(weighted.margin));
@@ -94,7 +94,7 @@ test('50+ candidates can pass preliminary screening while cost, price and weight
   assert.equal(record.filter.decision, 'pass');
   assert.equal(record.preliminary_profit.status, 'pending_inputs');
   assert.equal(record.preliminary_profit.inputs.actualWeightKg, null);
-  assert.equal(record.preliminary_profit.inputs.fulfillmentFee, 3.64);
+  assert.equal(record.preliminary_profit.inputs.fulfillmentFee, 3.67);
   assert.equal(record.amazon_observations.item_weight_kg, null);
   assert.ok(record.preliminary_profit.missing_inputs.includes('actualWeightKg'));
   assert.ok(record.preliminary_profit.missing_inputs.includes('purchaseCostCny'));

@@ -47,7 +47,7 @@ function appProfitOracle(product, context = {}) {
     const analysisVersionPendingIds = new Set();
     const COMPETITOR_PRICE_RATIO = 1;
     const FBA_WEIGHT_STANDARD_SIZE_POLICY = 'large';
-    const AU_FBA_ENVELOPE_SIZE_POLICY = 'auto';
+    const AU_FBA_ENVELOPE_SIZE_POLICY = 'standard';
     const MISSING_WEIGHT_LOWEST_FREIGHT_KG = 0.075;
     const MISSING_WEIGHT_LOWEST_FREIGHT_LABEL = "重量未采集 · 按最低运费档估算";
     ${functions}
@@ -265,7 +265,7 @@ test('a confirmed weightless page keeps full profit pending and preserves manual
   const incomplete = assertParity(product);
   assert.equal(incomplete.salePrice, 9.99);
   assert.equal(incomplete.margin, null);
-  assert.equal(incomplete.fbaFee, 3.64);
+  assert.equal(incomplete.fbaFee, 3.67);
   assert.equal(incomplete.fbaEstimate.weightSource, '页面未提供重量 · FBA 配送费按最低档估算');
   assert.equal(incomplete.fbaEstimate.actualWeightKg, null);
   assert.equal(incomplete.profitCalculation, null);
@@ -351,7 +351,7 @@ test('legacy manual weight sources and explicit billing flags match frontend rec
     assert.equal(result.billingWeight, 0.2);
     assert.equal(result.profitInputs.actualWeightKg, 0.2);
     assert.equal(result.profitCalculation.domesticFreightWeightKg, 0.2);
-    assert.equal(result.fbaFee, 4.35);
+    assert.equal(result.fbaFee, 5.26);
   }
 });
 
@@ -372,4 +372,46 @@ test('general manual-profit marker keeps automatic weights refreshable in both r
   assert.equal(result.billingWeight, 0.7);
   assert.equal(result.profitInputs.actualWeightKg, 0.7);
   assert.equal(result.profitInputs.marketingRate, 7);
+});
+
+
+test('AU and CA approved envelope boundaries agree across frontend, backend and repeated recomputation', () => {
+  const cases = [
+    ['AU', 13, 0.075, 3.67], ['AU', 13.01, 0.075, 4.58],
+    ['AU', 13, 0.075001, 4.35], ['AU', 13.01, 0.225, 5.26],
+    ['AU', 13, 0.225001, 4.70], ['AU', 13.01, 0.475, 5.61],
+    ['AU', 13, 0.475001, null],
+    ['CA', 13.99, 0.1, (4.73 - 0.8) * 1.035], ['CA', 14, 0.1, 4.73 * 1.035],
+    ['CA', 13.99, 0.100001, (4.99 - 0.8) * 1.035],
+    ['CA', 14, 0.5, 5.95 * 1.035], ['CA', 14, 0.500001, null],
+  ];
+  for (const [marketplace, salePrice, weight, fee] of cases) {
+    const input = canonicalProduct({ marketplace, sourceMarketplace: marketplace, currentPrice: salePrice,
+      salePrice, manualSalePrice: true, productWeight: weight, billingWeight: weight,
+      manualFbaFee: false, fbaFee: 99, profitInputs: undefined });
+    const actual = assertParity(input);
+    assert.equal(actual.fbaFee, fee, JSON.stringify([marketplace, salePrice, weight]));
+    assert.equal(actual.fbaFee, recomputeProductProfit(actual).fbaFee);
+    if (fee !== null) assert.equal(actual.profitCalculation.fulfillmentFee, fee);
+    else assert.equal(actual.profitCalculation, null);
+  }
+});
+
+test('v9 fee migration preserves all manually saved operating inputs and frozen records', () => {
+  for (const marketplace of ['AU', 'CA']) {
+    const input = canonicalProduct({ marketplace, manualFbaFee: false, fbaFee: 3.64 });
+    input.profitInputs = { ...input.profitInputs, formulaVersion: 'profit-workbook-au-weight-only-fba-v9',
+      purchaseTaxRate: 6, domesticFreightRateCnyPerKg: 4, airFreightRateCnyPerKg: 60,
+      commissionRate: 15, managementRate: 5, returnsRate: 8,
+      purchaseTaxRateSource: 'product_manual', domesticFreightSource: 'product_manual' };
+    const actual = assertParity(input);
+    for (const key of ['purchaseTaxRate', 'domesticFreightRateCnyPerKg', 'airFreightRateCnyPerKg',
+      'commissionRate', 'managementRate', 'returnsRate', 'purchaseTaxRateSource', 'domesticFreightSource']) {
+      assert.equal(actual.profitInputs[key], input.profitInputs[key], key);
+    }
+    const manual = assertParity({ ...input, manualFbaFee: true, fbaFee: 1.23456 });
+    assert.equal(manual.fbaFee, 1.23456);
+    const frozen = { ...input, analysisHandoff: { owner: 'procurement' } };
+    assert.deepEqual(recomputeProductProfit(frozen), frozen);
+  }
 });

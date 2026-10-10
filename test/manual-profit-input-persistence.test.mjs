@@ -92,7 +92,7 @@ for (const [name, overrides] of weightCases) {
       assert.equal(item.billingWeight, 0.2);
       assert.equal(item.profitInputs.actualWeightKg, 0.2);
       assert.equal(item.profitCalculation.domesticFreightWeightKg, 0.2);
-      assert.equal(item.fbaFee, 4.35);
+      assert.equal(item.fbaFee, 5.26);
       assert.equal(resolveAnalysisProfitInputs(item).actualWeightKg, 0.2);
       assert.equal(item.productWeight, input.productWeight);
     }

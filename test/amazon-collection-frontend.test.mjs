@@ -55,7 +55,7 @@ function harness() {
   const elements = new Map();
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, { value: "", checked: false, disabled: false, hidden: false, textContent: "", innerHTML: "", title: "", dataset: {}, scrollTop: 0, scrollLeft: 0,
-      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {}, scrollIntoView() {}, focus() {}, closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }, listeners: {}, addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); } });
+      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {}, insertAdjacentHTML(position, html) { this.innerHTML = position === "afterbegin" ? html + this.innerHTML : this.innerHTML + html; }, scrollIntoView() {}, focus() {}, closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }, listeners: {}, addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); } });
     return elements.get(id);
   };
   const calls = [], timers = [], toasts = [], events = [];
@@ -822,7 +822,7 @@ test("a new collection revision automatically computes profit once weight arrive
   assert.equal(incomplete.salePrice, 9.99);
   assert.equal(incomplete.margin, null);
   assert.ok(incomplete.profitPendingReasons.includes("商品重量"));
-  assert.equal(incomplete.fbaFee, 3.64);
+  assert.equal(incomplete.fbaFee, 3.67);
   assert.equal(incomplete.fbaEstimate.weightSource, "页面未提供重量 · FBA 配送费按最低档估算");
   const nextProduct = { ...structuredClone(pricedWithoutWeight), productWeight: 0.12, billingWeight: 0.12 };
   fixture.respond(async (path) => path === "/api/amazon/collection" ? job("completed", 2) : snapshot(job("completed", 2), [nextProduct]));
@@ -1167,7 +1167,7 @@ test("confirmed absent weight uses minimum FBA and can be reviewed without fabri
   const restoredSuppliers = structuredClone(app.state().products[0].suppliers);
   app.openLocalDrawer(productId);
   assert.equal(element("editWeight").value, "");
-  assert.equal(Number(element("editFbaFee").value), 3.64);
+  assert.equal(Number(element("editFbaFee").value), 4.58);
   assert.equal(element("approveProductButton").disabled, false);
   assert.match(element("costBreakdown").innerHTML, /最低档/);
   app.approve();
@@ -1251,7 +1251,7 @@ test("manual cost dialog also permits confirmed missing weight and preserves man
   assert.equal(product.billingWeight, null);
   assert.equal(product.salePrice, 18);
   assert.equal(product.manualSalePrice, true);
-  assert.equal(product.fbaFee, 3.64);
+  assert.equal(product.fbaFee, 4.58);
 });
 
 for (const raw of ["0", "-1", "oops"]) test("manual dialog rejects invalid weight " + raw, () => {
@@ -1324,9 +1324,9 @@ test("a real manual weight replaces the minimum FBA assumption with an ordinary 
   app.approve();
   const product = app.state().products[0];
   assert.equal(product.reviewStatus, "approved");
-  assert.equal(product.fbaFee, 4.35);
-  assert.equal(product.fbaFeeSource, "au_workbook_weight_rate");
-  assert.equal(product.fbaEstimate.assumption, "weight_only_envelope_proxy");
+  assert.equal(product.fbaFee, 5.26);
+  assert.equal(product.fbaFeeSource, "au_standard_envelope_price_rate");
+  assert.equal(product.fbaEstimate.assumption, "standard_envelope_dimensions_assumed");
   assert.equal(product.profitInputs.actualWeightKg, 0.2);
   assert.ok(Number.isFinite(product.margin));
 });
@@ -2019,4 +2019,100 @@ test("a snapshot started before a profit save cannot arrive after success and ro
   assert.equal(app.state().products[0].salePrice, 23);
   assert.equal(app.state().products[0].reviews, 45);
   assert.equal(calls.filter(call => call.path === `/api/runs/${runId}`).length, 2);
+});
+
+
+function automaticEnvelopeProduct(marketplace, salePrice, weight = 0.1) {
+  return { ...canonicalProduct(), marketplace, sourceMarketplace: marketplace,
+    currentPrice: salePrice, salePrice, manualSalePrice: true,
+    productWeight: weight, billingWeight: weight, manualFbaFee: false, fbaFee: null,
+    profitInputs: undefined };
+}
+
+test('Canadian fee displays cents but retains full precision through preview, unrelated edits, save and reload', async () => {
+  const fee = (4.73 - 0.8) * 1.035;
+  const { app, element, fire, calls } = editableProfitFixture(automaticEnvelopeProduct('CA', 13.99));
+  assert.equal(element('editFbaFee').value, '4.07');
+  assert.equal(app.editor().fulfillmentFee, fee);
+  assert.equal(app.state().products[0].profitCalculation.fulfillmentFee, fee);
+  element('editPieceCount').value = '3';
+  await fire('editPieceCount', 'input');
+  assert.equal(await app.saveEditorToDisk(), true);
+  const saved = calls.at(-1).body;
+  assert.equal(saved.products[0].fbaFee, fee);
+  assert.equal(saved.products[0].manualFbaFee, false);
+  const restarted = harness();
+  restarted.app.restore(saved, { persistMigrations: false });
+  restarted.app.openLocalDrawer(productId);
+  assert.equal(restarted.element('editFbaFee').value, '4.07');
+  assert.equal(restarted.app.editor().fulfillmentFee, fee);
+  app.openManual();
+  app.manualPreview();
+  assert.equal(element('manualFulfillmentFee').value, '4.07');
+  app.saveManualDraft();
+  assert.equal(app.state().products[0].fbaFee, fee);
+  assert.equal(app.state().products[0].manualFbaFee, false);
+});
+
+for (const [marketplace, before, after, expected] of [
+  ['AU', 13, 13.01, 5.26], ['AU', 13.01, 13, 4.35],
+  ['CA', 13.99, 14, 4.73 * 1.035], ['CA', 14, 13.99, (4.73 - 0.8) * 1.035],
+]) test(marketplace + ' sale boundary updates exact automatic fee and retains an explicit manual override', async () => {
+  const fixture = editableProfitFixture(automaticEnvelopeProduct(marketplace, before));
+  const { app, element, fire } = fixture;
+  element('editSalePrice').value = String(after);
+  await fire('editSalePrice', 'input');
+  assert.equal(app.editor().fulfillmentFee, expected);
+  assert.equal(element('editFbaFee').value, expected.toFixed(2));
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(app.state().products[0].fbaFee, expected);
+  element('editFbaFee').value = '2.99';
+  await fire('editFbaFee', 'input');
+  assert.equal(await app.saveEditorToDisk(), true);
+  element('editSalePrice').value = String(before);
+  await fire('editSalePrice', 'input');
+  assert.equal(await app.saveEditorToDisk(), true);
+  assert.equal(app.state().products[0].fbaFee, 2.99);
+  assert.equal(app.state().products[0].manualFbaFee, true);
+});
+
+test('confirmed missing weight follows the current price band and still permits preliminary approval', async () => {
+  for (const [marketplace, before, after, expected] of [
+    ['AU', 13, 13.01, 4.58], ['CA', 13.99, 14, 4.73 * 1.035],
+  ]) {
+    const initial = { ...automaticEnvelopeProduct(marketplace, before, null),
+      collectionQuality: { fields: { weight: { status: 'unavailable', reason: 'page_not_provided' } } } };
+    const { app, element, fire } = editableProfitFixture(initial);
+    element('editSalePrice').value = String(after);
+    await fire('editSalePrice', 'input');
+    assert.equal(app.editor().fulfillmentFee, expected);
+    assert.equal(element('editFbaFee').value, expected.toFixed(2));
+    app.approve();
+    const result = app.state().products[0];
+    assert.equal(result.reviewStatus, 'approved');
+    assert.equal(result.fbaFee, expected);
+    assert.equal(result.billingWeight, null);
+    assert.equal(result.profitCalculation, null);
+  }
+});
+
+
+test('v9 migration retains preliminary approval unless the automatic fee really changes', () => {
+  const cases = [
+    { product: { ...canonicalProduct(), manualFbaFee: true, fbaFee: 2 }, status: 'approved', fee: 2 },
+    { product: { ...canonicalProduct(), manualFbaFee: false, fbaFee: 2, fbaFeeSource: 'manual' }, status: 'approved', fee: 2 },
+    { product: { ...automaticEnvelopeProduct('US', 13), fbaFee: 3.86 }, status: 'approved', fee: 3.86 },
+    { product: { ...automaticEnvelopeProduct('AU', 13), fbaFee: 4.35 }, status: 'approved', fee: 4.35 },
+    { product: { ...automaticEnvelopeProduct('AU', 13.01), fbaFee: 4.35 }, status: 'pending', fee: 5.26 },
+  ];
+  for (const { product, status, fee } of cases) {
+    product.reviewStatus = 'approved';
+    product.profitInputs = { ...(product.profitInputs || canonicalProduct().profitInputs),
+      formulaVersion: 'profit-workbook-au-weight-only-fba-v9' };
+    const { app } = harness();
+    app.restore(snapshot(job('completed'), [product]), { persistMigrations: false });
+    const restored = app.state().products[0];
+    assert.equal(restored.reviewStatus, status);
+    assert.equal(restored.fbaFee, fee);
+  }
 });

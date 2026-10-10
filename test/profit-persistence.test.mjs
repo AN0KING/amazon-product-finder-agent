@@ -130,21 +130,30 @@ test('Amazon weight and a changed price each commit newly computed profit with t
   const store = await createStore('amazon-arrivals');
   const runId = 'amazon-arrivals';
   await store.saveSnapshot(snapshot(runId, [product({ productWeight: null, billingWeight: null })]));
-  // CA has no configured local minimum table; unknown weight must not invent one from US fees.
+  // A successfully collected page without weight permits the CA minimum fee, but not complete profit.
   const weightless = (await diskSnapshot(store, runId)).products[0];
   assert.equal(weightless.margin, null);
-  assert.equal(weightless.fbaFee, null);
-  assert.equal(weightless.fbaEstimate, null);
+  assert.equal(weightless.profitCalculation, null);
+  assert.deepEqual(weightless.profitPendingReasons, ['商品重量']);
+  assert.equal(weightless.fbaFee, 4.73 * 1.035);
+  assert.equal(weightless.fbaFeeSource, 'missing_weight_minimum_fba_estimate');
+  assert.equal(weightless.fbaEstimate.assumption, 'missing_weight_minimum_fba_estimate');
+  assert.equal(weightless.fbaEstimate.actualWeightKg, null);
+  assert.equal(weightless.fbaEstimate.billableWeightG, null);
   assert.equal(weightless.productWeight, null);
+  assert.equal(weightless.billingWeight, null);
   assert.equal(weightless.profitInputs.actualWeightKg, null);
   await collect(store, runId);
   const weighted = (await diskSnapshot(store, runId)).products[0];
   assert.equal(weighted.productWeight, 0.3);
   assert.equal(weighted.salePrice, 9.99);
+  assert.equal(weighted.fbaFee, (5.31 - 0.8) * 1.035);
+  assert.equal(weighted.fbaFeeSource, 'ca_peak_envelope_price_rate');
   assertFormula(weighted);
   await collect(store, runId, 2, rawAmazon({ currentPrice: 30 }));
   const repriced = (await diskSnapshot(store, runId)).products[0];
   assert.equal(repriced.salePrice, 30);
+  assert.equal(repriced.fbaFee, 5.31 * 1.035);
   assert.notEqual(repriced.margin, weighted.margin);
   assertFormula(repriced);
   assert.deepEqual((await store.getRunSnapshot(runId)).products[0], repriced);
