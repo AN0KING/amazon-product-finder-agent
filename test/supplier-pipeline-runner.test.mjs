@@ -515,3 +515,162 @@ test('repeated resumes of a completed sales-filtered cohort explain exclusions w
   assert.deepEqual(mock.calls, []);
   assert.equal(mock.store.active, null);
 });
+
+test('upload replacement waits for transport shutdown, preserves checkpoints, and fences late callbacks from the new run', async t => {
+  const started = deferred(), aborted = deferred(), release = deferred();
+  let oldOnTask;
+  const mock = await setup(t, { snapshot: snapshot([
+    product('A', { salePrice: 49, manualSalePrice: true, productWeight: 0.35, manualProductWeight: true,
+      purchaseCost: 12, supplierQuotes: [{ offerId: 'saved-offer', price: 12 }] }),
+    product('manual', { manualPurchaseCost: true, purchaseCost: 0, supplierQuotes: [{ offerId: 'manual-offer' }] }),
+  ]), search: async (_item, state, { onTask, signal }) => {
+    if (state.runState.id !== RUN) return { cost: 25 };
+    oldOnTask = onTask;
+    await onTask(TASK);
+    signal.addEventListener('abort', () => aborted.resolve(signal.reason), { once: true });
+    started.resolve();
+    await release.promise; // Deliberately model a transport with delayed cancellation.
+    return { cost: 999 };
+  } });
+  const oldWork = mock.runner.tick();
+  await started.promise;
+  const before = mock.store.read();
+  const replacement = snapshot([product('A')]); replacement.runState.id = 'next-run';
+  mock.store.records.set('next-run', replacement);
+  const cancelling = mock.runner.cancelForReplacement(RUN);
+  assert.equal((await aborted.promise).code, 'USER_REPLACED');
+  assert.equal(mock.runner.work, oldWork);
+  assert.deepEqual(mock.busy, [true]);
+  const startingNew = mock.runner.start('next-run', { resume: true });
+  assert.equal(mock.calls.length, 1);
+  release.resolve();
+  const cancelled = await cancelling;
+  await oldWork;
+  await startingNew;
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(cancelled.enabled, false);
+  assert.equal(cancelled.causeCode, 'USER_REPLACED');
+  assert.equal(cancelled.activeProductId, null);
+  assert.equal(cancelled.nextRetryAt, null);
+  assert.deepEqual(cancelled.productIds, before.runState.supplier1688Pipeline.productIds);
+  assert.deepEqual(cancelled.tasks, before.runState.supplier1688Pipeline.tasks);
+  assert.deepEqual(mock.store.read().products, before.products);
+  assert.deepEqual(mock.applied, []);
+  assert.deepEqual(mock.busy, [true, false]);
+  const archived = mock.store.read();
+  const nextBefore = await mock.store.readSnapshot('next-run');
+  const writes = mock.store.writes.length;
+  await oldOnTask('task_late_callback');
+  assert.equal(mock.store.writes.length, writes);
+  assert.deepEqual(await mock.store.readSnapshot('next-run'), nextBefore);
+  assert.deepEqual(mock.store.read(), archived);
+  await mock.runner.tick();
+  assert.equal((await mock.store.readSnapshot('next-run')).products[0].purchaseCost, 25);
+  assert.deepEqual(mock.store.read(), archived);
+  assert.deepEqual(mock.calls.map(call => call.snapshot.runState.id), [RUN, 'next-run']);
+  assert.equal(mock.store.active, 'next-run');
+});
+
+test('replacement during runtime inspection prevents the pending search and releases only after inspection exits', async t => {
+  const started = deferred(), release = deferred();
+  const mock = await setup(t, { getRuntime: async () => { started.resolve(); await release.promise; return ready(); } });
+  const work = mock.runner.tick(); await started.promise;
+  const cancelling = mock.runner.cancelForReplacement(RUN);
+  await Promise.resolve();
+  assert.equal(mock.runner.work, work);
+  release.resolve(); await cancelling; await work;
+  assert.equal(mock.calls.length, 0);
+  assert.equal(mock.runner.runId, null);
+  assert.equal(mock.runner.cachedStatus, null);
+  assert.equal(mock.runner.work, null);
+  assert.equal(mock.store.active, null);
+  assert.equal(mock.store.read().runState.supplier1688Pipeline.status, 'cancelled');
+});
+
+test('archived and cancelled runs reject start, resume and append, including after a process restart', async t => {
+  for (const archived of [true, false]) {
+    const state = snapshot([product('A'), product('B')], ['A'], {
+      owner: 'server', status: archived ? 'paused' : 'cancelled', enabled: false,
+      tasks: { A: { status: 'pending', taskId: TASK, attempts: 2, failureCount: 1 } },
+    });
+    if (archived) state.runState.archivedAt = new Date(EPOCH).toISOString();
+    const store = new MemoryStore(state); store.active = RUN;
+    const mock = await setup(t, { store, start: false });
+    const before = store.read();
+    await assert.rejects(mock.runner.start(RUN), { code: 'RUN_ARCHIVED' });
+    await assert.rejects(mock.runner.start(RUN, { resume: true }), { code: 'RUN_ARCHIVED' });
+    await assert.rejects(mock.runner.append(RUN, ['B']), { code: 'RUN_ARCHIVED' });
+    await mock.runner.tick();
+    assert.deepEqual(store.read(), before);
+    assert.equal(store.writes.length, 0);
+    assert.equal(mock.calls.length, 0);
+    assert.equal(mock.runner.runId, null);
+  }
+});
+
+test('replacement of a different run never aborts or releases the current search', async t => {
+  const started = deferred(), release = deferred();
+  let activeSignal;
+  const mock = await setup(t, { search: async (_item, _state, { signal }) => {
+    activeSignal = signal; started.resolve(); await release.promise; return { cost: 18 };
+  } });
+  const other = snapshot([product('other')], ['other'], { owner: 'server', status: 'paused', enabled: false,
+    tasks: { other: { taskId: TASK, status: 'pending', attempts: 1 } } });
+  other.runState.id = 'other';
+  mock.store.records.set('other', copy(other));
+  const work = mock.runner.tick(); await started.promise;
+  const beforeCurrent = mock.store.read();
+  await mock.runner.cancelForReplacement('other');
+  assert.equal(activeSignal.aborted, false);
+  assert.equal(mock.runner.work, work);
+  assert.equal(mock.runner.runId, RUN);
+  assert.equal(mock.store.active, RUN);
+  assert.deepEqual(mock.busy, [true]);
+  assert.deepEqual(mock.store.read(), beforeCurrent);
+  const savedOther = await mock.store.readSnapshot('other');
+  assert.equal(savedOther.runState.supplier1688Pipeline.status, 'cancelled');
+  assert.deepEqual(savedOther.products, other.products);
+  assert.deepEqual(savedOther.runState.supplier1688Pipeline.tasks, other.runState.supplier1688Pipeline.tasks);
+  release.resolve(); await work;
+  assert.equal(mock.store.read().products[0].purchaseCost, 18);
+});
+
+test('replacement with no supplier pipeline is idempotent and preserves another active run', async t => {
+  const state = snapshot([product('A')]); delete state.runState.supplier1688Pipeline;
+  const mock = await setup(t, { snapshot: state, start: false });
+  mock.store.active = 'other';
+  assert.equal(await mock.runner.cancelForReplacement(RUN), null);
+  assert.equal(await mock.runner.cancelForReplacement(RUN), null);
+  assert.equal(mock.store.active, 'other');
+  assert.deepEqual(mock.store.read(), state);
+  assert.equal(mock.store.writes.length, 0);
+  mock.store.active = RUN;
+  assert.equal(await mock.runner.cancelForReplacement(RUN), null);
+  assert.equal(mock.store.active, null);
+  assert.equal(mock.store.writes.length, 0);
+  assert.equal(await mock.runner.cancelForReplacement(null), null);
+});
+
+
+test('replacement abort errors do not become retryable failures or restart checkpoints', async t => {
+  const assigned = deferred();
+  const mock = await setup(t, { search: async (_item, _state, { onTask, signal }) => {
+    await onTask(TASK);
+    assigned.resolve();
+    await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const work = mock.runner.tick(); await assigned.promise;
+  const before = mock.store.read();
+  await mock.runner.cancelForReplacement(RUN); await work;
+  const saved = mock.store.read();
+  assert.equal(saved.runState.supplier1688Pipeline.status, 'cancelled');
+  assert.equal(saved.runState.supplier1688Pipeline.causeCode, 'USER_REPLACED');
+  assert.deepEqual(saved.runState.supplier1688Pipeline.tasks, before.runState.supplier1688Pipeline.tasks);
+  assert.deepEqual(saved.runState.errors, before.runState.errors);
+  assert.deepEqual(saved.products, before.products);
+  assert.equal(mock.runner.controller, null);
+  assert.equal(mock.runner.work, null);
+  assert.equal(mock.runner.cachedStatus, null);
+  assert.deepEqual(mock.busy, [true, false]);
+  await assert.rejects(mock.runner.start(RUN, { resume: true }), { code: 'RUN_ARCHIVED' });
+});

@@ -67,10 +67,11 @@ function harness() {
       setInterval(callback, ms) { timers.push({ callback, ms, interval: true }); return timers.length; }, clearInterval() {}, confirm: () => true,
       EventSource: class { constructor(url) { this.url = url; events.push(this); } } },
     setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {}, requestAnimationFrame(callback) { callback(); }, structuredClone, AbortController, DOMException, URL,
-    async fixtureApi(path, options = {}) { calls.push({ path, options, body: options.body ? JSON.parse(options.body) : null }); return respond(path, options); },
+    async fixtureApi(path, options = {}) { calls.push({ path, options, body: typeof options.body === "string" ? JSON.parse(options.body) : options.body ?? null }); return respond(path, options); },
     fixtureToast: (...args) => toasts.push(args),
   });
   const source = appSource.replace(/^import[\s\S]*?;\r?\n/gm, "").replace(/\}\)\(\);\s*$/, `
+    const originalAvailability = updateStartAvailability;
     renderMarketUi = renderStoreAuditUi = renderStoreManager = setImportStatus = resetStoreAuditUi = setDataMode = renderResults = renderRunCoverage = updateHistorySummary = updateStartAvailability = initIcons = restorePending1688RiskStatus = setStage = setProgress = hideProgressError = showProgressError = showView = scheduleRequested1688Resume = () => {};
     const originalPopulateDrawer = populateDrawer;
     populateDrawer = (product) => { document.getElementById('drawerProductName').textContent = product.name; };
@@ -80,6 +81,8 @@ function harness() {
     getSetupCriteria = () => ({ useSellerSprite: false });
     validateSetupCriteria = () => null;
     globalThis.scout = {
+      bindUpload: bindFileImport, availability: originalAvailability, history: loadHistoryRun, workspace: loadPersistentWorkspace,
+      importState: () => ({ storeList, runHistory, storeImportPending, taskReplacementPending, amazonCollectionJob, supplierPipelineState }),
       restore: restoreRunSnapshot, poll: pollAmazonCollection, run: runAnalysis, control: controlAmazonCollection,
       load: loadAmazonCollectionStatus, apply: applyAmazonCollectionJob, locked: isCollectionWriteLocked,
       save: persistCurrentRun, saveRequired: persistCurrentRunRequired, capture: captureRunSnapshot, render: renderAmazonCollection,
@@ -2116,3 +2119,177 @@ test('v9 migration retains preliminary approval unless the automatic fee really 
     assert.equal(restored.fbaFee, fee);
   }
 });
+
+
+function uploadFixture(status = 'paused') {
+  const fixture = harness();
+  fixture.app.restore(snapshot(job(status)));
+  fixture.app.bindUpload();
+  fixture.element('storeFileInput').files = [{ name: 'new-stores.xlsx', arrayBuffer: async () => new ArrayBuffer(4) }];
+  return fixture;
+}
+const parsedUpload = () => ({ audit: { marketplace: 'AU', uniqueSellers: 1 }, stores: [{ sellerId: 'NEWSELLER01', asins: ['B000000002'] }] });
+const archivedUpload = () => ({ summary: { id: runId, status: 'cancelled', archivedAt: '2026-10-12T03:30:00.000Z' }, runs: [{ id: runId, status: 'cancelled', productCount: 1, hasSnapshot: true }] });
+
+test('pause preserves the current task and never invokes upload archiving', async () => {
+  const fixture = uploadFixture('running');
+  fixture.respond(async (path, options) => {
+    if (path === '/api/amazon/collection/control') { assert.equal(JSON.parse(options.body).action, 'pause'); return job('paused', 2); }
+    if (path === `/api/runs/${runId}`) return snapshot(job('paused', 2));
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.app.control('pause');
+  assert.equal(fixture.app.state().runState.id, runId);
+  assert.equal(fixture.app.state().runState.amazonCollectionJob.status, 'paused');
+  assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+  assert.equal(fixture.app.locked(), false);
+  assert.equal(fixture.calls.some(call => call.path.endsWith('/archive')), false);
+});
+
+test('upload archives a paused task after saving edits and before clearing its view', async () => {
+  const fixture = uploadFixture();
+  let releaseArchive;
+  const archiveStarted = new Promise(resolve => {
+    fixture.respond(async (path, options) => {
+      if (path === '/api/store-list/parse') return parsedUpload();
+      if (path === '/api/runs') {
+        assert.equal(JSON.parse(options.body).products[0].purchaseCost, 6);
+        return { runs: [] };
+      }
+      if (path === `/api/runs/${runId}/archive`) {
+        assert.deepEqual(JSON.parse(options.body), { reason: 'file_upload' });
+        resolve();
+        return new Promise(done => { releaseArchive = done; });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+  });
+  const importing = fixture.fire('storeFileInput', 'change');
+  await archiveStarted;
+  assert.equal(fixture.app.state().runState.id, runId);
+  assert.equal(fixture.app.state().products.length, 1);
+  assert.equal(fixture.app.importState().taskReplacementPending, true);
+  assert.equal(fixture.element('body').inert, true);
+  const beforeMatching = fixture.calls.length;
+  await fixture.app.startMatching();
+  await fixture.app.resumeSupplier();
+  assert.equal(fixture.calls.length, beforeMatching, 'Upload cannot start a competing supplier task');
+  releaseArchive(archivedUpload());
+  await importing;
+  assert.deepEqual(fixture.calls.map(call => call.path), ['/api/store-list/parse', '/api/runs', `/api/runs/${runId}/archive`]);
+  assert.equal(fixture.app.state().runState.id, null);
+  assert.equal(fixture.app.state().products.length, 0);
+  assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'NEWSELLER01');
+  assert.equal(fixture.app.importState().runHistory[0].status, 'cancelled');
+  assert.equal(fixture.app.importState().amazonCollectionJob, null);
+  assert.equal(fixture.app.importState().taskReplacementPending, false);
+  assert.notEqual(fixture.element('body').inert, true);
+});
+
+test('running upload accepts one replacement and rejects late snapshot/status responses', async () => {
+  const fixture = uploadFixture('running');
+  let releaseSnapshot, releaseStatus, releaseArchive;
+  const archiveStarted = new Promise(resolve => {
+    fixture.respond(async path => {
+      if (path === `/api/runs/${runId}`) return new Promise(done => { releaseSnapshot = done; });
+      if (path === '/api/amazon/collection') return new Promise(done => { releaseStatus = done; });
+      if (path === '/api/store-list/parse') return parsedUpload();
+      if (path === `/api/runs/${runId}/archive`) { resolve(); return new Promise(done => { releaseArchive = done; }); }
+      throw new Error(`Unexpected ${path}`);
+    });
+  });
+  const readingSnapshot = fixture.app.refresh();
+  const readingStatus = fixture.app.load();
+  const importing = fixture.fire('storeFileInput', 'change');
+  await archiveStarted;
+  await fixture.fire('storeFileInput', 'change');
+  releaseArchive(archivedUpload());
+  await importing;
+  releaseSnapshot(snapshot(job('running', 90)));
+  releaseStatus(job('running', 90));
+  await Promise.all([readingSnapshot, readingStatus]);
+  assert.equal(fixture.calls.filter(call => call.path.endsWith('/archive')).length, 1);
+  assert.equal(fixture.calls.some(call => call.path === '/api/runs'), false);
+  assert.equal(fixture.app.state().runState.id, null);
+  assert.equal(fixture.app.state().products.length, 0);
+  assert.equal(fixture.app.importState().amazonCollectionJob, null);
+  assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'NEWSELLER01');
+});
+
+for (const [label, parse] of [
+  ['invalid workbook', async () => { throw new Error('Invalid XLSX'); }],
+  ['empty workbook', async () => ({ audit: { marketplace: 'AU', uniqueSellers: 0 }, stores: [] })],
+  ['wrong marketplace', async () => ({ ...parsedUpload(), audit: { marketplace: 'CA', uniqueSellers: 1 } })],
+]) {
+  test(`${label} keeps the paused task, manual data and checkpoint without archiving`, async () => {
+    const fixture = uploadFixture();
+    fixture.respond(async path => { assert.equal(path, '/api/store-list/parse'); return parse(); });
+    await fixture.fire('storeFileInput', 'change');
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.app.state().runState.id, runId);
+    assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+    assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'EXAMPLESELLER');
+    assert.equal(fixture.app.importState().storeImportPending, false);
+  });
+}
+
+test('failed archive preserves the old view and does not offer the new batch as ready', async () => {
+  const fixture = uploadFixture('running');
+  fixture.respond(async path => {
+    if (path === '/api/store-list/parse') return parsedUpload();
+    if (path.endsWith('/archive')) throw new Error('Disk write failed');
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.fire('storeFileInput', 'change');
+  assert.equal(fixture.app.state().runState.id, runId);
+  assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+  assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'EXAMPLESELLER');
+  assert.ok(fixture.toasts.some(([message]) => /Disk write failed/.test(message)));
+});
+
+test('cancelling the file picker does not pause, cancel or archive the current run', async () => {
+  const fixture = uploadFixture('running');
+  fixture.element('storeFileInput').files = [];
+  await fixture.fire('storeFileInput', 'change');
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(fixture.app.state().runState.id, runId);
+});
+
+test('upload remains available during collection while archived history cannot resume', async () => {
+  const fixture = uploadFixture('running');
+  fixture.app.availability();
+  assert.equal(fixture.element('storeFileInput').disabled, false);
+  assert.equal(fixture.element('uploadZone').disabled, false);
+  const archived = snapshot(job('cancelled'));
+  archived.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  fixture.app.restore(archived, { autoResume: true });
+  fixture.app.availability();
+  assert.equal(fixture.element('startAnalysisButton').disabled, true);
+  await fixture.app.control('resume');
+  await fixture.app.run();
+  assert.equal(fixture.calls.length, 0);
+});
+
+
+for (const source of ['history', 'workspace']) {
+  test(`a late ${source} response cannot change the archived run selection or replace an uploaded file`, async () => {
+    const fixture = uploadFixture();
+    let releaseOldRead;
+    fixture.respond(async path => {
+      if (path === '/api/runs/other-history-run' || path === '/api/state') return new Promise(resolve => { releaseOldRead = resolve; });
+      if (path === '/api/store-list/parse') return parsedUpload();
+      if (path === '/api/runs') return { runs: [] };
+      if (path === `/api/runs/${runId}/archive`) return archivedUpload();
+      throw new Error(`Unexpected ${path}`);
+    });
+    const oldRead = source === 'history' ? fixture.app.history('other-history-run') : fixture.app.workspace();
+    await fixture.fire('storeFileInput', 'change');
+    const old = snapshot({ ...job('paused'), runId: 'other-history-run' });
+    releaseOldRead(source === 'history' ? old : { latestRun: old, runs: [] });
+    await oldRead;
+    assert.equal(fixture.calls.filter(call => call.path.endsWith('/archive')).length, 1);
+    assert.equal(fixture.app.state().runState.id, null);
+    assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'NEWSELLER01');
+    assert.equal(fixture.app.importState().runHistory[0].status, 'cancelled');
+  });
+}

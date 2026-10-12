@@ -77,7 +77,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.48";
+const APP_VERSION = "0.9.50";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -165,13 +165,14 @@ let active1688Requests = 0;
 let draining = false;
 let drainTimer = null;
 let supplier1688RecoveryPromise = null;
+let archivingRunId = null;
 
 const amazonCollector = new AmazonCollectionRunner({
   store: persistenceStore,
   seed: seedAmazonCollection,
   discover: discoverAmazonCollection,
   loadDetails: loadAmazonCollectionDetails,
-  canRun: () => !draining && !shuttingDown && activeAmazonRequests === 0 && active1688Requests === 0 && !supplierPipeline.isRunnable(),
+  canRun: () => !archivingRunId && !draining && !shuttingDown && activeAmazonRequests === 0 && active1688Requests === 0 && !supplierPipeline.isRunnable(),
   onBusy: (busy) => {
     activeSearchRequests = Math.max(0, activeSearchRequests + (busy ? 1 : -1));
     activeAmazonRequests = Math.max(0, activeAmazonRequests + (busy ? 1 : -1));
@@ -186,7 +187,7 @@ const supplierPipeline = new SupplierPipelineRunner({
     setActiveRunId: (runId) => persistenceStore.setActiveSupplierRunId(runId),
   },
   getRuntime: () => supplier1688Client.getRuntime({ verify: false }),
-  canRun: () => !draining && !shuttingDown && active1688Requests === 0 && activeAmazonRequests === 0,
+  canRun: () => !archivingRunId && !draining && !shuttingDown && active1688Requests === 0 && activeAmazonRequests === 0,
   onBusy: (busy) => {
     active1688Requests = Math.max(0, active1688Requests + (busy ? 1 : -1));
     activeSearchRequests = Math.max(0, activeSearchRequests + (busy ? 1 : -1));
@@ -275,6 +276,12 @@ if (IS_DIRECT_RUN) {
 
 async function routeRequest(request, response, url, signal) {
   const runtimeVerifyRequest = isRuntimeVerifyRequest(url);
+  if (archivingRunId && request.method === "POST" && [
+    "/api/amazon/collection/start", "/api/amazon/collection/control", "/api/1688/pipeline/control",
+    "/api/products/search", "/api/sellsprite/search", "/api/1688/image-search", "/api/amazon/check",
+  ].includes(url.pathname)) {
+    throw new HttpError(409, "RUN_REPLACEMENT_PENDING", "旧任务正在取消并归档，请稍后开始新任务。");
+  }
   if (STATIC_FILES.has(url.pathname)) {
     const staticVersionQuery = url.searchParams.getAll("v").length === 1
       && [...url.searchParams.keys()].every((key) => key === "v");
@@ -484,6 +491,36 @@ async function routeRequest(request, response, url, signal) {
         facts_revision: product.facts_revision, screening_revision: product.screening_revision, source_version: product.source_version })),
       workbook, workbookError, manualSelection: handoff.manual_selection, readiness: handoff.readiness,
     } });
+    return;
+  }
+  const archiveRunMatch = /^\/api\/runs\/([^/]+)\/archive$/.exec(url.pathname);
+  if (archiveRunMatch) {
+    requireMethod(request, ["POST"]);
+    requireContentType(request, ["application/json"]);
+    if (draining || shuttingDown) throw new HttpError(503, "SERVICE_DRAINING", "服务正在更新，请稍后重新上传。");
+    const body = await readJsonBody(request);
+    if (!isPlainObject(body) || body.reason !== "file_upload" || Object.keys(body).some(key => key !== "reason")) {
+      throw new HttpError(422, "INVALID_RUN_ARCHIVE", "仅上传新文件时取消并归档旧任务。");
+    }
+    const runId = decodeRunIdSegment(archiveRunMatch[1]);
+    if (archivingRunId) throw new HttpError(409, "RUN_REPLACEMENT_PENDING", "已有任务正在归档，请稍后重试。");
+    archivingRunId = runId;
+    try {
+      await Promise.all([collectorReady, supplierPipelineReady]);
+      const snapshot = await persistenceStore.getRunSnapshot(runId);
+      if (!snapshot) throw new HttpError(404, "RUN_NOT_FOUND", "未找到要归档的旧任务，尚未切换文件。");
+      if (!snapshot.runState.archivedAt) {
+        await supplierPipeline.cancelForReplacement(runId);
+        await amazonCollector.cancelForReplacement(runId);
+      }
+      const data = await persistenceStore.archiveRun(runId);
+      for (const key of asinDetailRequestsByRun.keys()) {
+        if (key.startsWith(`${runId}\u0000`)) asinDetailRequestsByRun.delete(key);
+      }
+      sendJson(response, 200, { ok: true, data });
+    } finally {
+      archivingRunId = null;
+    }
     return;
   }
   const openRunFolderMatch = /^\/api\/runs\/([^/]+)\/open-folder$/.exec(url.pathname);
@@ -3789,6 +3826,7 @@ function normalizeHttpError(error) {
   if (error instanceof XlsxExportError) return new HttpError(error.status, error.code, error.message);
   if (error instanceof ExportFileStoreError) return new HttpError(error.status, error.code, error.message);
   if (error instanceof PersistenceStoreError) return new HttpError(error.status, error.code, error.message);
+  if (error?.code === 'RUN_ARCHIVED') return new HttpError(409, error.code, error.message);
   if (String(error?.code || '').startsWith('SUPPLIER_')) return new HttpError(error.status || 409, error.code, error.message);
   if (error instanceof StoreListError) {
     const statusByCode = {

@@ -328,3 +328,119 @@ test("products without supplierSearchAudit pass through compaction unchanged", a
   const saved = await store.getRunSnapshot(runId);
   assert.equal(saved.products[0].supplierSearchAudit, null);
 });
+
+
+test("replacement archives preserve manual values, quotes, collected results and checkpoints while releasing ownership", async () => {
+  const runId = "archive-preserves-data";
+  const store = await storeWithSnapshot(runId, [product({ manualSalePrice: true, salePrice: 19,
+    manualAmazonFields: { currentPrice: true }, weightSource: "产品人工覆盖" })]);
+  await store.updateAmazonCollection(runId, () => ({ job: { owner: "server", runId, revision: 2,
+    status: "paused", enabled: false, causeCode: "USER_PAUSED", tasks: { [asin]: { status: "partial", attempts: 1 } },
+    targetedRetry: { asins: [asin], returnState: { status: "paused", causeCode: "USER_PAUSED" } },
+    supplierPause: { previousStatus: "cooldown", expiresAt: "2026-10-12T03:00:00.000Z" } },
+    items: { [asin]: result() } }), { activate: true });
+  await store.saveAmazonStoreCheckpoint(runId, { marketplace: "CA", sellerId: "A123456789", asins: [asin], status: "waiting" });
+  await store.saveAsinDetailResult(runId, { marketplace: "CA", asin, data: { saved: true } });
+  await store.updateSupplierSnapshot(runId, snapshot => {
+    snapshot.runState.supplier1688Pipeline = { owner: "server", status: "paused", enabled: false, revision: 1,
+      productIds: [snapshot.products[0].id], tasks: { [snapshot.products[0].id]: { taskId: "saved-quote-task" } } };
+    return snapshot;
+  });
+  await store.setActiveSupplierRunId(runId);
+  const before = JSON.parse(await readFile(store.runPath(runId), "utf8"));
+  const beforeSources = (await store.getRunSnapshot(runId)).amazonDiscoveredSources;
+  assert.equal((await store.getOverview()).runs[0].status, "paused");
+  const archived = await store.archiveRun(runId);
+  const saved = JSON.parse(await readFile(store.runPath(runId), "utf8"));
+  assert.equal(archived.summary.status, "cancelled");
+  assert.ok(archived.summary.archivedAt);
+  assert.equal(archived.summary.archiveReason, "USER_REPLACED");
+  assert.deepEqual(saved.snapshot.products, before.snapshot.products);
+  assert.deepEqual(saved.amazonCollection.items, before.amazonCollection.items);
+  assert.deepEqual(saved.amazonCollection.job.tasks, before.amazonCollection.job.tasks);
+  assert.deepEqual(saved.amazonCollection.job.targetedRetry, before.amazonCollection.job.targetedRetry);
+  assert.deepEqual(saved.amazonCollection.job.supplierPause, before.amazonCollection.job.supplierPause);
+  assert.equal(saved.amazonCollection.job.archiveCheckpoint.status, "paused");
+  assert.deepEqual(saved.amazonStoreCheckpoints, before.amazonStoreCheckpoints);
+  assert.deepEqual(saved.asinDetails, before.asinDetails);
+  assert.deepEqual(saved.snapshot.runState.supplier1688Pipeline.tasks, before.snapshot.runState.supplier1688Pipeline.tasks);
+  assert.equal(saved.amazonCollection.job.status, "cancelled");
+  assert.equal(saved.amazonCollection.job.enabled, false);
+  assert.equal(saved.snapshot.runState.supplier1688Pipeline.status, "cancelled");
+  assert.equal(await store.getActiveAmazonCollection(), null);
+  assert.equal(await store.getActiveSupplierRunId(), null);
+  assert.equal((await store.getOverview()).latestRun, null);
+  const bytes = await readFile(store.runPath(runId), "utf8");
+  const again = await store.archiveRun(runId);
+  assert.equal(again.summary.archivedAt, archived.summary.archivedAt);
+  assert.equal(await readFile(store.runPath(runId), "utf8"), bytes);
+  assert.deepEqual((await store.getRunSnapshot(runId)).products, before.snapshot.products);
+  assert.deepEqual((await store.getRunSnapshot(runId)).amazonDiscoveredSources, beforeSources);
+  const restarted = new PersistenceStore({ directory: store.directory });
+  await restarted.ready();
+  assert.equal(await restarted.getActiveAmazonCollection(), null);
+  assert.equal(await restarted.getActiveSupplierRunId(), null);
+  assert.equal((await restarted.getOverview()).latestRun, null);
+  assert.equal((await restarted.getOverview()).runs[0].status, "cancelled");
+  assert.equal((await restarted.getOverview()).runs[0].archivedAt, archived.summary.archivedAt);
+  assert.equal((await restarted.getOverview()).runs[0].archiveReason, "USER_REPLACED");
+});
+
+test("late writes and pointer activation cannot mutate or reopen an archived run", async () => {
+  const runId = "archive-write-barrier";
+  const store = await storeWithSnapshot(runId);
+  const stale = await store.getRunSnapshot(runId);
+  await store.archiveRun(runId);
+  const bytes = await readFile(store.runPath(runId), "utf8");
+  const index = await readFile(store.indexPath, "utf8");
+  const writes = [
+    () => store.saveSnapshot(stale),
+    () => store.updateAmazonCollection(runId, () => { throw new Error("must not call archived updater"); }, { activate: true }),
+    () => store.updateSupplierSnapshot(runId, () => { throw new Error("must not call archived updater"); }),
+    () => store.setActiveSupplierRunId(runId),
+    () => store.appendSearchBatch(runId, { phase: "discover", collectedAt: new Date().toISOString() }),
+    () => store.appendSearchBatch(runId, { phase: "details", status: "completed" }),
+    () => store.saveAsinDetailResult(runId, { marketplace: "CA", asin, data: { late: true } }),
+    () => store.saveAmazonStoreCheckpoint(runId, { marketplace: "CA", sellerId: "A123456789", asins: [asin] }),
+    () => store.saveCompetitorLookupBatch(runId, { marketplace: "CA", month: "202609", requestedAsins: [asin], items: [] }),
+    () => store.recordToolCall({ runId, tool: "late_call" }),
+  ];
+  for (const write of writes) await assert.rejects(write(), { code: "RUN_ARCHIVED", status: 409 });
+  assert.equal(await readFile(store.runPath(runId), "utf8"), bytes);
+  assert.equal(await readFile(store.indexPath, "utf8"), index);
+});
+
+test("archiving a historical run never clears another run's active pointers or latest snapshot", async () => {
+  const runId = "archive-historical-only";
+  const store = await storeWithSnapshot(runId);
+  const other = "new-active-run";
+  await store.saveSnapshot({ runState: { id: other, marketplace: "CA", mode: "live", analysisSourceMode: "amazon_only" }, products: [] });
+  await store.updateAmazonCollection(other, () => ({ job: { owner: "server", runId: other, revision: 1,
+    status: "queued", enabled: true }, items: {} }), { activate: true });
+  await store.setActiveSupplierRunId(other);
+  const bytes = await readFile(store.runPath(other), "utf8");
+  await store.archiveRun(runId);
+  assert.equal((await store.getActiveAmazonCollection()).runId, other);
+  assert.equal(await store.getActiveSupplierRunId(), other);
+  assert.equal((await store.getOverview()).latestRunId, other);
+  assert.equal(await readFile(store.runPath(other), "utf8"), bytes);
+});
+
+test("a durable archive tombstone blocks restart recovery even if index cleanup was interrupted", async () => {
+  const runId = "archive-interrupted-index";
+  const store = await storeWithSnapshot(runId);
+  await store.updateAmazonCollection(runId, () => ({ job: { owner: "server", runId, revision: 1,
+    status: "queued", enabled: true }, items: {} }), { activate: true });
+  await store.setActiveSupplierRunId(runId);
+  const persistIndex = store.persistIndex;
+  store.persistIndex = async () => { throw new Error("Synthetic index write failure"); };
+  await assert.rejects(store.archiveRun(runId), /Synthetic index write failure/);
+  store.persistIndex = persistIndex;
+  const restarted = new PersistenceStore({ directory: store.directory });
+  await restarted.ready();
+  assert.equal(await restarted.getActiveAmazonCollection(), null);
+  assert.equal(await restarted.getActiveSupplierRunId(), null);
+  assert.equal((await restarted.getOverview()).latestRun, null);
+  await restarted.archiveRun(runId);
+  assert.equal((await restarted.getOverview()).runs[0].status, "cancelled");
+});

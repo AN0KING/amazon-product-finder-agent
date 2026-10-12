@@ -469,6 +469,9 @@ import {
   let storeList = null;
   let storeLoadGeneration = 0;
   let storeParseController = null;
+  let storeImportPending = false;
+  let taskReplacementPending = false;
+  let taskContextGeneration = 0;
   let sellerSpriteStatus = "idle";
   let sellerSpriteCallCount = null;
   let sellerSpriteSessionCallCount = null;
@@ -568,7 +571,7 @@ import {
     await loadAmazonCollectionStatus().catch(() => {});
     const [, persistedState] = await Promise.allSettled([loadRuntimeStatus(), loadPersistentWorkspace(), load1688SessionStatus()]);
     restorePending1688RiskStatus();
-    if (persistedState.status !== "fulfilled" || !persistedState.value) await loadDefaultStoreList();
+    if ((persistedState.status !== "fulfilled" || !persistedState.value) && storeLoadGeneration === 0 && !storeImportPending) await loadDefaultStoreList();
     startHeartbeat();
     startSnapshotEvents();
     await loadSupplierPipelineStatus().catch(() => {});
@@ -581,7 +584,7 @@ import {
     snapshotEvents.onmessage = (event) => {
       try {
         const update = JSON.parse(event.data);
-        if (update.runId !== runState.id) return;
+        if (taskReplacementPending || update.runId !== runState.id) return;
         if (supplier1688ResumePromise && runState.supplier1688Pipeline?.owner !== 'server') return;
         snapshotRefreshPending = true;
         void flushSnapshotUpdate();
@@ -590,7 +593,7 @@ import {
   }
 
   async function flushSnapshotUpdate() {
-    if (amazonCollectionSnapshotPromise || !snapshotRefreshPending) return;
+    if (taskReplacementPending || amazonCollectionSnapshotPromise || !snapshotRefreshPending) return;
     snapshotRefreshPending = false;
     try { await refreshAmazonCollectionSnapshot(); }
     catch { /* Retain current data; the next status poll retries. */ }
@@ -598,7 +601,10 @@ import {
   }
 
   async function loadSupplierPipelineStatus() {
-    supplierPipelineState = await apiRequest('/api/1688/pipeline', { timeout: 15000 });
+    const generation = taskContextGeneration;
+    const state = await apiRequest('/api/1688/pipeline', { timeout: 15000 });
+    if (taskReplacementPending || generation !== taskContextGeneration) return supplierPipelineState;
+    supplierPipelineState = state;
     if (supplierPipelineState?.runId === runState.id
       && supplierPipelineState.revision !== runState.supplier1688Pipeline?.revision) await refreshAmazonCollectionSnapshot();
     renderSupplier1688Stage();
@@ -613,6 +619,7 @@ import {
   }
 
   async function startServerSupplierPipeline() {
+    if (storeImportPending || taskReplacementPending || runState.archivedAt) return false;
     const runId = runState.id;
     if (!getPending1688ResumeProducts().length) {
       renderSupplier1688Stage();
@@ -671,6 +678,7 @@ import {
   }
 
   function isCollectionWriteLocked() {
+    if (taskReplacementPending || runState.archivedAt) return true;
     if (runState.supplier1688Pipeline?.owner === 'server'
       && ['queued', 'running', 'cooldown'].includes(runState.supplier1688Pipeline.status)) return true;
     const job = currentAmazonCollectionJob();
@@ -680,7 +688,7 @@ import {
 
   function hasOtherActiveCollection() {
     return Boolean(amazonCollectionJob?.owner === "server" && amazonCollectionJob.runId !== runState.id
-      && amazonCollectionJob.status !== "completed");
+      && !["completed", "cancelled"].includes(amazonCollectionJob.status));
   }
 
   function collectionWriteBlocked({ notify = true } = {}) {
@@ -698,8 +706,10 @@ import {
   }
 
   async function loadAmazonCollectionStatus() {
+    const generation = taskContextGeneration;
     try {
       const job = await apiRequest("/api/amazon/collection", { timeout: 15000 });
+      if (taskReplacementPending || generation !== taskContextGeneration) return amazonCollectionJob;
       amazonCollectionRefreshError = null;
       applyAmazonCollectionJob(job);
       return amazonCollectionJob;
@@ -719,7 +729,7 @@ import {
   }
 
   async function pollAmazonCollection() {
-    if (supplierCollectionTransition) { scheduleAmazonCollectionPoll(); return; }
+    if (taskReplacementPending || supplierCollectionTransition) { scheduleAmazonCollectionPoll(); return; }
     if (amazonCollectionPollPromise) return amazonCollectionPollPromise;
     amazonCollectionPollPromise = (async () => {
       try {
@@ -739,13 +749,15 @@ import {
   }
 
   async function refreshAmazonCollectionSnapshot() {
+    if (taskReplacementPending) return;
+    const generation = taskContextGeneration;
     if (amazonCollectionSnapshotPromise) return amazonCollectionSnapshotPromise;
     const requestedRunId = runState.id;
     const requestedProfitEpoch = profitEditorPersistenceEpoch;
     if (!requestedRunId) return;
     amazonCollectionSnapshotPromise = (async () => {
       const snapshot = await apiRequest(`/api/runs/${encodeURIComponent(requestedRunId)}`, { timeout: 30000 });
-      if (runState.id !== requestedRunId) return;
+      if (taskReplacementPending || generation !== taskContextGeneration || runState.id !== requestedRunId) return;
       // A read racing a profit save may still contain the old inputs. The next poll catches up.
       if (profitEditorPendingSaves || requestedProfitEpoch !== profitEditorPersistenceEpoch) {
         profitEditorSnapshotDeferred = true;
@@ -792,7 +804,7 @@ import {
   }
 
   async function performAmazonCollectionControl(action) {
-    if (amazonCollectionControlPending || !currentAmazonCollectionJob() || hasActive1688Work()) return;
+    if (storeImportPending || taskReplacementPending || runState.archivedAt || amazonCollectionControlPending || !currentAmazonCollectionJob() || hasActive1688Work()) return;
     const controlledRunId = runState.id;
     if (["resume", "retry_missing"].includes(action) && !isCollectionWriteLocked()) {
       if (exportRunning || analysisVersionPendingIds.size) {
@@ -832,7 +844,7 @@ import {
   }
 
   function renderAmazonCollection() {
-    const editingLocked = isCollectionWriteLocked();
+    const editingLocked = storeImportPending || isCollectionWriteLocked();
     const activeProduct = products.find((product) => product.id === activeProductId);
     PROFIT_EDITOR_INPUT_IDS.forEach((id) => {
       const input = byId(id);
@@ -852,7 +864,7 @@ import {
     panel.hidden = !job;
     if (!job) return;
     const sameRun = job.runId === runState.id;
-    const labels = { queued: "等待采集", running: "后台采集中", cooldown: "稍后自动重试", paused: "已手动暂停", completed: "采集已完成", needs_attention: "需要处理后继续" };
+    const labels = { queued: "等待采集", running: "后台采集中", cooldown: "稍后自动重试", paused: "已手动暂停", completed: "采集已完成", cancelled: "已取消并归档", needs_attention: "需要处理后继续" };
     const counts = job.counts || {};
     panel.dataset.status = job.status || "queued";
     setText("collectionStatus", job.causeCode === 'SUPPLIER_MATCHING' ? '供应商匹配中，采集暂存' : labels[job.status] || "后台任务");
@@ -865,7 +877,7 @@ import {
       ? "采集中可查看、筛选并发起图片匹配；暂停或完成后可编辑。"
       : sameRun && job.causeCode === 'SUPPLIER_MATCHING'
         ? "正在匹配供应商，Amazon 断点已保存；匹配结束后自动继续采集。"
-        : sameRun && job.status === 'paused' ? "已暂停，可编辑和匹配供应商；点击继续采集可恢复。" : "");
+        : sameRun && job.status === 'paused' ? "已暂停，断点已保留；点击继续采集可恢复，上传新文件才会取消并归档本任务。" : "");
     setText("collectionCause", job.causeCode ? `原因：${job.causeCode}` : "");
     const formatTime = (value) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
     setText("collectionLastProgress", formatTime(job.lastProgressAt || job.updatedAt));
@@ -875,7 +887,7 @@ import {
       const field = job.quality?.[key] || {};
       return `<div><strong>${label}</strong><span>已核验 ${Number(field.verified || 0)}</span><small>缺失 ${Number(field.missing || 0)} · 页面未提供 ${Number(field.unavailable || 0)} · 无效 ${Number(field.invalid || 0)}</small></div>`;
     }).join("");
-    const busy = amazonCollectionControlPending || !sameRun || hasActive1688Work();
+    const busy = storeImportPending || taskReplacementPending || Boolean(runState.archivedAt) || amazonCollectionControlPending || !sameRun || hasActive1688Work();
     const pause = byId("collectionPauseButton"), resume = byId("collectionResumeButton"), retry = byId("collectionRetryMissingButton");
     if (retry) retry.title = '重新访问存在缺失字段的商品页面；查看本地详情不会触发重访。';
     if (pause) pause.disabled = busy || !["queued", "running", "cooldown"].includes(job.status);
@@ -964,10 +976,14 @@ import {
     };
   }
 
-  function confirmActiveTaskReplacement(message) {
-    if (isCollectionWriteLocked() || hasOtherActiveCollection()) { showToast("后台任务仍在管理采集数据，请等待采集完成后更换店铺任务。", "info", 5000); return false; }
+  function confirmActiveTaskReplacement(message, { uploading = false } = {}) {
+    if (storeImportPending || taskReplacementPending) return false;
+    if (!uploading && (isCollectionWriteLocked() || hasOtherActiveCollection())) { showToast("后台任务仍在管理采集数据，请等待采集完成后更换店铺任务。", "info", 5000); return false; }
     if (analysisVersionPendingIds.size) { showToast("新的分析版本正在保存，请完成后再切换任务。", "info", 4200); return false; }
     if (exportRunning) { showToast("导出正在保存，请完成后再切换任务。", "info", 4200); return false; }
+    if (uploading && (runState.id || amazonCollectionJob?.runId || supplierPipelineState?.runId)) {
+      return window.confirm(`${message}\n\n旧任务将取消并归档到任务记录，已保存结果和人工数据保留。是否继续？`);
+    }
     if (!analysisRunning && !hasActive1688Work()) return true;
     return window.confirm(`${message}\n\n当前请求会被取消，已经保存的历史任务不会受影响。是否继续？`);
   }
@@ -1137,6 +1153,53 @@ import {
     updateHistorySummary();
   }
 
+  async function archiveCurrentRunForUpload() {
+    if (amazonCollectionControlPromise) await amazonCollectionControlPromise;
+    if (!isCollectionWriteLocked() && runState.id && runState.mode !== "idle") {
+      if (manualCostDraft && isManualCostDirty()) {
+        saveManualCost();
+        if (manualCostDraft && isManualCostDirty()) throw new Error("请先完成当前人工成本填写，再上传新文件。");
+      }
+      if (profitAutoCommitTimer !== null || drawerProfitDraft) {
+        if (!await saveProfitEditor()) throw new Error("人工修改尚未保存，旧任务尚未归档。");
+      }
+      if (!await persistCurrentRun({ notify: true })) throw new Error("旧任务保存未成功，尚未切换新文件。");
+    }
+    await persistenceSaveQueue;
+    const runIds = [...new Set([
+      runState.mode !== "idle" ? runState.id : null,
+      amazonCollectionJob?.status !== "cancelled" ? amazonCollectionJob?.runId : null,
+      supplierPipelineState && !["complete", "cancelled"].includes(supplierPipelineState.status) ? supplierPipelineState.runId : null,
+    ].filter(Boolean))];
+    taskReplacementPending = true;
+    taskContextGeneration += 1;
+    snapshotRefreshPending = false;
+    profitEditorSnapshotDeferred = false;
+    clearProfitAutoCommit();
+    cancelActiveTaskForReplacement();
+    if (supplier1688ResumePromise) await supplier1688ResumePromise.catch(() => {});
+    for (const runId of runIds) {
+      const archived = await apiRequest(`/api/runs/${encodeURIComponent(runId)}/archive`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "file_upload" }), timeout: 120000,
+      });
+      runHistory = Array.isArray(archived?.runs) ? archived.runs : runHistory;
+    }
+    amazonCollectionJob = null;
+    amazonCollectionRevision = null;
+    amazonCollectionRefreshError = null;
+    amazonCollectionStatusKnown = false;
+    supplierPipelineState = null;
+    supplier1688ResumeRequested = false;
+    amazonResumeRequested = false;
+    drawerProfitDraft = null;
+    drawerProfitBaseline = null;
+    resultPage = 1;
+    if (byId("resultSearch")) byId("resultSearch").value = "";
+    if (byId("resultMinMargin")) byId("resultMinMargin").value = "";
+    if (byId("resultsCompleteToggle")) byId("resultsCompleteToggle").checked = false;
+  }
+
   function bindFileImport() {
     const input = byId("storeFileInput");
     const zone = byId("uploadZone");
@@ -1145,52 +1208,64 @@ import {
     });
     input?.addEventListener("change", async () => {
       const file = input.files?.[0];
-      if (!file) return;
+      if (!file || storeImportPending || taskReplacementPending) return;
       if (!file.name.toLowerCase().endsWith(".xlsx")) {
         input.value = "";
         showToast("首版实时解析仅支持 XLSX 文件。", "error", 4200);
         return;
       }
-      if (!confirmActiveTaskReplacement(`导入“${file.name}”会替换当前店铺清单和页面结果。`)) {
+      if (!confirmActiveTaskReplacement(`导入“${file.name}”会替换当前店铺清单和页面结果。`, { uploading: true })) {
         input.value = "";
         return;
       }
-      cancelActiveTaskForReplacement();
+      storeImportPending = true;
+      const priorInert = document.body.inert;
+      // Freeze user edits while the final saved snapshot and archive are in flight.
+      // Internal draft commits below still read the existing form values.
+      document.body.inert = true;
       const generation = ++storeLoadGeneration;
       storeParseController?.abort();
-      storeParseController = new AbortController();
-      storeList = null;
-      resetTaskResultsForStoreChange();
-      selectedStoreFile = file;
-      resetStoreAuditUi();
+      const controller = new AbortController();
+      storeParseController = controller;
       updateStartAvailability();
-      setImportStatus("loading", "正在解析");
-      byId("uploadedFilename").textContent = file.name;
+      renderAmazonCollection();
+      setImportStatus("loading", "正在解析新文件");
       try {
+        // Validate the replacement before touching the saved task. A cancelled
+        // picker or an unreadable/empty workbook must leave its checkpoint intact.
         const buffer = await file.arrayBuffer();
         const data = await apiRequest("/api/store-list/parse", {
-          method: "POST",
-          body: buffer,
+          method: "POST", body: buffer,
           headers: {
             "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "X-File-Name": encodeURIComponent(file.name),
-            "X-Marketplace": activeMarket.code,
-          },
-          signal: storeParseController.signal,
+            "X-File-Name": encodeURIComponent(file.name), "X-Marketplace": activeMarket.code,
+          }, signal: controller.signal,
         });
-        if (generation !== storeLoadGeneration) return;
-        applyStoreList(data, file.name);
+        if (generation !== storeLoadGeneration || controller.signal.aborted) return;
         const parsedCount = data.audit?.uniqueSellers ?? data.stores?.length ?? 0;
-        const issueReason = parsedCount ? "" : firstStoreIssueReason(data);
-        showToast(issueReason ? `未导入店铺：${issueReason}` : `已解析 ${parsedCount} 个唯一店铺。`, issueReason ? "error" : "success", issueReason ? 6200 : 3000);
-      } catch (error) {
-        if (generation !== storeLoadGeneration || storeParseController.signal.aborted) return;
+        if (!parsedCount) throw new Error(firstStoreIssueReason(data) || "新文件没有可导入的店铺，旧任务已保留。");
+        if (data.audit?.marketplace !== activeMarket.code) throw new Error("新文件站点与当前站点不一致，旧任务已保留。");
+        setImportStatus("loading", "正在归档旧任务");
+        await archiveCurrentRunForUpload();
+        if (generation !== storeLoadGeneration) return;
         storeList = null;
-        setImportStatus("error", "解析失败");
-        updateStartAvailability();
-        showToast(error.message || "文件解析失败。", "error", 5200);
+        resetTaskResultsForStoreChange();
+        selectedStoreFile = file;
+        resetStoreAuditUi();
+        applyStoreList(data, file.name);
+        showToast(`已解析 ${parsedCount} 个唯一店铺，可开始新任务；旧任务可在任务记录中查看。`, "success", 5000);
+      } catch (error) {
+        if (generation !== storeLoadGeneration || controller.signal.aborted) return;
+        setImportStatus("error", "新文件尚未载入");
+        showToast(error.message || "上传未完成，旧任务记录已保留。", "error", 6200);
       } finally {
+        storeImportPending = false;
+        taskReplacementPending = false;
+        document.body.inert = priorInert;
         if (generation === storeLoadGeneration) input.value = "";
+        updateStartAvailability();
+        renderAmazonCollection();
+        scheduleAmazonCollectionPoll(0);
       }
     });
 
@@ -1919,8 +1994,10 @@ import {
   }
 
   async function loadPersistentWorkspace() {
+    const generation = taskContextGeneration;
     try {
       const data = await apiRequest("/api/state", { timeout: 15000 });
+      if (storeImportPending || taskReplacementPending || generation !== taskContextGeneration) return true;
       runHistory = Array.isArray(data?.runs) ? data.runs : [];
       amazonConnectionChecks = data?.amazonConnectionChecks && typeof data.amazonConnectionChecks === "object"
         ? data.amazonConnectionChecks
@@ -2059,8 +2136,8 @@ import {
       rebuildProductMissing(product);
       updateProductComputed(product);
     });
-    const supplierPipelineMigrated = restoreSupplier1688Pipeline();
-    const recoveredAmazonErrorsReconciled = reconcileRecoveredAmazonProductErrors();
+    const supplierPipelineMigrated = runState.archivedAt ? false : restoreSupplier1688Pipeline();
+    const recoveredAmazonErrorsReconciled = runState.archivedAt ? false : reconcileRecoveredAmazonProductErrors();
     restorePending1688RiskStatus();
     setDataMode(
       runState.mode === "mock" ? "mock" : isProxyAnalysis(runState) || runState.mode === "mixed" ? "mixed" : runState.mode === "error" ? "error" : "live",
@@ -2075,7 +2152,7 @@ import {
     if (persistMigrations && !currentAmazonCollectionJob() && (products.length > savedProductCount || profitFormulaMigrated || amazonPriceMigrated || supplierPipelineMigrated || recoveredAmazonErrorsReconciled)) {
       setTimeout(() => void persistCurrentRun({ notify: true }), 0);
     }
-    if (autoResume) scheduleAmazonRunResume();
+    if (autoResume && !runState.archivedAt) scheduleAmazonRunResume();
   }
 
   function restoreSupplier1688Pipeline() {
@@ -2412,13 +2489,15 @@ import {
 
   async function loadHistoryRun(runId, button) {
     if (!runId) return;
-    if (analysisRunning || hasActive1688Work() || exportRunning || analysisVersionPendingIds.size) {
+    if (storeImportPending || taskReplacementPending || analysisRunning || hasActive1688Work() || exportRunning || analysisVersionPendingIds.size) {
       showToast("当前采集、匹配或保存尚未结束，完成后可载入历史任务。", "info", 4800);
       return;
     }
+    const generation = taskContextGeneration;
     if (button) button.disabled = true;
     try {
       const snapshot = await apiRequest(`/api/runs/${encodeURIComponent(runId)}`, { timeout: 30000 });
+      if (storeImportPending || taskReplacementPending || generation !== taskContextGeneration) return;
       restoreRunSnapshot(snapshot);
       showView("results");
       showToast(`已恢复 ${products.length} 个历史候选商品。`, "success");
@@ -2814,9 +2893,10 @@ import {
     const check1688Button = byId("check1688Button");
     const useSellerSprite = byId("useSellerSpriteToggle")?.checked === true;
     const collectionLocked = isCollectionWriteLocked() || hasOtherActiveCollection();
-    if (fileInput) fileInput.disabled = collectionLocked;
-    if (uploadZone) uploadZone.disabled = collectionLocked;
-    if (marketplaceSelect) marketplaceSelect.disabled = collectionLocked;
+    const uploading = storeImportPending || taskReplacementPending || amazonCollectionControlPending || supplierCollectionTransition;
+    if (fileInput) fileInput.disabled = uploading || exportRunning || analysisVersionPendingIds.size > 0;
+    if (uploadZone) uploadZone.disabled = fileInput?.disabled ?? uploading;
+    if (marketplaceSelect) marketplaceSelect.disabled = uploading || collectionLocked;
     if (amazonRefreshButton) {
       const hasAmazonStore = (storeList?.stores || []).some((item) => /^[A-Z0-9]{8,20}$/.test(String(item?.sellerId || "").toUpperCase()));
       amazonRefreshButton.disabled = collectionLocked || analysisRunning || Boolean(amazonCheckPromise) || !hasAmazonStore;
@@ -2855,6 +2935,12 @@ import {
           : `<i data-lucide="${sellerSpriteStatus === "error" ? "refresh-cw" : "plug"}" aria-hidden="true"></i>${sellerSpriteStatus === "error" ? "重新授权 SellerSprite" : "授权 SellerSprite"}`;
     }
     if (!button) return;
+    if (uploading || runState.archivedAt) {
+      button.disabled = true;
+      button.innerHTML = uploading ? "正在载入新文件…" : "已归档，请上传新文件";
+      setText("analysisRequirementText", uploading ? "新文件确认可用后，旧任务将取消并归档。" : "当前为归档记录，可查看结果；上传新文件后开始新任务。");
+      return;
+    }
     if (collectionLocked) {
       const job = currentAmazonCollectionJob();
       const resumable = job && ["paused", "needs_attention", "cooldown"].includes(job.status);
@@ -3037,6 +3123,7 @@ import {
   }
 
   async function runAnalysis() {
+    if (storeImportPending || taskReplacementPending || runState.archivedAt) return;
     if (!amazonCollectionStatusKnown) {
       try { await loadAmazonCollectionStatus(); }
       catch { showToast("暂未确认后台任务状态，请稍后重试。已有采集任务会继续运行。", "info", 5000); return; }
@@ -3145,6 +3232,7 @@ import {
         const job = await apiRequest("/api/amazon/collection/start", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: runState.id }), timeout: 30000,
         });
+        assertCurrentTaskRequest(controller);
         if (job?.owner !== "server" || job.runId !== runState.id) throw createRunError("COLLECTION_START_FAILED", "后台服务未确认任务归属，请刷新查看任务状态。");
         analysisRunning = false;
         applyAmazonCollectionJob(job);
@@ -4679,6 +4767,7 @@ import {
   }
 
   async function startFiltered1688Matching() {
+    if (storeImportPending || taskReplacementPending || runState.archivedAt) return false;
     if (supplier1688Queue?.ratePolicy?.pausedReason || supplier1688RiskTask?.id) {
       showToast(supplier1688Queue?.ratePolicy?.pausedReason === "RATE_LIMITED"
         ? "搜图正在限流冷却，等待结束后会继续，当前进度已保留。"
@@ -4846,6 +4935,7 @@ import {
   }
 
   async function resumePending1688Candidates(batchRunner = null) {
+    if (storeImportPending || taskReplacementPending || runState.archivedAt) return false;
     if (!batchRunner) return startServerSupplierPipeline();
     if (supplier1688ResumePromise) return supplier1688ResumePromise;
     if (supplier1688Queue?.ratePolicy?.pausedReason || supplier1688RiskTask?.id) return false;
@@ -9078,7 +9168,8 @@ import {
       const validTime = time && !Number.isNaN(time.getTime());
       const dateLabel = validTime ? time.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" }) : "--";
       const timeLabel = validTime ? time.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "--:--";
-      const statusLabel = summary.status === "failed"
+      const statusLabel = summary.archivedAt || summary.status === "cancelled"
+        ? "已取消并归档" : summary.status === "paused" ? "已暂停" : summary.status === "running" ? "采集中" : summary.status === "failed"
         ? "未完成"
         : summary.status === "collecting" ? "已采集" : summary.mode === "mock" ? "模拟数据" : summary.mode === "mixed" ? "混合估算" : "已完成";
       const statusState = summary.status === "failed" ? "error" : summary.mode || "live";
@@ -9147,7 +9238,7 @@ import {
   }
 
   function isAnalysisReadOnly(product) {
-    return product?.analysisHandoff?.owner === "procurement" || analysisHandoffPendingIds.has(product?.id) || analysisVersionPendingIds.has(product?.id);
+    return Boolean(runState.archivedAt) || product?.analysisHandoff?.owner === "procurement" || analysisHandoffPendingIds.has(product?.id) || analysisVersionPendingIds.has(product?.id);
   }
 
   function analysisVersionBlockedReason(product) {

@@ -64,7 +64,7 @@ async function waitUntil(check, describe, timeoutMs = 8_000) {
   throw new Error(`Timed out waiting for ${describe}.`);
 }
 
-test("real local collection API persists ownership, revisions, quality and manual pause across restart", { timeout: 30_000 }, async (t) => {
+test("real local collection API preserves resumable pause and archives replaced runs without reviving them", { timeout: 45_000 }, async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "scout-collection-api-"));
   const dataDirectory = path.join(temporaryRoot, "data");
   const guardPath = path.join(temporaryRoot, "deny-outbound.mjs");
@@ -159,6 +159,19 @@ syncBuiltinESMExports();
     salesByAsin: { [asin]: { sales30: 100, rawText: "100+ bought in past month" } },
     complete: true, status: "complete", pagesVisited: 1, reportedTotalAsins: 1, notEnumeratedAsins: 0 });
   const staleSnapshot = await store.getRunSnapshot(runId);
+  const replacementRunId = "synthetic-api-new-upload";
+  await store.saveSnapshot({
+    runState: { id: replacementRunId, marketplace: "CA", currency: "CAD", amazonDomain: "www.amazon.ca", analysisSourceMode: "amazon_only", mode: "live", criteria: { useSellerSprite: false } },
+    products: [],
+    storeList: { stores: [{ sellerId: "TESTSELLER02", asins: [asin], rowNumbers: [2] }], audit: { marketplace: "CA" } },
+  });
+  await store.appendSearchBatch(replacementRunId, {
+    phase: "analyze", marketplace: "CA", status: "completed", productCount: 1,
+    response: { items: [raw] },
+  });
+  await store.saveAmazonStoreCheckpoint(replacementRunId, { marketplace: "CA", sellerId: "TESTSELLER02", asins: [asin],
+    salesByAsin: { [asin]: { sales30: 100, rawText: "100+ bought in past month" } },
+    complete: true, status: "complete", pagesVisited: 1, reportedTotalAsins: 1, notEnumeratedAsins: 0 });
 
   async function startServer() {
     const port = await freeLocalPort();
@@ -239,6 +252,15 @@ syncBuiltinESMExports();
   assert.equal(staleWrite.body.error.code, "STALE_COLLECTION_SNAPSHOT");
   latest.products[0].manualPurchaseCost = true;
   latest.products[0].purchaseCost = 457;
+  latest.products[0].purchaseUnitCostCny = 457;
+  latest.products[0].manualAmazonFields = { currentPrice: true };
+  latest.products[0].currentPrice = 21;
+  latest.products[0].manualSalePrice = true;
+  latest.products[0].salePrice = 17;
+  latest.products[0].manualWeight = true;
+  latest.products[0].productWeight = 0.2;
+  latest.products[0].billingWeight = 0.2;
+  latest.products[0].supplierQuotes = [{ offerId: "saved-manual-offer", price: 457, supplierName: "Synthetic supplier" }];
   const currentWrite = await callApi(first.origin, "/api/runs", { method: "POST", body: latest });
   assert.equal(currentWrite.status, 200);
 
@@ -247,6 +269,11 @@ syncBuiltinESMExports();
   assert.equal(paused.body.data.status, "paused");
   assert.equal(paused.body.data.enabled, false);
   assert.equal(paused.body.data.causeCode, "USER_PAUSED");
+  const pausedSnapshot = (await callApi(first.origin, `/api/runs/${runId}`)).body.data;
+  assert.equal(pausedSnapshot.runState.archivedAt, undefined, "Pause must retain a resumable run, not archive it.");
+  const invalidArchive = await callApi(first.origin, `/api/runs/${runId}/archive`, { method: "POST", body: { reason: "pause" } });
+  assert.equal(invalidArchive.status, 422);
+  assert.equal((await callApi(first.origin, "/api/amazon/collection")).body.data.status, "paused");
   const supplierBefore = (await callApi(first.origin, '/api/1688/pipeline')).body.data;
   const invalidAppend = await callApi(first.origin, '/api/1688/pipeline/control', { method: 'POST', body: { runId: supplierRunId, action: 'append', productIds: [newId, 'CA:B000009999'] } });
   assert.equal(invalidAppend.status, 422);
@@ -288,5 +315,83 @@ syncBuiltinESMExports();
   assert.equal(resumedSupplier.selectionId, 'keep-original-selection');
   assert.deepEqual(resumedSupplier.productIds, [matchedId, newId]);
   assert.deepEqual(resumedSupplier.tasks[matchedId], originalTask);
+  const resumed = await callApi(restarted.origin, "/api/amazon/collection/control", { method: "POST", body: { runId, action: "resume" } });
+  assert.equal(resumed.status, 202);
+  assert.equal(resumed.body.data.enabled, true);
+  await waitUntil(async () => {
+    const response = await callApi(restarted.origin, "/api/amazon/collection");
+    return response.body.data?.status === "completed" && !response.body.data.workerActive;
+  }, "the manually resumed saved collection to finish");
+  assert.equal((await callApi(restarted.origin, "/api/amazon/collection/control", { method: "POST", body: { runId, action: "pause" } })).status, 202);
+  const beforeArchive = (await callApi(restarted.origin, `/api/runs/${runId}`)).body.data;
+  assert.equal(beforeArchive.runState.archivedAt, undefined);
+  const archived = await callApi(restarted.origin, `/api/runs/${runId}/archive`, { method: "POST", body: { reason: "file_upload" } });
+  assert.equal(archived.status, 200);
+  assert.equal(archived.body.data.summary.id, runId);
+  assert.equal(archived.body.data.summary.status, "cancelled");
+  assert.ok(archived.body.data.summary.archivedAt);
+  assert.equal(archived.body.data.summary.productCount, 1);
+  assert.equal((await callApi(restarted.origin, "/api/amazon/collection")).body.data, null);
+  const archiveSnapshot = (await callApi(restarted.origin, `/api/runs/${runId}`)).body.data;
+  assert.equal(archiveSnapshot.runState.status, "cancelled");
+  assert.equal(archiveSnapshot.runState.archivedAt, archived.body.data.summary.archivedAt);
+  assert.equal(archiveSnapshot.runState.amazonCollectionJob.status, "cancelled");
+  assert.equal(archiveSnapshot.runState.amazonCollectionJob.enabled, false);
+  assert.deepEqual(archiveSnapshot.products, beforeArchive.products, "Archiving preserves derived results, manual prices, weights, costs and saved quotes.");
+  assert.deepEqual(archiveSnapshot.amazonCollection.items, beforeArchive.amazonCollection.items);
+  assert.equal(archiveSnapshot.products[0].currentPrice, 21);
+  assert.equal(archiveSnapshot.products[0].salePrice, 17);
+  assert.equal(archiveSnapshot.products[0].productWeight, 0.2);
+  assert.equal(archiveSnapshot.products[0].purchaseCost, 457);
+  assert.deepEqual(archiveSnapshot.products[0].supplierQuotes, latest.products[0].supplierQuotes);
+  const history = (await callApi(restarted.origin, "/api/state")).body.data;
+  assert.equal(history.runs.find(run => run.id === runId).status, "cancelled");
+  assert.notEqual(history.latestRunId, runId, "Reload must not automatically reopen the archived run.");
+
+  const duplicateArchive = await callApi(restarted.origin, `/api/runs/${runId}/archive`, { method: "POST", body: { reason: "file_upload" } });
+  assert.equal(duplicateArchive.status, 200);
+  assert.deepEqual(duplicateArchive.body.data.summary, archived.body.data.summary);
+  assert.deepEqual((await callApi(restarted.origin, `/api/runs/${runId}`)).body.data, archiveSnapshot);
+  const lateWrite = await callApi(restarted.origin, "/api/runs", { method: "POST", body: beforeArchive });
+  assert.equal(lateWrite.status, 409);
+  assert.equal(lateWrite.body.error.code, "RUN_ARCHIVED");
+  const oldStart = await callApi(restarted.origin, "/api/amazon/collection/start", { method: "POST", body: { runId } });
+  assert.equal(oldStart.status, 409);
+  assert.equal(oldStart.body.error.code, "RUN_ARCHIVED");
+  const oldResume = await callApi(restarted.origin, "/api/amazon/collection/control", { method: "POST", body: { runId, action: "resume" } });
+  assert.ok(oldResume.status >= 400 && oldResume.status < 500);
+  assert.equal((await callApi(restarted.origin, "/api/amazon/collection")).body.data, null);
+
+  // A different paused supplier run must remain untouched until it, too, is replaced.
+  assert.equal((await callApi(restarted.origin, "/api/1688/pipeline")).body.data.status, "paused");
+  const supplierArchived = await callApi(restarted.origin, `/api/runs/${supplierRunId}/archive`, { method: "POST", body: { reason: "file_upload" } });
+  assert.equal(supplierArchived.status, 200);
+  assert.equal((await callApi(restarted.origin, "/api/1688/pipeline")).body.data, null);
+  const archivedSupplierSnapshot = (await callApi(restarted.origin, `/api/runs/${supplierRunId}`)).body.data;
+  assert.equal(archivedSupplierSnapshot.runState.supplier1688Pipeline.status, "cancelled");
+  assert.equal(archivedSupplierSnapshot.runState.supplier1688Pipeline.enabled, false);
+  assert.deepEqual(archivedSupplierSnapshot.runState.supplier1688Pipeline.tasks[matchedId], originalTask);
+  assert.equal(archivedSupplierSnapshot.products[0].purchaseCost, 8);
+  const oldSupplierResume = await callApi(restarted.origin, "/api/1688/pipeline/control", { method: "POST", body: { runId: supplierRunId, action: "resume" } });
+  assert.equal(oldSupplierResume.status, 409);
+  assert.equal(oldSupplierResume.body.error.code, "RUN_ARCHIVED");
   await stopServer(restarted);
+
+  const afterArchiveRestart = await startServer();
+  assert.equal((await callApi(afterArchiveRestart.origin, "/api/amazon/collection")).body.data, null);
+  assert.equal((await callApi(afterArchiveRestart.origin, "/api/1688/pipeline")).body.data, null);
+  assert.deepEqual((await callApi(afterArchiveRestart.origin, `/api/runs/${runId}`)).body.data, archiveSnapshot);
+  const replacement = await callApi(afterArchiveRestart.origin, "/api/amazon/collection/start", { method: "POST", body: { runId: replacementRunId } });
+  assert.equal(replacement.status, 202);
+  assert.equal(replacement.body.data.runId, replacementRunId);
+  const replacementFinished = await waitUntil(async () => {
+    const response = await callApi(afterArchiveRestart.origin, "/api/amazon/collection");
+    return response.body.data?.status === "completed" && !response.body.data.workerActive ? response.body.data : false;
+  }, "the independent replacement run to finish");
+  assert.equal(replacementFinished.counts.complete, 1);
+  const replacementSnapshot = (await callApi(afterArchiveRestart.origin, `/api/runs/${replacementRunId}`)).body.data;
+  assert.equal(replacementSnapshot.products[0].currentPrice, 9.99);
+  assert.notEqual(replacementSnapshot.products[0].purchaseCost, 457, "The new run must not inherit manual values from the archived run.");
+  assert.deepEqual((await callApi(afterArchiveRestart.origin, `/api/runs/${runId}`)).body.data, archiveSnapshot);
+  await stopServer(afterArchiveRestart);
 });

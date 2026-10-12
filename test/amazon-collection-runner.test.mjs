@@ -31,8 +31,9 @@ class MemoryStore {
     this.active = null;
     this.nextRead = null;
   }
-  async getRunSnapshot() {
-    return { runState: { analysisSourceMode: 'amazon_only', marketplace: 'CA', criteria: {} }, storeList: { stores: [] } };
+  async getRunSnapshot(runId) {
+    const archivedAt = this.records.get(runId)?.job?.archivedAt;
+    return { runState: { analysisSourceMode: 'amazon_only', marketplace: 'CA', criteria: {}, archivedAt }, storeList: { stores: [] } };
   }
   async getActiveAmazonCollection() {
     return this.active ? { runId: this.active, ...copy(this.records.get(this.active)) } : null;
@@ -50,6 +51,15 @@ class MemoryStore {
     this.records.set(runId, copy(next));
     if (activate) this.active = runId;
     return copy(next);
+  }
+  async archiveRun(runId) {
+    const saved = this.records.get(runId);
+    if (saved?.job && !saved.job.archivedAt) {
+      Object.assign(saved.job, { status: 'cancelled', enabled: false, archivedAt: new Date().toISOString(),
+        causeCode: 'USER_REPLACED', nextRetryAt: null, revision: saved.job.revision + 1 });
+    }
+    if (this.active === runId) this.active = null;
+    return saved;
   }
   read() { return copy(this.records.get(RUN)); }
   holdNextRead() {
@@ -789,4 +799,93 @@ test('full collection retains and fetches low-sales and missing-sales products b
   await h.runner.tick();
   assert.deepEqual(h.calls, [[A, B]]);
   assert.equal(h.store.read().job.status, 'completed');
+});
+
+
+test('replacement cancellation preserves paused checkpoints and allows a new run without reviving the old one', async t => {
+  const h = await setup(t, { asins: [A, B], items: [completeItem(A)] });
+  await h.runner.command(RUN, 'pause');
+  const before = h.store.read();
+  const archived = await h.runner.cancelForReplacement(RUN);
+  assert.equal(archived.status, 'cancelled');
+  assert.equal(archived.workerActive, false);
+  assert.equal(h.runner.runId, null);
+  assert.equal(h.store.active, null);
+  assert.deepEqual(h.store.read().items, before.items);
+  assert.deepEqual(h.store.read().job.tasks, before.job.tasks);
+  await assert.rejects(h.runner.start(RUN), { code: 'RUN_ARCHIVED' });
+  await assert.rejects(h.runner.command(RUN, 'resume'), { code: 'COLLECTION_NOT_ACTIVE' });
+  await assert.rejects(h.runner.command(RUN, 'retry_missing'), { code: 'COLLECTION_NOT_ACTIVE' });
+  await h.runner.start('replacement-run');
+  await h.runner.tick();
+  assert.equal(h.runner.runId, 'replacement-run');
+  assert.deepEqual(h.calls, [[B]]);
+  assert.equal(h.store.read().job.status, 'cancelled');
+});
+
+test('replacement aborts in-flight work and rejects late results after a new run begins', async t => {
+  const entered = deferred();
+  const late = deferred();
+  let workerSignal;
+  const h = await setup(t, { loadDetails: (_job, asins, signal, count) => {
+    if (count > 1) return asins.map(completeItem);
+    workerSignal = signal; entered.resolve(); return late.promise;
+  } });
+  const tick = h.runner.tick();
+  await entered.promise;
+  await h.runner.cancelForReplacement(RUN);
+  await tick;
+  assert.equal(workerSignal.aborted, true);
+  const archived = h.store.read();
+  await h.runner.start('new-run-after-abort');
+  late.resolve([{ ...completeItem(A), currentPrice: 999 }]);
+  await Promise.resolve();
+  await h.runner.tick();
+  assert.deepEqual(h.store.read(), archived);
+  assert.equal(h.store.records.get('new-run-after-abort').items[A].currentPrice, 9.99);
+});
+
+test('archiving a non-current run does not abort or release the current worker', async t => {
+  const entered = deferred();
+  const response = deferred();
+  let workerSignal;
+  const h = await setup(t, { loadDetails: (_job, _asins, signal) => {
+    workerSignal = signal; entered.resolve(); return response.promise;
+  } });
+  h.store.records.set('historical-run', { job: { status: 'paused', revision: 1, tasks: {} }, items: {} });
+  const tick = h.runner.tick();
+  await entered.promise;
+  await h.runner.cancelForReplacement('historical-run');
+  assert.equal(workerSignal.aborted, false);
+  assert.equal(h.runner.runId, RUN);
+  assert.equal(h.store.active, RUN);
+  response.resolve([completeItem(A)]);
+  await tick;
+  assert.equal(h.store.read().job.status, 'completed');
+});
+
+test('replacement during a pending timer read invalidates that stale read before another run starts', async t => {
+  const h = await setup(t);
+  const gate = h.store.holdNextRead();
+  const tick = h.runner.tick();
+  await gate.started.promise;
+  await h.runner.cancelForReplacement(RUN);
+  await h.runner.start('new-run-after-read');
+  gate.release.resolve();
+  await tick;
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.store.read().job.status, 'cancelled');
+});
+
+test('a cancelled collection is never restored even with a stale active pointer at restart', async t => {
+  const h = await setup(t);
+  await h.runner.cancelForReplacement(RUN);
+  await h.runner.close();
+  h.store.active = RUN;
+  const restored = new AmazonCollectionRunner({ store: h.store, loadDetails: () => { throw new Error('must not collect'); } });
+  t.after(() => restored.close());
+  assert.equal(await restored.initialize({ timer: false }), null);
+  await restored.tick();
+  assert.equal(restored.runId, null);
+  assert.equal(h.store.read().job.status, 'cancelled');
 });

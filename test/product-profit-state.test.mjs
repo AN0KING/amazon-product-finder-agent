@@ -41,6 +41,7 @@ function appProfitOracle(product, context = {}) {
   const expected = vm.runInContext(`
     ${appSource.slice(marketStart, marketEnd)}
     const scope = oracleContext.snapshot || oracleContext;
+    const runState = scope.runState || {};
     const code = String(oracleProduct.marketplace || oracleContext.marketplace || scope.runState?.marketplace || scope.marketplace || 'NL').toUpperCase();
     let activeMarket = MARKET_CONFIGS[code] || MARKET_CONFIGS.NL;
     const analysisHandoffPendingIds = new Set();
