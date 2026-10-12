@@ -283,10 +283,12 @@ svg {
   color: #607168;
 }
 
-#sellerSpriteCallCount {
+#sellerSpriteCallCount,
+#sellerSpriteSalesCount,
+#sellerSpriteSalesUnknown {
   color: #a7b2ac;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .connection-line strong,
@@ -2087,7 +2089,7 @@ input[type="checkbox"]:checked {
 
 .results-filter-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 288px), 1fr));
   gap: 0 24px;
   margin-top: 5px;
 }
@@ -2183,6 +2185,59 @@ input[type="checkbox"]:checked {
   width: 15px;
   height: 15px;
   margin-top: 1px;
+}
+
+.monthly-sales-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.monthly-sales-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  min-width: 0;
+}
+
+.monthly-sales-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.monthly-sales-heading span {
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.monthly-sales-panel p {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}
+
+.monthly-sales-totals {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.monthly-sales-detail {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: 11px;
 }
 
 .search-control {
@@ -5823,4 +5878,41 @@ input[type="checkbox"]:checked {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* The service owns monitoring; this compact panel only displays its saved status. */
+.local-monitor-panel {
+  width: calc(100% - 64px);
+  max-width: var(--content-width);
+  margin: 24px auto 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--surface, #fff);
+  color: var(--ink-soft);
+  font-size: 12px;
+  min-width: 0;
+}
+.local-monitor-panel summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  padding: 12px 16px;
+  cursor: pointer;
+}
+.local-monitor-panel summary::before { content: "+"; color: var(--accent); }
+.local-monitor-panel[open] summary::before { content: "−"; }
+.local-monitor-panel summary strong { color: var(--ink); }
+#localMonitorStatus[data-state="attention"] { color: #a84c24; font-weight: 700; }
+.local-monitor-content { padding: 0 16px 12px; overflow-wrap: anywhere; }
+.local-monitor-content p { margin: 6px 0; line-height: 1.65; }
+#localMonitorEvents { margin: 8px 0 0; padding-left: 18px; }
+#localMonitorEvents li { margin: 8px 0; line-height: 1.6; }
+#localMonitorEvents time { display: block; font-size: 11px; }
+
+@media (max-width: 1180px) {
+  .local-monitor-panel { width: calc(100% - 48px); }
+}
+@media (max-width: 700px) {
+  .local-monitor-panel { width: calc(100% - 28px); margin-top: 16px; }
 }

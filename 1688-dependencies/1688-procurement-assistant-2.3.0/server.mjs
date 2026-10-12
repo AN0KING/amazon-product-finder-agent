@@ -302,7 +302,9 @@ async function pumpQueue() {
   workerPumping = true;
   try {
     while (taskQueue.length > 0) {
-      if (searchPolicy.view().manualResumeRequired) break;
+      const policy = searchPolicy.view();
+      // A failed result write retains its reservation. Never spin/requeue it.
+      if (policy.manualResumeRequired || policy.rateTrial?.activeSearch) break;
       if (loginChildAlive() || loginLaunchPending) break; // 专用 Edge 被登录/验证占用时暂停出队，避免会话锁冲突
       const waitMs = searchPolicy.waitMs();
       if (waitMs > 0) {
@@ -348,32 +350,46 @@ function scheduleQueueWake(waitMs) {
 async function executeTask(taskId) {
   const task = tasks.get(taskId);
   if (!task || task.status !== "queued") return;
-  if (loginChildAlive() || !(await searchPolicy.beginSearch())) {
+  if (loginChildAlive() || !(await searchPolicy.beginSearch({ taskId }))) {
     enqueueTask(taskId, { front: true });
     return;
   }
-  task.status = "running";
-  task.searchStartedAt = new Date().toISOString();
-  task.failure = null;
-  await persistTask(task);
-  log(`任务 ${taskId} 开始以图搜款（image=${task.fileName}）`);
   try {
-    const data = await dispatch(
-      "image-search",
-      { imagePath: task.imageFile, max: SEARCH_MAX_OFFERS, headed: false },
-      { headed: false, profile: "default" },
-    );
-    const offers = Array.isArray(data?.offers) ? data.offers : [];
-    task.candidates = offers.map(mapOfferToCandidate);
-    task.imageId = data?.imageId ?? null;
-    task.status = "review_candidates";
+    task.status = "running";
+    task.searchStartedAt = new Date().toISOString();
     task.failure = null;
-    log(`任务 ${taskId} 完成：候选 ${task.candidates.length} 条（imageId=${task.imageId ?? "n/a"}）`);
-  } catch (error) {
-    await applyTaskError(task, error);
-    log(`任务 ${taskId} 失败：${task.failure?.code} ${task.failure?.message}`);
+    await persistTask(task);
+    log(`任务 ${taskId} 开始以图搜款（image=${task.fileName}）`);
+    try {
+      const data = await dispatch(
+        "image-search",
+        { imagePath: task.imageFile, max: SEARCH_MAX_OFFERS, headed: false },
+        { headed: false, profile: "default" },
+      );
+      const offers = Array.isArray(data?.offers) ? data.offers : [];
+      task.candidates = offers.map(mapOfferToCandidate);
+      task.imageId = data?.imageId ?? null;
+      task.status = "review_candidates";
+      task.failure = null;
+      log(`任务 ${taskId} 完成：候选 ${task.candidates.length} 条（imageId=${task.imageId ?? "n/a"}）`);
+    } catch (error) {
+      await applyTaskError(task, error);
+      log(`任务 ${taskId} 失败：${task.failure?.code} ${task.failure?.message}`);
+    }
+    await persistTask(task);
+  } finally {
+    try {
+      await searchPolicy.finishSearch({
+        taskId, success: task.status === "review_candidates", code: task.failure?.code ?? null,
+      });
+    } catch (error) {
+      // pauseForManual blocks in memory even if the disk is still unavailable.
+      await searchPolicy.pauseForManual("RATE_TRIAL_RECORD_FAILED", taskId).catch(pauseError => {
+        log(`速率试验暂停记录写入失败：${shortMessage(pauseError)}`);
+      });
+      throw error;
+    }
   }
-  await persistTask(task);
 }
 
 async function applyTaskError(task, error) {
@@ -946,6 +962,29 @@ function runtimePayload() {
     service: { pid: process.pid, startedAt: startedAtIso } };
 }
 
+async function handleStartRateTrial(body) {
+  const allowed = new Set(["confirmed", "startPerHour", "stepPerHour", "stageDurationMs"]);
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).some(key => !allowed.has(key)) || body.confirmed !== true
+    || body.startPerHour !== 90 || body.stepPerHour !== 10 || body.stageDurationMs !== 3_600_000) {
+    throw new ApiError(422, "RATE_TRIAL_INPUT_INVALID", "请确认每小时90个起步、每档一小时、逐档增加10个的测试参数。");
+  }
+  if (runningTaskId || workerPumping || loginChildAlive() || loginLaunchPending) {
+    throw new ApiError(409, "RATE_TRIAL_BUSY", "当前搜图或人工验证尚未结束，请稍后启用速率测试。");
+  }
+  try {
+    await searchPolicy.startTrial({ startPerHour: 90, stepPerHour: 10, stageDurationMs: 3_600_000 });
+  } catch (error) {
+    if (["RATE_POLICY_NOT_READY", "RATE_TRIAL_EXISTS", "INVALID_RATE_TRIAL"].includes(error?.code)) {
+      throw new ApiError(error.status, error.code, error.message);
+    }
+    throw error;
+  }
+  cancelQueueWake();
+  void pumpQueue();
+  return runtimePayload();
+}
+
 async function handleResumeQueue(body) {
   if (body?.confirmed !== true) throw new ApiError(422, "RESUME_CONFIRMATION_REQUIRED", "请明确确认继续搜图（confirmed 必须为 true）。");
   if (loginChildAlive() || loginLaunchPending) throw new ApiError(409, "VERIFICATION_IN_PROGRESS", "请等待人工验证窗口完成后再继续搜图。");
@@ -976,6 +1015,14 @@ async function handleRequest(request, response) {
     const verify = url.searchParams.get("verify") === "1";
     if (verify && !searchPolicy.view().manualResumeRequired && searchPolicy.waitMs() === 0) await runBrowserOp(() => verifyNow({ force: false }));
     sendJson(response, 200, runtimePayload());
+    return;
+  }
+  if (pathname === "/api/v1/queue/rate-trial" && request.method === "GET") {
+    sendJson(response, 200, { ok: true, ratePolicy: searchPolicy.view() });
+    return;
+  }
+  if (pathname === "/api/v1/queue/rate-trial" && request.method === "POST") {
+    sendJson(response, 200, await handleStartRateTrial(await readJsonBody(request, 64 * 1024)));
     return;
   }
   if (pathname === "/api/v1/queue/resume" && request.method === "POST") {

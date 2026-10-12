@@ -1,4 +1,4 @@
-import * as salesPolicy from "../lib/amazon-sales-policy.mjs";
+import * as salesPolicy from "../lib/monthly-sales-policy.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -62,7 +62,7 @@ function harness() {
   let respond = async (path) => { throw new Error(`Unexpected API request: ${path}`); };
   const context = vm.createContext({
     ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
-    document: { body: element("body"), addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
+    document: { body: element("body"), documentElement: element("html"), addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
     window: { crypto: { randomUUID: () => "new-synthetic-run" }, setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {},
       setInterval(callback, ms) { timers.push({ callback, ms, interval: true }); return timers.length; }, clearInterval() {}, confirm: () => true,
       EventSource: class { constructor(url) { this.url = url; events.push(this); } } },
@@ -72,6 +72,7 @@ function harness() {
   });
   const source = appSource.replace(/^import[\s\S]*?;\r?\n/gm, "").replace(/\}\)\(\);\s*$/, `
     const originalAvailability = updateStartAvailability;
+    const originalMarketUi = renderMarketUi;
     renderMarketUi = renderStoreAuditUi = renderStoreManager = setImportStatus = resetStoreAuditUi = setDataMode = renderResults = renderRunCoverage = updateHistorySummary = updateStartAvailability = initIcons = restorePending1688RiskStatus = setStage = setProgress = hideProgressError = showProgressError = showView = scheduleRequested1688Resume = () => {};
     const originalPopulateDrawer = populateDrawer;
     populateDrawer = (product) => { document.getElementById('drawerProductName').textContent = product.name; };
@@ -81,6 +82,9 @@ function harness() {
     getSetupCriteria = () => ({ useSellerSprite: false });
     validateSetupCriteria = () => null;
     globalThis.scout = {
+      useRealMarketUi: () => { renderMarketUi = originalMarketUi; renderMarketUi(); },
+      marketState: () => ({ activeMarket, taskExchangeRate }),
+      checkAmazon: refreshAmazonConnection, checkSellerSprite: checkSellerSpriteConnection,
       bindUpload: bindFileImport, availability: originalAvailability, history: loadHistoryRun, workspace: loadPersistentWorkspace,
       importState: () => ({ storeList, runHistory, storeImportPending, taskReplacementPending, amazonCollectionJob, supplierPipelineState }),
       restore: restoreRunSnapshot, poll: pollAmazonCollection, run: runAnalysis, control: controlAmazonCollection,
@@ -89,7 +93,7 @@ function harness() {
       scheduleResume: scheduleAmazonRunResume,
       startEvents: startSnapshotEvents, refresh: refreshAmazonCollectionSnapshot,
       settleSnapshots: async () => { while (amazonCollectionSnapshotPromise) await amazonCollectionSnapshotPromise; },
-      loadSupplier: loadSupplierPipelineStatus, pollSupplier: poll1688AutoResume,
+      loadSupplier: loadSupplierPipelineStatus, pollSupplier: poll1688Status,
       resumeSupplier: () => resumePending1688Candidates(), pauseSupplier: pauseServerSupplierPipeline,
       applySession: (auth, queue) => apply1688SessionStatus(auth, queue),
       applySupplierResult: apply1688SearchResult, row: (id) => renderProductRow(products.find(product => product.id === id)),
@@ -1316,7 +1320,7 @@ test("manual dialog cannot approve a manually changed monthly count using the ol
   app.approveManual();
   assert.equal(app.state().products[0].reviewStatus, "pending");
   assert.equal(app.state().products[0].sales30, 100);
-  assert.match(element("manualCostError").textContent, /50\+/);
+  assert.match(element("manualCostError").textContent, /有效月销量（至少 50）/);
 });
 
 test("a real manual weight replaces the minimum FBA assumption with an ordinary weight fee", () => {
@@ -2121,14 +2125,30 @@ test('v9 migration retains preliminary approval unless the automatic fee really 
 });
 
 
-function uploadFixture(status = 'paused') {
+function uploadFixture(status = 'paused', marketplace = 'AU', exchangeRate = null) {
   const fixture = harness();
-  fixture.app.restore(snapshot(job(status)));
+  const saved = snapshot(job(status));
+  if (marketplace === 'CA') {
+    Object.assign(saved.runState, { marketplace: 'CA', currency: 'CAD', amazonDomain: 'www.amazon.ca' });
+    saved.storeList.audit.marketplace = 'CA';
+    saved.profitModel.exchangeRate = 5.2;
+    for (const product of saved.products) {
+      Object.assign(product, { id: `CA:${product.asin}`, marketplace: 'CA', sourceMarketplace: 'CA' });
+      product.profitInputs.exchangeRate = 5.2;
+    }
+  }
+  if (Number.isFinite(exchangeRate)) {
+    saved.profitModel.exchangeRate = exchangeRate;
+    saved.runState.exchangeRate = exchangeRate;
+    for (const product of saved.products) product.profitInputs.exchangeRate = exchangeRate;
+  }
+  fixture.app.restore(saved);
+  fixture.app.useRealMarketUi();
   fixture.app.bindUpload();
   fixture.element('storeFileInput').files = [{ name: 'new-stores.xlsx', arrayBuffer: async () => new ArrayBuffer(4) }];
   return fixture;
 }
-const parsedUpload = () => ({ audit: { marketplace: 'AU', uniqueSellers: 1 }, stores: [{ sellerId: 'NEWSELLER01', asins: ['B000000002'] }] });
+const parsedUpload = (marketplace = 'AU') => ({ audit: { marketplace, uniqueSellers: 1 }, stores: [{ marketplace, sellerId: 'NEWSELLER01', asins: ['B000000002'] }] });
 const archivedUpload = () => ({ summary: { id: runId, status: 'cancelled', archivedAt: '2026-10-12T03:30:00.000Z' }, runs: [{ id: runId, status: 'cancelled', productCount: 1, hasSnapshot: true }] });
 
 test('pause preserves the current task and never invokes upload archiving', async () => {
@@ -2186,6 +2206,80 @@ test('upload archives a paused task after saving edits and before clearing its v
   assert.notEqual(fixture.element('body').inert, true);
 });
 
+for (const [from, to, oldCurrency, currency, exchangeRate] of [
+  ['AU', 'CA', 'AUD', 'CAD', 5.2],
+  ['CA', 'AU', 'CAD', 'AUD', 4.8],
+]) test(`uploading ${to} links switches ${from} only after its saved task is archived`, async () => {
+  const fixture = uploadFixture('paused', from, 6.23);
+  const before = JSON.parse(JSON.stringify(fixture.app.capture()));
+  let releaseArchive;
+  const archiveStarted = new Promise(resolve => {
+    fixture.respond(async (path, options) => {
+      if (path === '/api/store-list/parse') {
+        assert.equal(options.headers['X-Marketplace'], from, 'The selected market is only the parser fallback');
+        return parsedUpload(to);
+      }
+      if (path === '/api/runs') {
+        const saved = JSON.parse(options.body);
+        assert.equal(saved.runState.marketplace, from);
+        assert.equal(saved.runState.currency, oldCurrency);
+        assert.equal(saved.storeList.audit.marketplace, from);
+        assert.equal(saved.profitModel.exchangeRate, before.profitModel.exchangeRate);
+        assert.deepEqual(saved.products, before.products, 'Archiving must preserve manual prices, costs, weights and supplier quotes');
+        return { runs: [] };
+      }
+      if (path === `/api/runs/${runId}/archive`) {
+        resolve();
+        return new Promise(done => { releaseArchive = done; });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+  });
+  const importing = fixture.fire('storeFileInput', 'change');
+  await archiveStarted;
+  assert.equal(fixture.app.marketState().activeMarket.code, from);
+  assert.equal(fixture.element('marketplaceSelect').value, from);
+  assert.equal(fixture.app.state().runState.currency, oldCurrency);
+  assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+  releaseArchive(archivedUpload());
+  await importing;
+  const next = fixture.app.capture();
+  assert.equal(fixture.app.marketState().activeMarket.code, to);
+  assert.equal(fixture.element('marketplaceSelect').value, to);
+  assert.equal(fixture.element('brandMarket').textContent, `SCOUT ${to}`);
+  assert.equal(fixture.element('exchangeRateLabel').textContent, `1 ${currency} 兑换人民币`);
+  assert.equal(next.runState.id, null);
+  assert.equal(next.runState.mode, 'idle');
+  assert.equal(next.runState.marketplace, to);
+  assert.equal(next.runState.sourceMarketplace, to);
+  assert.equal(next.runState.currency, currency);
+  assert.equal(next.runState.exchangeRate, exchangeRate);
+  assert.equal(next.profitModel.exchangeRate, exchangeRate);
+  assert.equal(next.products.length, 0);
+  assert.equal(next.storeList.audit.marketplace, to);
+  assert.deepEqual(fixture.calls.map(call => call.path), ['/api/store-list/parse', '/api/runs', `/api/runs/${runId}/archive`]);
+});
+
+test('after importing Canada, explicit Amazon and SellerSprite checks use the uploaded market', async () => {
+  const fixture = uploadFixture();
+  fixture.respond(async path => {
+    if (path === '/api/store-list/parse') return parsedUpload('CA');
+    if (path === '/api/runs') return { runs: [] };
+    if (path === `/api/runs/${runId}/archive`) return archivedUpload();
+    if (path === '/api/amazon/check') return { ready: true, checkedAt: '2026-10-12T08:00:00.000Z', sellerId: 'NEWSELLER01', discoveredAsins: 1 };
+    if (path === '/api/sellsprite/status') return { configuration: { configured: true }, capabilities: { supportedMarketplaces: ['CA'] } };
+    if (path === '/api/sellsprite/connect') return { tools: ['competitor_lookup'], capabilities: { supportedMarketplaces: ['CA'] } };
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.fire('storeFileInput', 'change');
+  assert.equal(fixture.calls.some(call => /check|connect|sellsprite/.test(call.path)), false, 'Upload must not automatically call external services');
+  assert.equal(await fixture.app.checkAmazon(), true);
+  fixture.element('useSellerSpriteToggle').checked = true;
+  assert.equal(await fixture.app.checkSellerSprite(), true);
+  assert.deepEqual(fixture.calls.find(call => call.path === '/api/amazon/check').body, { marketplace: 'CA', sellerId: 'NEWSELLER01' });
+  assert.deepEqual(fixture.calls.find(call => call.path === '/api/sellsprite/connect').body, { confirmed: true, marketplace: 'CA' });
+});
+
 test('running upload accepts one replacement and rejects late snapshot/status responses', async () => {
   const fixture = uploadFixture('running');
   let releaseSnapshot, releaseStatus, releaseArchive;
@@ -2193,7 +2287,7 @@ test('running upload accepts one replacement and rejects late snapshot/status re
     fixture.respond(async path => {
       if (path === `/api/runs/${runId}`) return new Promise(done => { releaseSnapshot = done; });
       if (path === '/api/amazon/collection') return new Promise(done => { releaseStatus = done; });
-      if (path === '/api/store-list/parse') return parsedUpload();
+      if (path === '/api/store-list/parse') return parsedUpload('CA');
       if (path === `/api/runs/${runId}/archive`) { resolve(); return new Promise(done => { releaseArchive = done; }); }
       throw new Error(`Unexpected ${path}`);
     });
@@ -2214,12 +2308,21 @@ test('running upload accepts one replacement and rejects late snapshot/status re
   assert.equal(fixture.app.state().products.length, 0);
   assert.equal(fixture.app.importState().amazonCollectionJob, null);
   assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'NEWSELLER01');
+  assert.equal(fixture.app.marketState().activeMarket.code, 'CA');
+  assert.equal(fixture.element('marketplaceSelect').value, 'CA');
+  assert.equal(fixture.app.state().runState.currency, 'CAD');
+  assert.equal(fixture.app.capture().profitModel.exchangeRate, 5.2);
 });
 
 for (const [label, parse] of [
   ['invalid workbook', async () => { throw new Error('Invalid XLSX'); }],
-  ['empty workbook', async () => ({ audit: { marketplace: 'AU', uniqueSellers: 0 }, stores: [] })],
-  ['wrong marketplace', async () => ({ ...parsedUpload(), audit: { marketplace: 'CA', uniqueSellers: 1 } })],
+  ['empty workbook', async () => ({ audit: { marketplace: 'CA', uniqueSellers: 0 }, stores: [] })],
+  ['empty stores with an inconsistent audit count', async () => ({ audit: { marketplace: 'CA', uniqueSellers: 1 }, stores: [] })],
+  ['unsupported marketplace', async () => parsedUpload('XX')],
+  ['missing marketplace', async () => ({ ...parsedUpload('CA'), audit: { uniqueSellers: 1 } })],
+  ['mixed marketplace audit', async () => ({ ...parsedUpload('CA'), audit: { marketplace: 'CA', uniqueSellers: 1, requiresSeparateBatches: true } })],
+  ['store marketplace inconsistent with audit', async () => ({ ...parsedUpload('AU'), audit: { marketplace: 'CA', uniqueSellers: 1 } })],
+  ['mixed marketplace workbook', async () => { throw Object.assign(new Error('Workbook contains CA and AU links'), { code: 'MIXED_MARKETPLACES' }); }],
 ]) {
   test(`${label} keeps the paused task, manual data and checkpoint without archiving`, async () => {
     const fixture = uploadFixture();
@@ -2230,13 +2333,16 @@ for (const [label, parse] of [
     assert.equal(fixture.app.state().products[0].purchaseCost, 6);
     assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'EXAMPLESELLER');
     assert.equal(fixture.app.importState().storeImportPending, false);
+    assert.equal(fixture.app.marketState().activeMarket.code, 'AU');
+    assert.equal(fixture.element('marketplaceSelect').value, 'AU');
+    assert.equal(fixture.app.capture().profitModel.exchangeRate, 4.8);
   });
 }
 
-test('failed archive preserves the old view and does not offer the new batch as ready', async () => {
+test('failed archive preserves the old view and marketplace and does not offer the new batch as ready', async () => {
   const fixture = uploadFixture('running');
   fixture.respond(async path => {
-    if (path === '/api/store-list/parse') return parsedUpload();
+    if (path === '/api/store-list/parse') return parsedUpload('CA');
     if (path.endsWith('/archive')) throw new Error('Disk write failed');
     throw new Error(`Unexpected ${path}`);
   });
@@ -2245,6 +2351,28 @@ test('failed archive preserves the old view and does not offer the new batch as 
   assert.equal(fixture.app.state().products[0].purchaseCost, 6);
   assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'EXAMPLESELLER');
   assert.ok(fixture.toasts.some(([message]) => /Disk write failed/.test(message)));
+  assert.equal(fixture.app.marketState().activeMarket.code, 'AU');
+  assert.equal(fixture.element('marketplaceSelect').value, 'AU');
+  assert.equal(fixture.app.state().runState.currency, 'AUD');
+  assert.equal(fixture.app.capture().profitModel.exchangeRate, 4.8);
+});
+
+test('a failed old snapshot save prevents both marketplace switching and archiving', async () => {
+  const fixture = uploadFixture('paused');
+  fixture.respond(async path => {
+    if (path === '/api/store-list/parse') return parsedUpload('CA');
+    if (path === '/api/runs') throw new Error('Snapshot could not be persisted');
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.fire('storeFileInput', 'change');
+  assert.equal(fixture.calls.some(call => call.path.endsWith('/archive')), false);
+  assert.equal(fixture.app.state().runState.id, runId);
+  assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+  assert.equal(fixture.app.importState().storeList.stores[0].sellerId, 'EXAMPLESELLER');
+  assert.equal(fixture.app.marketState().activeMarket.code, 'AU');
+  assert.equal(fixture.element('marketplaceSelect').value, 'AU');
+  assert.equal(fixture.app.state().runState.currency, 'AUD');
+  assert.equal(fixture.app.capture().profitModel.exchangeRate, 4.8);
 });
 
 test('cancelling the file picker does not pause, cancel or archive the current run', async () => {
@@ -2293,3 +2421,29 @@ for (const source of ['history', 'workspace']) {
     assert.equal(fixture.app.importState().runHistory[0].status, 'cancelled');
   });
 }
+
+
+test("a late successful collection result cannot overwrite manually entered monthly sales or restore its superseded evidence", () => {
+  const { app } = harness();
+  const manual = canonicalProduct();
+  manual.sales30 = 20;
+  manual.sales30Evidence = null;
+  manual.amazonSales30Evidence = null;
+  manual.manualAmazonOverride = true;
+  manual.manualAmazonFields = { ...manual.manualAmazonFields, sales30: true };
+  manual.fieldSources = { ...manual.fieldSources, sales30: "manual" };
+  app.restore(snapshot(job("completed"), [manual]));
+  const collectedEvidence = { source: "amazon_product_page", period: "past_month", kind: "lower_bound",
+    value: 200, rawText: "200+ bought in past month", asin: manual.asin };
+  app.mergeCandidates([{ id: manual.id, asin: manual.asin, sourceAsin: manual.sourceAsin, marketplace: "AU",
+    analysisSourceMode: "amazon_only", detailStatus: "success", title: "Late successful result", sales30: 200,
+    sales30Evidence: collectedEvidence, amazonSales30Evidence: collectedEvidence,
+    fieldSources: { sales30: "amazon_product_page" } }]);
+  const saved = app.state().products.find(item => item.id === manual.id);
+  assert.equal(saved.sales30, 20);
+  assert.equal(saved.sales30Evidence, null);
+  assert.equal(saved.amazonSales30Evidence, null);
+  assert.equal(saved.fieldSources.sales30, "manual");
+  assert.equal(saved.manualAmazonFields.sales30, true);
+  assert.equal(app.filtered().some(item => item.id === manual.id), false);
+});

@@ -39,7 +39,7 @@ async function setup(t, options = {}) {
   const busy = [];
   const applied = [];
   const runner = new SupplierPipelineRunner({
-    store, now: () => clock.now, retryMs: 100, intervalMs: 10,
+    store, now: () => clock.now, retryMs: 100, intervalMs: options.intervalMs ?? 10,
     getRuntime: options.getRuntime || (async () => ready()),
     canRun: options.canRun || (() => true), onBusy: value => busy.push(value),
     search: async (item, state, contract) => {
@@ -53,7 +53,7 @@ async function setup(t, options = {}) {
     },
   });
   t.after(() => runner.close());
-  await runner.initialize({ timer: false });
+  await runner.initialize({ timer: options.timer ?? false });
   if (options.start !== false) await runner.start(RUN, { resume: true });
   return { runner, store, clock, calls, busy, applied, advance: ms => { clock.now += ms; } };
 }
@@ -516,6 +516,171 @@ test('repeated resumes of a completed sales-filtered cohort explain exclusions w
   assert.equal(mock.store.active, null);
 });
 
+const timerOptions = { timer: true, intervalMs: 5000, clock: { get now() { return Date.now(); } } };
+const advanceTimers = async (t, runner, milliseconds = 0) => {
+  t.mock.timers.tick(milliseconds);
+  if (runner.work) await runner.work;
+};
+
+test('automatic scheduling checks the next product immediately and wakes at the exact 36-second bridge deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const runtimeChecks = [], starts = [];
+  let nextAllowedAt = null;
+  const mock = await setup(t, { ...timerOptions, snapshot: snapshot([product('A'), product('B')]),
+    getRuntime: async () => {
+      runtimeChecks.push(Date.now());
+      return { ...ready(), queue: { ratePolicy: { nextAllowedAt } } };
+    },
+    search: async item => {
+      starts.push({ id: item.id, at: Date.now() });
+      nextAllowedAt = new Date(Date.now() + 36_000).toISOString();
+      return { cost: 10 };
+    },
+  });
+  await advanceTimers(t, mock.runner);
+  assert.deepEqual(starts, [{ id: 'A', at: EPOCH }]);
+  await advanceTimers(t, mock.runner);
+  assert.deepEqual(runtimeChecks, [EPOCH, EPOCH]);
+  assert.equal((await mock.runner.status()).nextRetryAt, new Date(EPOCH + 36_000).toISOString());
+  await advanceTimers(t, mock.runner, 35_999);
+  assert.equal(starts.length, 1);
+  await advanceTimers(t, mock.runner, 1);
+  assert.deepEqual(starts, [{ id: 'A', at: EPOCH }, { id: 'B', at: EPOCH + 36_000 }]);
+  assert.equal((await mock.runner.status()).status, 'complete');
+});
+
+test('automatic follow-up and interval ticks never overlap an in-flight match or release its manual pause', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const started = deferred(), release = deferred();
+  const mock = await setup(t, { ...timerOptions, snapshot: snapshot([product('A'), product('B')]),
+    search: async () => { started.resolve(); await release.promise; return { cost: 10 }; },
+  });
+  t.mock.timers.tick(0);
+  await started.promise;
+  const work = mock.runner.work;
+  t.mock.timers.tick(20_000);
+  assert.equal(mock.runner.work, work);
+  assert.equal(mock.calls.length, 1);
+  await mock.runner.pause();
+  release.resolve();
+  await work;
+  await advanceTimers(t, mock.runner, 100_000);
+  assert.equal(mock.calls.length, 1);
+  assert.equal((await mock.runner.status()).status, 'paused');
+  assert.equal(mock.store.read().products[0].purchaseCost, 10);
+  assert.equal(mock.store.read().products[1].purchaseCost, null);
+  assert.equal(mock.runner.wakeTimer, null);
+});
+
+test('a persisted exact retry deadline resumes after restart but manual and verification pauses remain stopped', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const until = new Date(EPOCH + 36_000).toISOString();
+  const store = new MemoryStore(snapshot([product('A', { supplierProcurementTaskId: TASK })], ['A'], {
+    owner: 'server', status: 'cooldown', enabled: true, nextRetryAt: until,
+    tasks: { A: { status: 'pending', taskId: TASK, attempts: 2, failureCount: 1, nextRetryAt: until } },
+  }));
+  store.active = RUN;
+  const mock = await setup(t, { ...timerOptions, store, start: false });
+  await advanceTimers(t, mock.runner, 35_999);
+  assert.equal(mock.calls.length, 0);
+  await advanceTimers(t, mock.runner, 1);
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.calls[0].item.supplierProcurementTaskId, TASK);
+  assert.equal((await mock.runner.status()).tasks.A.failureCount, 1);
+  await mock.runner.close();
+  for (const status of ['paused', 'needs_attention']) {
+    const stopped = new MemoryStore(snapshot([product('A')], ['A'], {
+      owner: 'server', status, enabled: false, nextRetryAt: new Date(Date.now() + 100).toISOString(),
+    }));
+    stopped.active = RUN;
+    const paused = await setup(t, { ...timerOptions, store: stopped, start: false });
+    await advanceTimers(t, paused.runner, 40_000);
+    assert.equal(paused.calls.length, 0);
+    assert.equal((await paused.runner.status()).status, status);
+    assert.equal(paused.runner.wakeTimer, null);
+    await paused.runner.close();
+  }
+});
+
+test('exact wakes respect the shared busy guard without spinning and shutdown cancels automatic work', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  let available = false, checks = 0;
+  const mock = await setup(t, { ...timerOptions, canRun: () => { checks++; return available; } });
+  await advanceTimers(t, mock.runner);
+  assert.equal(checks, 1);
+  await advanceTimers(t, mock.runner, 4999);
+  assert.equal(checks, 1);
+  assert.equal(mock.calls.length, 0);
+  available = true;
+  await mock.runner.close();
+  await advanceTimers(t, mock.runner, 10_000);
+  assert.equal(checks, 1);
+  assert.equal(mock.calls.length, 0);
+  assert.equal(mock.runner.timer, null);
+  assert.equal(mock.runner.wakeTimer, null);
+});
+
+test('manual pause and shutdown cancel a pending exact cooldown wake', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  for (const stop of ['pause', 'close']) {
+    const mock = await setup(t, { ...timerOptions, getRuntime: async () => ({ ...ready(),
+      queue: { ratePolicy: { nextAllowedAt: new Date(Date.now() + 36_000).toISOString() } },
+    }) });
+    await advanceTimers(t, mock.runner);
+    assert.ok(mock.runner.wakeTimer);
+    await mock.runner[stop]();
+    assert.equal(mock.runner.wakeTimer, null);
+    await advanceTimers(t, mock.runner, 40_000);
+    assert.equal(mock.calls.length, 0);
+    await mock.runner.close();
+  }
+});
+
+test('timer false never schedules future retries or the next candidate automatically', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const mock = await setup(t, { snapshot: snapshot([product('A'), product('B')]) });
+  await advanceTimers(t, mock.runner, 50_000);
+  assert.equal(mock.calls.length, 0);
+  await mock.runner.tick();
+  await advanceTimers(t, mock.runner, 50_000);
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.runner.wakeTimer, null);
+});
+
+test('automatic retry deadlines preserve bounded failures and never keep retrying an exhausted task', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const attempts = [];
+  const mock = await setup(t, { ...timerOptions, search: async () => {
+    attempts.push(Date.now());
+    throw Object.assign(new Error('temporary failure'), { code: 'NETWORK_ERROR' });
+  } });
+  await advanceTimers(t, mock.runner);
+  await advanceTimers(t, mock.runner, 100);
+  await advanceTimers(t, mock.runner, 200);
+  await advanceTimers(t, mock.runner, 100_000);
+  assert.deepEqual(attempts, [EPOCH, EPOCH + 100, EPOCH + 300]);
+  assert.equal((await mock.runner.status()).tasks.A.failureCount, 3);
+  assert.equal((await mock.runner.status()).status, 'complete');
+});
+
+test('a malformed saved retry deadline does not create immediate empty polling', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const store = new MemoryStore(snapshot([product('A')], ['A'], {
+    owner: 'server', status: 'cooldown', enabled: true, nextRetryAt: 'invalid-saved-date',
+  }));
+  store.active = RUN;
+  const mock = await setup(t, { ...timerOptions, store, start: false });
+  let reads = 0;
+  const read = store.readSnapshot.bind(store);
+  store.readSnapshot = async id => { reads++; return read(id); };
+  await advanceTimers(t, mock.runner, 5000);
+  assert.equal(reads, 1);
+  await advanceTimers(t, mock.runner, 4999);
+  assert.equal(reads, 1);
+  assert.equal(mock.calls.length, 0);
+});
+
+
 test('upload replacement waits for transport shutdown, preserves checkpoints, and fences late callbacks from the new run', async t => {
   const started = deferred(), aborted = deferred(), release = deferred();
   let oldOnTask;
@@ -585,6 +750,26 @@ test('replacement during runtime inspection prevents the pending search and rele
   assert.equal(mock.runner.work, null);
   assert.equal(mock.store.active, null);
   assert.equal(mock.store.read().runState.supplier1688Pipeline.status, 'cancelled');
+});
+
+test('replacement clears a scheduled wake and retains saved queue checkpoints', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: EPOCH });
+  const mock = await setup(t, { ...timerOptions, getRuntime: async () => ({ ...ready(),
+    queue: { ratePolicy: { nextAllowedAt: new Date(Date.now() + 36_000).toISOString() } },
+  }) });
+  await advanceTimers(t, mock.runner);
+  assert.ok(mock.runner.wakeTimer);
+  const before = mock.store.read();
+  const cancelled = await mock.runner.cancelForReplacement(RUN);
+  assert.equal(mock.runner.wakeTimer, null);
+  assert.equal(mock.runner.cachedStatus, null);
+  assert.equal(mock.runner.runId, null);
+  assert.equal(mock.store.active, null);
+  await advanceTimers(t, mock.runner, 100_000);
+  assert.equal(mock.calls.length, 0);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.deepEqual(cancelled.tasks, before.runState.supplier1688Pipeline.tasks);
+  assert.deepEqual(mock.store.read().products, before.products);
 });
 
 test('archived and cancelled runs reject start, resume and append, including after a process restart', async t => {
@@ -673,4 +858,23 @@ test('replacement abort errors do not become retryable failures or restart check
   assert.equal(mock.runner.cachedStatus, null);
   assert.deepEqual(mock.busy, [true, false]);
   await assert.rejects(mock.runner.start(RUN, { resume: true }), { code: 'RUN_ARCHIVED' });
+});
+
+
+test('confirmed supplier cohort accepts same-market API sales only while SellerSprite is enabled', async t => {
+  const valid = product('API', { marketplace: 'US', analysisSourceMode: 'amazon_sellsprite', sales30: 120,
+    sales30Evidence: { source: 'sellsprite_api', sourceTool: 'competitor_lookup', field: 'amzUnit', scope: 'asin',
+      asin: 'B012345678', marketplace: 'US', providerMarketplace: 'US', period: 'past_month', kind: 'estimate', value: 120 } });
+  const foreign = { ...copy(valid), id: 'FOREIGN', marketplace: 'AU' };
+  const state = snapshot([valid, foreign]);
+  state.runState.criteria = { useSellerSprite: true };
+  const mock = await setup(t, { snapshot: state });
+  await mock.runner.tick();
+  assert.deepEqual(mock.calls.map(call => call.item.id), ['API']);
+  assert.equal(mock.store.read().products[1].supplierSearchStatus, 'not_started');
+  const offState = snapshot([valid]);
+  offState.runState.criteria = { useSellerSprite: false };
+  const disabled = await setup(t, { snapshot: offState });
+  await disabled.runner.tick();
+  assert.equal(disabled.calls.length, 0);
 });

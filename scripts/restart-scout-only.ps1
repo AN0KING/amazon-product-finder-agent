@@ -1,6 +1,12 @@
-param([string]$NodePath = 'C:\Users\nanashiWu\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe')
+param([string]$NodePath)
 
 $ErrorActionPreference = 'Stop'
+# Use the independently installed Node runtime unless explicitly overridden.
+if ([string]::IsNullOrWhiteSpace($NodePath)) {
+  $NodePath = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
+if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { throw 'Configured Node runtime is missing.' }
+$NodePath = (Resolve-Path -LiteralPath $NodePath -ErrorAction Stop).Path
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $serverPath = Join-Path $projectRoot 'server.mjs'
 $expectedVersion = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version
@@ -20,7 +26,6 @@ $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $oldProcessId"
 if ($processInfo.Name -ne 'node.exe' -or $processInfo.CommandLine -notmatch [regex]::Escape($serverPath)) {
   throw 'Port 4173 does not belong to this Scout server. Nothing stopped.'
 }
-if (-not (Test-Path -LiteralPath $NodePath)) { throw 'Configured Node runtime is missing.' }
 $logRoot = Join-Path $env:TEMP 'scout-au'
 if (-not (Test-Path -LiteralPath $logRoot)) { New-Item -ItemType Directory -Path $logRoot | Out-Null }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

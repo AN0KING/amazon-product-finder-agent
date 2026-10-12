@@ -57,12 +57,13 @@
             <div class="seller-sprite-copy">
               <strong>SellerSprite MCP</strong>
               <small class="seller-sprite-meta">
-                <span id="sellerSpriteStatusText" aria-live="polite">等待连接</span>
-                <span class="seller-sprite-separator" aria-hidden="true">·</span>
-                <span id="sellerSpriteCallCount" title="不是 ASIN 数；历史累计 ASIN 详情调用；授权检测不计入">历史调用 -- 次</span>
+                <span id="sellerSpriteStatusText" aria-live="polite">未启用 · Amazon 可用</span>
               </small>
+              <small id="sellerSpriteCallCount" title="历史商品接口实际调用次数；连接和工具清单检查不计入；1 次调用可能包含多个 ASIN">历史商品调用 -- 次</small>
+              <small id="sellerSpriteSalesCount">当前任务月销量 0 个 ASIN</small>
+              <small id="sellerSpriteSalesUnknown">当前任务销量未知 0 个</small>
             </div>
-            <button class="icon-button connection-retry" type="button" id="sellerSpriteRetryButton" aria-label="授权 SellerSprite" title="授权 SellerSprite">
+            <button class="icon-button connection-retry" type="button" id="sellerSpriteRetryButton" aria-label="连接 SellerSprite" title="连接 SellerSprite">
               <i data-lucide="plug" aria-hidden="true"></i>
             </button>
           </div>
@@ -128,6 +129,15 @@
             <div class="collection-times"><span>后台每 30 秒巡检 · 页面每 5 秒同步</span><span>最后进展 <time id="collectionLastProgress">—</time></span><span>下次自动重试 <time id="collectionNextRetry">—</time></span></div>
             <details class="collection-quality"><summary>查看字段完整度</summary><div id="collectionQualitySummary"></div></details>
           </section>
+          <details class="local-monitor-panel" id="localMonitorPanel">
+            <summary><strong>后台巡检</strong><span id="localMonitorStatus" role="status">正在读取状态</span></summary>
+            <div class="local-monitor-content">
+              <p id="localMonitorFrequency">巡检由本地服务独立执行。</p>
+              <p id="localMonitorCheckSummary">正在读取最近检查记录。</p>
+              <p id="localMonitorEmpty">暂无需要通知的事件。</p>
+              <ol id="localMonitorEvents" aria-label="最近巡检事件" hidden></ol>
+            </div>
+          </details>
           <section class="view-panel is-active" data-view="task" aria-labelledby="taskTitle">
             <div class="page-heading">
               <div>
@@ -153,7 +163,7 @@
                 <input id="storeFileInput" type="file" accept=".xlsx" hidden />
                 <button class="upload-zone" type="button" id="uploadZone">
                   <i data-lucide="file-spreadsheet" aria-hidden="true"></i>
-                  <span><strong id="uploadedFilename">选择店铺文件</strong><small>每行一个 Amazon 店铺链接 · Agent 将访问店铺并枚举商品</small></span>
+                  <span><strong id="uploadedFilename">选择店铺文件</strong><small>每行一个 Amazon 店铺链接 · 自动识别国家并切换站点</small></span>
                   <i data-lucide="upload" aria-hidden="true"></i>
                 </button>
 
@@ -248,7 +258,8 @@
                     <input id="useSellerSpriteToggle" type="checkbox" />
                     <i aria-hidden="true"></i>
                   </label>
-
+                  <p class="analysis-requirement" id="sellerSpriteSetupStatus" role="status">关闭时仅读取 Amazon 购买量提示；缺失月销量标记为未知。</p>
+                  <a class="text-button" href="https://open.sellersprite.com/mcp?language=zh-cn" target="_blank" rel="noopener noreferrer">SellerSprite 官方配置说明</a>
                 </div>
 
                 <label class="toggle-line">
@@ -263,7 +274,7 @@
                 <div class="analysis-actions">
                   <button class="secondary-button" type="button" id="connectSellerSpriteButton" hidden>
                     <i data-lucide="plug" aria-hidden="true"></i>
-                    授权 SellerSprite
+                    连接 SellerSprite
                   </button>
                   <button class="primary-button" type="button" id="startAnalysisButton" disabled>
                     <i data-lucide="play" aria-hidden="true"></i>
@@ -356,11 +367,20 @@
               <span>本次仅使用 Amazon 官网商品页；未授权、未调用 SellerSprite。</span>
             </div>
 
+            <section class="monthly-sales-panel" role="status" aria-labelledby="monthlySalesTitle">
+              <div class="monthly-sales-heading">
+                <h2 id="monthlySalesTitle">月销量覆盖</h2>
+                <span>未知销量不等于低于 50</span>
+              </div>
+              <p class="monthly-sales-totals" id="monthlySalesCoverage">月销量覆盖待载入</p>
+              <p class="monthly-sales-detail" id="monthlySalesCoverageDetail">全部源 ASIN 保留在任务记录中。</p>
+            </section>
+
             <section class="results-filter-panel" id="resultsAmazonFilters" aria-labelledby="resultsAmazonFiltersTitle">
               <div class="results-filter-heading">
                 <div>
-                  <h2 id="resultsAmazonFiltersTitle">Amazon 官网筛选</h2>
-                  <p>筛选只改变当前显示，全部已抓取 ASIN 始终保留在候选商品中。</p>
+                  <h2 id="resultsAmazonFiltersTitle">商品数据筛选</h2>
+                  <p>筛选只改变当前显示，全部已抓取 ASIN 保留在任务记录；未知月销量单独统计。</p>
                 </div>
                 <div class="results-filter-actions">
                   <button class="text-button" type="button" id="clearFiltersButton">恢复默认</button>
@@ -373,9 +393,9 @@
               <div class="results-filter-grid">
                 <label class="filter-line filter-line-direct">
                   <i data-lucide="chart-no-axes-column-increasing" aria-hidden="true"></i>
-                  <span>Amazon 月销量</span>
-                  <select class="filter-select" id="monthlySalesBand" aria-label="Amazon 页面月销量档位">
-                    <option value="all">全部合格月销量（须明确标识 50+）</option>
+                  <span>近 30 天销量</span>
+                  <select class="filter-select" id="monthlySalesBand" aria-label="有效月销量档位">
+                    <option value="all">全部合格月销量（有效值 ≥50）</option>
                     <option value="50_to_100">50+（50–&lt;100）</option>
                     <option value="100_plus">100+（≥100）</option>
                   </select>
@@ -568,7 +588,7 @@
 
           <section class="detail-tab-panel is-active" id="amazonPanel" role="tabpanel" aria-labelledby="amazonTab" data-detail-panel="amazon">
             <dl class="metric-list" id="amazonMetrics"></dl>
-            <div class="source-note" id="sellerSpriteSourceNote" data-mode="idle"><i data-lucide="plug" aria-hidden="true"></i><span>等待一次手动授权 SellerSprite，数据来源尚未确认。</span></div>
+            <div class="source-note" id="sellerSpriteSourceNote" data-mode="idle"><i data-lucide="plug" aria-hidden="true"></i><span>等待一次手动连接 SellerSprite，数据来源尚未确认。</span></div>
           </section>
 
           <section class="detail-tab-panel" id="suppliersPanel" role="tabpanel" aria-labelledby="suppliersTab" aria-hidden="true" data-detail-panel="suppliers">
@@ -868,8 +888,8 @@
         <header><h2 id="contextDialogTitle">当前计算口径</h2><button class="icon-button" type="button" id="closeContextButton" aria-label="关闭" title="关闭"><i data-lucide="x" aria-hidden="true"></i></button></header>
         <ul>
           <li id="marketScopeNote">当前站点：Amazon <span data-market-name>荷兰站</span>，销售币种 <span data-market-currency>EUR</span>，采购币种 CNY，配送地区 <span data-market-region>未设置</span>。</li>
-          <li>Amazon 指标：仅调用 Codex 中已配置 SellerSprite MCP 的“ASIN 详情”；密钥只由本地服务读取。</li>
-          <li>店铺流程：Agent 访问 Amazon 店铺并枚举全部源 ASIN，再逐个交给 SellerSprite 分析；父 ASIN 只作为关联字段，不合并删除源 ASIN。</li>
+          <li>Amazon 指标：默认读取 Amazon 官网；主动启用并连接 SellerSprite 后，按当前站点和 ASIN 查询近月销量。密钥只由本地服务读取。</li>
+          <li>店铺流程：程序访问 Amazon 店铺并保留全部源 ASIN，再按选择的数据源分析；未配置 SellerSprite 不影响 Amazon 模式。父 ASIN 不合并删除源 ASIN。</li>
           <li>数据模式：实时、混合估算与模拟演示始终在顶栏和商品详情中标记。</li>
           <li>我们的售价：<span data-sale-price-policy>与竞品当前售价 EUR 相同</span>；产品人员单品覆盖后，以人工售价重算。</li>
           <li>目标采购成本：<span data-target-cost-policy>我们的售价 EUR × 当地币种兑 CNY 汇率 ÷ 5</span>。</li>

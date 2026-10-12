@@ -27,7 +27,7 @@ const evaluate = (item, criteria = {}) => evaluateAnalysisProduct(item, { runSta
 test("unknown or numeric-only monthly sales cannot enter the default all candidate scope", () => {
   for (const sales30 of [undefined, null, 0, 50, 100, 1200]) {
     const result = evaluate(product({ sales30, sales30Evidence: null }));
-    assert.equal(result.filter.decision, "excluded");
+    assert.equal(result.filter.decision, "pending");
     assert.ok(result.filter.reasons.includes("MONTHLY_SALES_EVIDENCE_MISSING"));
     assert.ok(!result.filter.reasons.includes("MONTHLY_SALES_BELOW_50"));
     assert.equal(result.amazon_observations.monthly_sales, null);
@@ -38,9 +38,9 @@ test("pending detail collection without a monthly-purchase badge stays outside c
   const item = product({ detailStatus: "pending", sales30: null, sales30Evidence: null });
   const result = classifyAnalysisProducts({ runState, products: [item] });
   assert.equal(result.passed.length, 0);
-  assert.equal(result.pending.length, 0);
-  assert.equal(result.excluded.length, 1);
-  assert.ok(result.excluded[0].filter.reasons.includes("AMAZON_DETAIL_NOT_COMPLETE"));
+  assert.equal(result.pending.length, 1);
+  assert.equal(result.excluded.length, 0);
+  assert.ok(result.pending[0].filter.reasons.includes("AMAZON_DETAIL_NOT_COMPLETE"));
 });
 
 test("verified 50+, 100+, 200+, and larger current-product badges qualify and sales bands still apply", () => {
@@ -69,7 +69,7 @@ test("unrelated, third-party, or non-monthly badge evidence cannot qualify a han
     { rawText: "100+ reviews" }, { value: 100, rawText: "50+ bought in past month" },
   ]) {
     const result = evaluate(product({ sales30: 100, sales30Evidence: evidence(50, override) }));
-    assert.equal(result.filter.decision, "excluded");
+    assert.equal(result.filter.decision, "pending");
     assert.equal(result.amazon_observations.monthly_sales, null);
   }
 });
@@ -97,5 +97,23 @@ test("policy evaluation never rewrites existing procurement handoff records", ()
   const pack = createAnalysisHandoffPackage({ runState, products: [item] });
   assert.equal(pack.products.length, 0);
   assert.deepEqual(item, original);
-  assert.equal(getAnalysisFormulaContract().amazon_monthly_sales_policy.missing_evidence, "unknown_and_excluded");
+  assert.equal(getAnalysisFormulaContract().amazon_monthly_sales_policy.missing_evidence, "unknown_and_pending");
+});
+
+
+test("same-ASIN SellerSprite evidence follows the enabled source in handoff filtering and manual selection", () => {
+  const item = product({ marketplace: "US", analysisSourceMode: "amazon_sellsprite", sales30: 123,
+    sales30Evidence: { source: "sellsprite_api", sourceTool: "competitor_lookup", field: "amzUnit", scope: "asin",
+      asin: "B000000001", marketplace: "US", providerMarketplace: "US", period: "past_month", kind: "estimate", value: 123 } });
+  const enabled = { runState, products: [item], criteria: { useSellerSprite: true } };
+  const record = evaluate(item, enabled.criteria);
+  assert.equal(record.filter.decision, "pass");
+  assert.equal(record.amazon_observations.monthly_sales, 123);
+  assert.equal(record.amazon_observations.monthly_sales_source, "sellsprite_api");
+  assert.equal(selectManuallyReviewedProducts(enabled).length, 1);
+  assert.equal(createAnalysisHandoffPackage(enabled).products.length, 1);
+  const disabled = { ...enabled, criteria: { useSellerSprite: false } };
+  assert.equal(selectManuallyReviewedProducts(disabled).length, 0);
+  assert.equal(evaluate(item, disabled.criteria).amazon_observations.monthly_sales, null);
+  assert.equal(selectManuallyReviewedProducts({ ...enabled, products: [{ ...item, marketplace: "AU" }] }).length, 0);
 });

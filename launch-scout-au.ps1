@@ -2,7 +2,8 @@ param(
   [switch]$ForceRestart,
   [switch]$NoBrowser,
   [switch]$KeepServiceAlive,
-  [switch]$NoWatchdog
+  [switch]$NoWatchdog,
+  [switch]$Skip1688Startup
 )
 
 $ErrorActionPreference = "Stop"
@@ -114,7 +115,7 @@ function Stop-OutdatedScoutService {
       throw "The Node listener on port 4173 is not this Scout service."
     }
   } elseif (-not [string]::IsNullOrWhiteSpace($listenerProcess.Path)) {
-    $expectedNodePath = [System.IO.Path]::GetFullPath((Get-Command node -ErrorAction Stop).Source)
+    $expectedNodePath = [System.IO.Path]::GetFullPath((Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
     $listenerNodePath = [System.IO.Path]::GetFullPath($listenerProcess.Path)
     if (-not [string]::Equals($listenerNodePath, $expectedNodePath, [System.StringComparison]::OrdinalIgnoreCase)) {
       throw "The listener on port 4173 is not using the expected Node runtime."
@@ -149,7 +150,7 @@ if (-not (Test-Path -LiteralPath $logRoot)) {
   New-Item -ItemType Directory -Path $logRoot | Out-Null
 }
 
-$nodePath = (Get-Command node -ErrorAction Stop).Source
+$nodePath = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 if ($ForceRestart -or -not (Test-ScoutService)) {
   Stop-OutdatedScoutService
   # Scout starts independently; 1688 recovery remains an explicit in-app action.
@@ -193,13 +194,15 @@ Start-ScoutWatchdog
 
 # Start the 1688 procurement assistant bridge alongside Scout (best-effort;
 # the in-app 1688 flows can also start it on demand via /api/1688/service/recover).
-try {
-  $dependencyScript = Join-Path $projectRoot "scripts\start-1688-dependency.mjs"
-  Start-Process -FilePath $nodePath `
-    -ArgumentList @($dependencyScript) `
-    -WorkingDirectory $projectRoot `
-    -WindowStyle Hidden | Out-Null
-} catch {}
+if (-not $Skip1688Startup) {
+  try {
+    $dependencyScript = Join-Path $projectRoot "scripts\start-1688-dependency.mjs"
+    Start-Process -FilePath $nodePath `
+      -ArgumentList @($dependencyScript) `
+      -WorkingDirectory $projectRoot `
+      -WindowStyle Hidden | Out-Null
+  } catch {}
+}
 
 if (-not $NoBrowser) {
   $edgeCandidates = @(

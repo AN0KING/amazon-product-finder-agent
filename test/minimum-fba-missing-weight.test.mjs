@@ -100,7 +100,7 @@ test('50+ candidates can pass preliminary screening while cost, price and weight
   assert.ok(record.preliminary_profit.missing_inputs.includes('purchaseCostCny'));
   assert.ok(record.preliminary_profit.missing_inputs.includes('salePrice'));
   const noSales = evaluateAnalysisProduct({ ...item, sales30Evidence: null });
-  assert.equal(noSales.filter.decision, 'excluded');
+  assert.equal(noSales.filter.decision, 'pending');
   assert.ok(noSales.filter.reasons.includes('MONTHLY_SALES_EVIDENCE_MISSING'));
 });
 

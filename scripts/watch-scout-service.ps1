@@ -63,7 +63,7 @@ try {
             if ($otherListener) { throw 'Port 4173 is occupied by an unverified process; it was not modified.' }
             Write-WatchdogEvent 'Scout process is absent; restoring the local service.'
           }
-          & $launcherPath -NoBrowser -NoWatchdog
+          & $launcherPath -NoBrowser -NoWatchdog -Skip1688Startup
           $unhealthyChecks = 0
           Write-WatchdogEvent 'Local service restored; its saved background task will resume automatically.'
         }

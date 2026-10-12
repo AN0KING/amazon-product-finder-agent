@@ -12,7 +12,7 @@ const page = body => `<html><body><input id="ASIN" value="${asin}"><h1 id="produ
 const parse = body => parseAmazonProductPage(page(body), { marketplace: "CA", asin });
 
 test("new detail results identify the corrected parser without a price migration", () => {
-  assert.equal(AMAZON_PRODUCT_DETAIL_PARSER_VERSION, 6);
+  assert.equal(AMAZON_PRODUCT_DETAIL_PARSER_VERSION, 7);
 });
 
 test("makeup bag total stays 9.59 beside a separate 3.20/count amount", () => {
@@ -194,4 +194,56 @@ test("context does not replace a failed request reason or invent an observed ASI
   const result = auditAmazonProductFields({ ...parsed, detailStatus: "failed", detailErrorCode: "AMAZON_HTTP_429", detailRetryable: true });
   assert.equal(result.fields.price.reason, "request_failed");
   assert.equal(result.fields.price.retryable, true);
+});
+
+
+// Synthetic A/B markup exercises alternate layouts without claiming any live
+// Amazon response has supplied a missing quantity.
+test('monthly purchase extraction supports feature containers and ordinary main-header text', () => {
+  const cases = [
+    '<div id="socialProofingAsinFaceout_feature_div"><div>50+ bought in past month</div></div>',
+    '<div data-feature-name="socialProofingAsinFaceout"><p>100+ bought in past month</p></div>',
+    '<div id="centerCol"><span class="a-color-secondary">50+ bought in past month</span></div>',
+    '<div id="title_feature_div"><p>50+ bought in past month</p></div>',
+    '<span id="social-proofing-faceout-title-tk_bought" aria-label="50+ bought in past month"><b>50+</b></span>',
+  ];
+  for (const body of cases) {
+    const result = parse(body);
+    assert.ok(result.sales30 >= 50, body);
+    assert.equal(result.sales30Evidence.asin, asin);
+    assert.equal(result.sales30Evidence.kind, 'lower_bound');
+    assert.equal(result.sales30Evidence.period, 'past_month');
+  }
+});
+
+test('localized and full-width purchase markers remain lower bounds in detail evidence', () => {
+  for (const text of ['５０＋ bought in past month', 'Plus de 50 achetés au cours du mois dernier', '100+ Mal im letzten Monat gekauft']) {
+    const result = parse(`<div id="socialProofingAsinFaceout_feature_div">${text}</div>`);
+    assert.equal(result.sales30Evidence.kind, 'lower_bound', text);
+    assert.equal(result.sales30Evidence.rawText, text);
+  }
+});
+
+test('new main-header fallback never borrows another ASIN, user text or recommendation', () => {
+  for (const wrapper of [
+    `id="recommendations"`, `data-asin="${otherAsin}"`, `hidden`, `class="a-carousel"`,
+    `data-hook="review-body"`, `id="productDescription"`, `id="feature-bullets"`, `id="aplus"`,
+    `id="CardInstance-unattributed"`,
+  ]) {
+    const result = parse(`<div id="centerCol"><div ${wrapper}><span>100+ bought in past month</span></div></div>`);
+    assert.equal(result.sales30, null, wrapper);
+  }
+  assert.equal(parse(`<div id="socialProofingAsinFaceout_feature_div"><div data-asin="${otherAsin}">50+ bought in past month</div></div>`).sales30, null);
+  assert.equal(parse('<div id="centerCol"><span>100+ bought in past month for another product</span></div>').sales30, null);
+});
+
+test('a modern product component must identify the current ASIN to supply its badge', () => {
+  assert.equal(parse(`<div id="CardInstance-main" data-asin="${asin}"><div id="socialProofingAsinFaceout_feature_div">50+ bought in past month</div></div>`).sales30, 50);
+  assert.equal(parse(`<div id="recommendations"><div id="CardInstance-main" data-asin="${asin}"><div id="socialProofingAsinFaceout_feature_div">50+ bought in past month</div></div></div>`).sales30, null);
+});
+
+test('conflicting current product badges do not pick the first quantity', () => {
+  const result = parse('<span class="social-proofing-faceout-title-text">50+ bought in past month</span><span class="social-proofing-faceout-title-text">200+ bought in past month</span>');
+  assert.equal(result.sales30, null);
+  assert.equal(result.sales30Evidence, null);
 });

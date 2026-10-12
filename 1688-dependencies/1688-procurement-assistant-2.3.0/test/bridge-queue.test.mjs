@@ -19,10 +19,11 @@ async function harness(t) {
   let verifies = 0;
   let spawns = 0;
   let dispatchImpl = async () => ({ offers: [] });
+  let writeFileImpl = (...args) => fs.writeFile(...args);
   let clock = Date.now();
   const spawned = [];
   const context = vm.createContext({
-    crypto, fsp: fs, path, Buffer, URL, setTimeout, clearTimeout, fileURLToPath, pathToFileURL, StringDecoder,
+    crypto, fsp: { ...fs, writeFile: (...args) => writeFileImpl(...args) }, path, Buffer, URL, setTimeout, clearTimeout, fileURLToPath, pathToFileURL, StringDecoder,
     serverUrl: pathToFileURL(path.join(dir, 'server.mjs')).href,
     process: { env: {}, pid: process.pid, execPath: process.execPath, stdout: { write: () => true } },
     ImageSearchRatePolicy: class extends ImageSearchRatePolicy { constructor(options) { super({ ...options, now: () => clock }); } },
@@ -48,7 +49,7 @@ async function harness(t) {
     .replace('const LOGIN_READY_TIMEOUT_MS = 40_000;', 'const LOGIN_READY_TIMEOUT_MS = 10;');
   source = source.slice(0, source.lastIndexOf('\nmain().catch'));
   source += `\nglobalThis.api = { tasks, taskQueue, searchPolicy, auth, pumpQueue, executeTask, applyTaskError,
-    publicTask, publicAuth, queueSummary, handleRequest, handleConfirmTask, handleResumeQueue, openLogin,
+    publicTask, publicAuth, queueSummary, handleRequest, handleConfirmTask, handleResumeQueue, handleStartRateTrial, openLogin,
     spawnLoginChild, loginChildAlive, loadTasksFromDisk, healthPayload,
     ready: () => { queueReady = true; }, child: () => loginChild,
     flush: async () => { await logWriteQueue; }, cleanup: () => { cancelQueueWake(); queueReady = false; } };`;
@@ -61,7 +62,17 @@ async function harness(t) {
   return { ...api, dir, spawned,
     logText: async () => { await api.flush(); return fs.readFile(path.join(dir, 'data', 'sourcing-console', 'logs', 'service.log'), 'utf8'); },
     counts: () => ({ calls, verifies, spawns }),
-    dispatch: impl => { dispatchImpl = impl; }, advance: ms => { clock += ms; },
+    dispatch: impl => { dispatchImpl = impl; }, advance: ms => { clock += ms; }, now: () => clock,
+    writeFile: impl => { writeFileImpl = impl; },
+    post: async (url, payload) => {
+      let status, body;
+      const request = new EventEmitter(); request.method = 'POST'; request.url = url;
+      const work = api.handleRequest(request, { writeHead: value => { status = value; }, end: value => { body = JSON.parse(value); } });
+      request.emit('data', Buffer.from(JSON.stringify(payload)));
+      request.emit('end');
+      await work;
+      return { status, body };
+    },
     get: async url => {
       let status, body;
       await api.handleRequest({ method: 'GET', url }, { writeHead: value => { status = value; }, end: value => { body = JSON.parse(value); } });
@@ -151,7 +162,7 @@ test('explicit resume refuses missing proof, then requeues only after confirmati
   assert.equal(result.queue.ratePolicy.manualResumeRequired, false);
   assert.equal(h.tasks.get('risk').status, 'queued');
   assert.equal(h.counts().calls, 0);
-  assert.equal(h.searchPolicy.waitMs(), 30_000);
+  assert.equal(h.searchPolicy.waitMs(), 18_000);
 });
 
 test('429 enters a shared persisted cooldown and bounded retry instead of a manual pause', async t => {
@@ -295,4 +306,261 @@ test('canceled stale attempts cannot replace a new phase or error or prove manua
   assert.equal(h.searchPolicy.view().manualResumeRequired, true);
   assert.equal(h.searchPolicy.view().manualVerificationCompletedAt, null);
   assert.doesNotMatch(await h.logText(), /\[image-search-verification\] verified_result/);
+});
+
+const rateTrialConfig = { confirmed: true, startPerHour: 90, stepPerHour: 10, stageDurationMs: 3_600_000 };
+
+test('rate-trial API strictly validates the approved parameters without starting work', async t => {
+  const h = await harness(t);
+  const initial = await h.get('/api/v1/queue/rate-trial');
+  assert.equal(initial.status, 200);
+  assert.equal(initial.body.ratePolicy.rateTrial, null);
+  for (const payload of [null, [], {}, { confirmed: true },
+    { ...rateTrialConfig, confirmed: 'true' }, { ...rateTrialConfig, startPerHour: 100 },
+    { ...rateTrialConfig, startPerHour: '90' }, { ...rateTrialConfig, stepPerHour: 20 },
+    { ...rateTrialConfig, stageDurationMs: 1_800_000 }, { ...rateTrialConfig, override: true },
+  ]) {
+    await assert.rejects(h.post('/api/v1/queue/rate-trial', payload), { status: 422, code: 'RATE_TRIAL_INPUT_INVALID' });
+    assert.equal(h.searchPolicy.view().rateTrial, null);
+  }
+  assert.deepEqual(h.counts(), { calls: 0, verifies: 0, spawns: 0 });
+});
+
+test('rate-trial API is idempotent and does not count hours while the queue has no real searches', async t => {
+  const h = await harness(t);
+  h.ready();
+  const first = await h.post('/api/v1/queue/rate-trial', rateTrialConfig);
+  assert.equal(first.status, 200);
+  assert.equal(first.body.ok, true);
+  const initial = first.body.queue.ratePolicy.rateTrial;
+  assert.equal(initial.status, 'waiting');
+  assert.equal(initial.targetPerHour, 90);
+  assert.equal(initial.currentStage, null);
+  assert.equal(initial.gapMs, 40_000);
+  h.advance(2 * 3_600_000);
+  await h.pumpQueue();
+  const reread = await h.get('/api/v1/queue/rate-trial');
+  const repeated = await h.post('/api/v1/queue/rate-trial', rateTrialConfig);
+  assert.deepEqual(reread.body.ratePolicy.rateTrial, initial);
+  assert.deepEqual(repeated.body.queue.ratePolicy.rateTrial, initial);
+  assert.deepEqual(h.counts(), { calls: 0, verifies: 0, spawns: 0 });
+  h.tasks.set('fresh', task('fresh'));
+  const realStart = h.now();
+  await h.executeTask('fresh');
+  const trial = h.searchPolicy.view().rateTrial;
+  assert.equal(trial.currentStage.startedAt, realStart);
+  assert.equal(trial.currentStage.started, 1);
+  assert.equal(trial.currentStage.succeeded, 1);
+  assert.equal(trial.targetPerHour, 90);
+  assert.equal(trial.lastPassedPerHour, null);
+  const repeatedAfterWork = await h.handleStartRateTrial(rateTrialConfig);
+  assert.deepEqual(repeatedAfterWork.queue.ratePolicy.rateTrial, trial);
+});
+
+test('rate-trial API preserves policy error status and an existing trial instead of replacing it', async t => {
+  const h = await harness(t);
+  h.searchPolicy.loaded = false;
+  await assert.rejects(h.handleStartRateTrial(rateTrialConfig), { status: 503, code: 'RATE_POLICY_NOT_READY' });
+  h.searchPolicy.loaded = true;
+  await h.searchPolicy.startTrial({ startPerHour: 80, stepPerHour: 10, stageDurationMs: 3_600_000 });
+  const before = h.searchPolicy.view().rateTrial;
+  await assert.rejects(h.handleStartRateTrial(rateTrialConfig), { status: 409, code: 'RATE_TRIAL_EXISTS' });
+  assert.deepEqual(h.searchPolicy.view().rateTrial, before);
+  assert.deepEqual(h.counts(), { calls: 0, verifies: 0, spawns: 0 });
+});
+
+test('rate-trial API refuses an in-flight search without creating or resetting rate state', async t => {
+  const h = await harness(t);
+  let signalStarted, release;
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  const pending = new Promise(resolve => { release = resolve; });
+  h.dispatch(async () => { signalStarted(); await pending; return { offers: [] }; });
+  h.tasks.set('busy', task('busy')); h.taskQueue.push('busy');
+  h.ready();
+  const pumping = h.pumpQueue();
+  await started;
+  try {
+    await assert.rejects(h.post('/api/v1/queue/rate-trial', rateTrialConfig), { status: 409, code: 'RATE_TRIAL_BUSY' });
+    assert.equal(h.searchPolicy.view().rateTrial, null);
+    assert.equal(h.tasks.get('busy').status, 'running');
+  } finally { release(); await pumping; }
+  assert.equal(h.counts().calls, 1);
+});
+
+test('executeTask persists successful trial results and releases each reservation for the next product', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  h.dispatch(async () => { h.advance(2000); return { offers: [], imageId: 'matched-image' }; });
+  for (const id of ['first-trial-product', 'second-trial-product']) {
+    h.tasks.set(id, task(id));
+    await h.executeTask(id);
+    assert.equal(h.tasks.get(id).status, 'review_candidates');
+    assert.equal(h.tasks.get(id).imageId, 'matched-image');
+    h.advance(40_000);
+  }
+  const trial = h.searchPolicy.view().rateTrial;
+  assert.equal(trial.currentStage.started, 2);
+  assert.equal(trial.currentStage.succeeded, 2);
+  assert.equal(trial.currentStage.failed, 0);
+  assert.equal(trial.currentStage.pending, 0);
+  assert.equal(trial.activeSearch, null);
+  const persisted = JSON.parse(await fs.readFile(h.searchPolicy.file, 'utf8'));
+  assert.equal(persisted.rateTrial.currentStage.succeeded, 2);
+  assert.equal(persisted.rateTrial.activeSearch, null);
+  assert.equal(h.counts().calls, 2);
+});
+
+test('executeTask records a slider failure in the trial report and keeps all later searches paused', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  h.tasks.set('challenged', task('challenged')); h.tasks.set('later', task('later'));
+  h.dispatch(async () => {
+    h.advance(12_000);
+    throw Object.assign(new Error('请完成滑块验证'), { code: 'RISK_CONTROL' });
+  });
+  await h.executeTask('challenged');
+  const trial = h.searchPolicy.view().rateTrial;
+  assert.equal(h.tasks.get('challenged').status, 'risk_blocked');
+  assert.equal(trial.status, 'stopped_risk');
+  assert.equal(trial.currentStage.started, 1);
+  assert.equal(trial.currentStage.succeeded, 0);
+  assert.equal(trial.currentStage.failed, 1);
+  assert.equal(trial.currentStage.pending, 0);
+  assert.equal(trial.activeSearch, null);
+  assert.equal(trial.trigger.targetPerHour, 90);
+  assert.equal(trial.trigger.elapsedMs, 12_000);
+  assert.equal(trial.trigger.failed, 1);
+  assert.equal(trial.trigger.previousPassedPerHour, null);
+  const persisted = JSON.parse(await fs.readFile(h.searchPolicy.file, 'utf8'));
+  assert.equal(persisted.rateTrial.trigger.failed, 1);
+  assert.equal(persisted.rateTrial.activeSearch, null);
+  const repeated = await h.handleStartRateTrial(rateTrialConfig);
+  assert.equal(repeated.queue.ratePolicy.manualResumeRequired, true);
+  assert.deepEqual(repeated.queue.ratePolicy.rateTrial, trial);
+  h.advance(3_600_000);
+  await h.executeTask('later');
+  assert.equal(h.counts().calls, 1);
+  assert.equal(h.tasks.get('later').status, 'queued');
+  assert.equal(h.searchPolicy.view().manualResumeRequired, true);
+  assert.deepEqual(h.searchPolicy.view().rateTrial.trigger, trial.trigger);
+});
+
+test('executeTask releases and records a completed search even when saving its final task snapshot fails', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  h.tasks.set('save-failure', task('save-failure'));
+  let taskWrites = 0;
+  h.writeFile(async (file, ...args) => {
+    if (path.basename(file) === 'save-failure.json' && ++taskWrites === 2) {
+      throw Object.assign(new Error('task snapshot write failed'), { code: 'EIO' });
+    }
+    return fs.writeFile(file, ...args);
+  });
+  await assert.rejects(h.executeTask('save-failure'), { code: 'EIO' });
+  assert.equal(h.counts().calls, 1);
+  const trial = h.searchPolicy.view().rateTrial;
+  assert.equal(trial.currentStage.started, 1);
+  assert.equal(trial.currentStage.succeeded, 1);
+  assert.equal(trial.currentStage.pending, 0);
+  assert.equal(trial.activeSearch, null);
+});
+
+for (const persistentFailure of [false, true]) {
+  test('a ' + (persistentFailure ? 'persistent' : 'single') + ' trial result write failure pauses pending work without repeated dispatch or queue spinning', async t => {
+    const h = await harness(t);
+    await h.handleStartRateTrial(rateTrialConfig);
+    for (const id of ['finished-unrecorded', 'pending-second']) {
+      h.tasks.set(id, task(id)); h.taskQueue.push(id);
+    }
+    const persist = h.searchPolicy.persist.bind(h.searchPolicy);
+    let resultWrites = 0, reservations = 0;
+    const beginSearch = h.searchPolicy.beginSearch.bind(h.searchPolicy);
+    h.searchPolicy.beginSearch = async options => {
+      reservations++;
+      // Fail a regressed requeue loop deterministically instead of hanging
+      // the test worker on an endless chain of resolved microtasks.
+      if (reservations > 2) throw new Error('unexpected repeated reservation loop');
+      return beginSearch(options);
+    };
+    h.dispatch(async () => {
+      // The next rate window has already opened when result persistence fails.
+      h.advance(60_000);
+      h.searchPolicy.persist = async () => {
+        resultWrites++;
+        if (persistentFailure || resultWrites === 1) {
+          throw Object.assign(new Error('trial result disk unavailable'), { code: 'EIO' });
+        }
+        return persist();
+      };
+      return { offers: [], imageId: 'preserved-image' };
+    });
+    h.ready();
+    await h.pumpQueue();
+    const policy = h.searchPolicy.view();
+    assert.equal(h.counts().calls, 1);
+    assert.equal(reservations, 1);
+    assert.equal(resultWrites, 2); // Failed result, then attempted durable pause.
+    assert.equal(policy.manualResumeRequired, true);
+    assert.equal(policy.pausedReason, 'RATE_TRIAL_RECORD_FAILED');
+    assert.equal(policy.blockedTaskId, 'finished-unrecorded');
+    assert.equal(policy.rateTrial.status, 'stopped_manual');
+    assert.equal(policy.rateTrial.activeSearch.taskId, 'finished-unrecorded');
+    assert.equal(policy.rateTrial.currentStage.succeeded, 0);
+    assert.equal(policy.rateTrial.currentStage.pending, 1);
+    assert.equal(h.tasks.get('finished-unrecorded').status, 'review_candidates');
+    assert.equal(h.tasks.get('finished-unrecorded').imageId, 'preserved-image');
+    assert.equal(h.tasks.get('pending-second').status, 'queued');
+    assert.deepEqual(Array.from(h.taskQueue), ['pending-second']);
+    const savedTask = JSON.parse(await fs.readFile(path.join(h.dir, 'data', 'sourcing-console', 'tasks', 'finished-unrecorded.json'), 'utf8'));
+    assert.equal(savedTask.status, 'review_candidates');
+    const savedPolicy = JSON.parse(await fs.readFile(h.searchPolicy.file, 'utf8'));
+    assert.equal(savedPolicy.rateTrial.activeSearch.taskId, 'finished-unrecorded');
+    if (!persistentFailure) assert.equal(savedPolicy.pausedReason, 'RATE_TRIAL_RECORD_FAILED');
+    h.advance(3_600_000);
+    await h.pumpQueue();
+    await h.pumpQueue();
+    assert.equal(h.counts().calls, 1);
+    assert.equal(reservations, 1);
+    assert.equal(resultWrites, 2);
+    assert.deepEqual(Array.from(h.taskQueue), ['pending-second']);
+  });
+}
+
+test('an outstanding result reservation alone prevents dequeue and an empty requeue loop', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  await h.searchPolicy.beginSearch({ taskId: 'awaiting-result-record' });
+  h.advance(60_000);
+  h.tasks.set('pending-second', task('pending-second')); h.taskQueue.push('pending-second');
+  let attempts = 0;
+  const beginSearch = h.searchPolicy.beginSearch.bind(h.searchPolicy);
+  h.searchPolicy.beginSearch = async options => {
+    if (++attempts > 1) throw new Error('unexpected repeated reservation loop');
+    return beginSearch(options);
+  };
+  h.ready();
+  await h.pumpQueue();
+  assert.equal(h.searchPolicy.view().manualResumeRequired, false);
+  assert.equal(attempts, 0);
+  assert.equal(h.counts().calls, 0);
+  assert.equal(h.tasks.get('pending-second').status, 'queued');
+  assert.deepEqual(Array.from(h.taskQueue), ['pending-second']);
+});
+
+test('executeTask propagates the original result-record error if recording the manual pause also fails', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  h.tasks.set('original-error', task('original-error'));
+  const resultError = Object.assign(new Error('original finishSearch disk error'), { code: 'EIO' });
+  const pauseError = Object.assign(new Error('pause disk error'), { code: 'ENOSPC' });
+  let writes = 0;
+  h.dispatch(async () => {
+    h.searchPolicy.persist = async () => { throw ++writes === 1 ? resultError : pauseError; };
+    return { offers: [] };
+  });
+  await assert.rejects(h.executeTask('original-error'), error => error === resultError);
+  assert.equal(writes, 2);
+  assert.equal(h.searchPolicy.view().manualResumeRequired, true);
+  assert.equal(h.searchPolicy.view().pausedReason, 'RATE_TRIAL_RECORD_FAILED');
+  assert.equal(h.counts().calls, 1);
 });

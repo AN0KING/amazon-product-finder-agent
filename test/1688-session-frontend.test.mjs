@@ -8,7 +8,7 @@ import * as pieceCount from "../lib/title-piece-count.mjs";
 import * as handoff from "../lib/analysis-handoff.mjs";
 import * as coverage from "../lib/analysis-coverage.mjs";
 import * as detailRetry from "../lib/amazon-detail-retry.mjs";
-import * as salesPolicy from "../lib/amazon-sales-policy.mjs";
+import * as salesPolicy from "../lib/monthly-sales-policy.mjs";
 
 const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const taskId = "task_synthetic_image_search";
@@ -57,9 +57,9 @@ function harness() {
       imageUrl: 'https://m.media-amazon.com/images/I/fixture.jpg', supplierSearchStatus: 'queue_waiting',
       supplierProcurementTaskId: '${taskId}', manualPurchaseCost: false, reviewStatus: 'pending' }];
     globalThis.scout = {
-      start: start1688Session, load: load1688SessionStatus, poll: poll1688AutoResume,
+      start: start1688Session, load: load1688SessionStatus, poll: poll1688Status,
       apply: (value) => apply1688SessionStatus(value.auth, value.queue, value.imageSearchRecovery),
-      renderMessage: render1688SessionStatusMessage, schedule: schedule1688AutoResumePolling,
+      renderMessage: render1688SessionStatusMessage, schedule: schedule1688StatusPolling,
       resumeAfterVerification: (...args) => resume1688AfterVerification(...args),
       state: () => ({ loggedIn: supplier1688LoggedIn, status: supplier1688Status, auth: supplier1688Auth,
         riskTask: supplier1688RiskTask, riskScope: supplier1688RiskTaskScope, queue: supplier1688Queue }),
@@ -244,7 +244,7 @@ const blockedRuntimes = [
   ["identity not ready", runtime({ auth: { ready: false, reason: "verification_required" } })],
 ];
 for (const [reason, blocked] of blockedRuntimes) {
-  test(`automatic resume polls only cached local status and never resumes while ${reason}`, async () => {
+  test(`status polling only reads cached local status and never resumes while ${reason}`, async () => {
     const fixture = harness();
     fixture.app.apply(runtime());
     fixture.respond(async (path) => {
@@ -257,13 +257,14 @@ for (const [reason, blocked] of blockedRuntimes) {
   });
 }
 
-test("an idle authenticated queue can resume after a local GET without an online identity check", async () => {
+test("an idle authenticated queue stays paused after a local GET until the user explicitly continues", async () => {
   const fixture = harness();
   fixture.app.apply(runtime());
   fixture.respond(async () => runtime());
   await fixture.app.poll();
   assert.deepEqual(fixture.calls.map(({ path, method }) => ({ path, method })), [{ path: "/api/v1/runtime", method: "GET" }]);
-  assert.equal(fixture.resumes(), 1);
+  assert.equal(fixture.resumes(), 0);
+  assert.match(fixture.element("supplier1688StatusText").textContent, /请点击匹配继续/);
 });
 
 test("a failed local status read neither changes a known identity nor resumes business work", async () => {

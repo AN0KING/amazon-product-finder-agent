@@ -4,3 +4,8 @@ node_modules/
 data/
 data-backup-*/
 .diagnostics/
+
+# Local integration credentials; only examples belong in Git.
+config/*.local.toml
+.env
+.env.local

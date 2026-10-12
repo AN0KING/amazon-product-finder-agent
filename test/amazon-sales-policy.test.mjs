@@ -54,3 +54,31 @@ test('badge parsing rejects unrelated quantities, periods, unsafe integers and m
   for (const text of ['50+', '50 ratings in past month', '100+ bought last year', 'bought in past month',
     '999999999999999999999+ bought in past month', '0.5 bought in past month']) assert.equal(parseAmazonMonthlySales(text), null, text);
 });
+
+
+test('localized one-month purchase badges preserve real quantity and separators', () => {
+  for (const [raw, expected] of [
+    ['50+ gekocht in de afgelopen maand', 50],
+    ['100+ Mal im letzten Monat gekauft', 100],
+    ['1.000+ Mal im letzten Monat gekauft', 1000],
+    ['1,5 Tsd.+ Mal im letzten Monat gekauft', 1500],
+    ['Plus de 50 achetés au cours du mois dernier', 50],
+    ['Plus de 1 000 achetés au cours du mois dernier', 1000],
+    ['100+ acquistati nel mese scorso', 100],
+    ['100+ comprados el mes pasado', 100],
+    ['Mais de 1 mil compras no mês passado', 1000],
+    ['Kupiono ponad 50 razy w zeszłym miesiącu', 50],
+    ['过去一个月购买了100件以上', 100],
+    ['過去1か月で100点以上購入されました', 100],
+    ['50\u200b+ bought in past month', 50],
+  ]) assert.equal(parseAmazonMonthlySales(raw), expected, raw);
+});
+
+test('purchase badges require a single complete count and one-month statement', () => {
+  for (const raw of [
+    '1,00+ bought in past month', '1.23+ bought in past month', '1,00,000+ bought in past month',
+    '100+ Mal in den letzten 3 Monaten gekauft', '100+ comprados el año pasado',
+    '100 achetés au cours des 3 derniers mois', '50+ bought in past month and 200+ bought in past year',
+    '50 reviews, 100+ bought in past month', '50+ bought in past month for another product',
+  ]) assert.equal(parseAmazonMonthlySales(raw), null, raw);
+});

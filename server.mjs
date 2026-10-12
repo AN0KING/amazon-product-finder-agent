@@ -1,4 +1,5 @@
 import { amazonMonthlySalesValue } from "./lib/amazon-sales-policy.mjs";
+import { monthlySalesValue } from "./lib/monthly-sales-policy.mjs";
 import "./lib/fetch-proxy.mjs";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -11,6 +12,8 @@ import {
   classifySellerSpriteConnectionError,
   connectSellerSprite,
   getConnectionSummary,
+  getSellerSpriteCapabilities,
+  getSellerSpriteConfigurationStatus,
   resetSellerSpriteClient,
 } from "./lib/sellsprite-client.mjs";
 import {
@@ -23,6 +26,8 @@ import {
 import { checkAmazonConnection } from "./lib/amazon-connection-check.mjs";
 import { AmazonCollectionRunner } from "./lib/amazon-collection-runner.mjs";
 import { SupplierPipelineRunner } from "./lib/supplier-pipeline-runner.mjs";
+import { ProgramMonitor } from "./lib/program-monitor.mjs";
+import { readSupplierMonitoringState } from "./lib/monitor-sources.mjs";
 import { applySupplierProfitResult } from "./lib/supplier-profit-result.mjs";
 import { recomputeProductProfit } from "./lib/product-profit-state.mjs";
 import { auditAmazonProductFields } from "./lib/amazon-detail-quality.mjs";
@@ -117,6 +122,7 @@ const STATIC_FILES = new Map([
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
   ["/lib/amazon-sales-policy.mjs", { file: "lib/amazon-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/lib/monthly-sales-policy.mjs", { file: "lib/monthly-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/profit-model.mjs", { file: "lib/profit-model.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-handoff.mjs", { file: "lib/analysis-handoff.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-coverage.mjs", { file: "lib/analysis-coverage.mjs", type: "text/javascript; charset=utf-8" }],
@@ -207,6 +213,22 @@ const supplierPipeline = new SupplierPipelineRunner({
   applyResult: applySupplierProfitResult,
 });
 let supplierPipelineReady = Promise.resolve();
+const monitorEnabled = process.env.SCOUT_MONITOR_ENABLED !== "0";
+const programMonitor = new ProgramMonitor({
+  statePath: path.join(persistenceStore.directory, "program-monitor.json"),
+  loadAmazon: async () => {
+    await collectorReady;
+    return amazonCollector.status();
+  },
+  loadSupplier1688: async ({ signal }) => {
+    await supplierPipelineReady;
+    return readSupplierMonitoringState({ pipeline: await supplierPipeline.status(), signal });
+  },
+  onError: () => process.stderr.write("Program monitor could not save or refresh its local status.\n"),
+});
+let monitorReady = Promise.resolve();
+let monitorStartupError = null;
+
 
 const server = createServer(async (request, response) => {
   const requestController = new AbortController();
@@ -269,6 +291,14 @@ if (IS_DIRECT_RUN) {
     collectorReady.catch(() => {});
     supplierPipelineReady = supplierPipeline.initialize();
     supplierPipelineReady.catch(error => process.stderr.write(`Supplier pipeline recovery failed: ${error.code || error.message}\n`));
+    if (monitorEnabled) {
+      monitorReady = programMonitor.start();
+      monitorReady.catch(() => {
+        monitorStartupError = "PROGRAM_MONITOR_START_FAILED";
+        process.stderr.write("Program monitor initialization failed.\n");
+      });
+    }
+
   });
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
@@ -309,6 +339,14 @@ async function routeRequest(request, response, url, signal) {
     return;
   }
 
+  if (url.pathname === "/api/monitor") {
+    requireMethod(request, ["GET"]);
+    sendJson(response, 200, { ok: true, data: {
+      ...programMonitor.snapshot(), configured: monitorEnabled, errorCode: monitorStartupError,
+    } });
+    return;
+  }
+
   if (url.pathname === "/api/1688/pipeline") {
     requireMethod(request, ["GET"]);
     await supplierPipelineReady;
@@ -333,9 +371,27 @@ async function routeRequest(request, response, url, signal) {
     return;
   }
 
+  if (url.pathname === "/api/sellsprite/status") {
+    requireMethod(request, ["GET"]);
+    sendJson(response, 200, { ok: true, data: {
+      ...getConnectionSummary(), configuration: await getSellerSpriteConfigurationStatus(),
+      capabilities: getSellerSpriteCapabilities(),
+    } });
+    return;
+  }
+  if (url.pathname === "/api/sellsprite/connect") {
+    requireMethod(request, ["POST"]);
+    requireContentType(request, ["application/json"]);
+    const body = await readJsonBody(request);
+    if (body.confirmed !== true || Object.keys(body).some(key => !["confirmed", "marketplace"].includes(key))) {
+      throw new HttpError(422, "SELLSPRITE_CONFIRMATION_REQUIRED", "请主动确认连接 SellerSprite。");
+    }
+    await handleSellerSpriteConnect(response, signal, validateMarketplace(body.marketplace));
+    return;
+  }
   if (url.pathname === "/api/health") {
     requireMethod(request, ["GET"]);
-    await handleHealth(response, signal);
+    sendJson(response, 200, { ok: true, data: { version: APP_VERSION, ...getConnectionSummary() } });
     return;
   }
   if (url.pathname === "/api/version") {
@@ -732,15 +788,32 @@ async function serveStatic(response, method, descriptor) {
   response.end(method === "HEAD" ? undefined : body);
 }
 
-async function handleHealth(response, signal) {
+export async function connectSellerSpriteForMarketplace(marketplace, { connect = connectSellerSprite, capabilities = getSellerSpriteCapabilities } = {}) {
+  const before = capabilities([], marketplace);
+  if (!before.marketplaceSupported) {
+    throw new HttpError(422, "SELLSPRITE_MARKETPLACE_UNSUPPORTED", `SellerSprite 当前接口不支持 ${marketplace} 站点的月销量，请使用 Amazon 页面数据。`);
+  }
+  const tools = await connect({ timeout: 20_000 });
+  const support = capabilities(tools, marketplace);
+  if (!support.monthlySales.available || !support.monthlySales.marketplaceSupported) {
+    const relatedToolNote = support.relatedCompetitors.available
+      ? " 当前返回的 asin_competitor 用于相关竞品查询，不能替代目标 ASIN 的月销量。" : "";
+    throw new HttpError(422, "SELLSPRITE_TOOL_UNAVAILABLE",
+      "SellerSprite MCP 已连接，但未提供本站点的 competitor_lookup 月销量接口。请在 SellerSprite 官方 MCP 配置中启用该工具，再重新连接。" + relatedToolNote);
+  }
+  return { tools, capabilities: support };
+}
+
+async function handleSellerSpriteConnect(response, signal, marketplace) {
   try {
-    const tools = await connectSellerSprite({ timeout: 20_000 });
+    const { tools, capabilities } = await connectSellerSpriteForMarketplace(marketplace);
     if (signal?.aborted) return;
     const names = tools.map((tool) => tool.name).filter((name) => typeof name === "string").sort();
     sendJson(response, 200, {
       ok: true,
       data: {
         status: "live",
+        capabilities,
         version: APP_VERSION,
         toolCount: names.length,
         tools: names,
@@ -750,9 +823,9 @@ async function handleHealth(response, signal) {
   } catch (error) {
     await resetSellerSpriteClient();
     if (signal?.aborted) return;
-    const failure = classifySellerSpriteConnectionError(error);
-    process.stderr.write(`SellerSprite health check failed: ${safeErrorCode(error)}\n`);
-    sendJson(response, 503, {
+    const failure = error instanceof HttpError ? { code: error.code, message: error.message } : classifySellerSpriteConnectionError(error);
+    process.stderr.write(`SellerSprite connection failed: ${safeErrorCode(error)}\n`);
+    sendJson(response, error instanceof HttpError ? error.status : 503, {
       ok: false,
       error: failure,
       data: { status: "error", version: APP_VERSION, toolCallCount: getConnectionSummary().toolCallCount },
@@ -996,7 +1069,7 @@ async function handleUploadedStoreList(request, response) {
   if (!marketplaceHeader) throw new HttpError(400, "MARKETPLACE_REQUIRED", "X-Marketplace is required.");
   const marketplace = validateMarketplace(marketplaceHeader);
   const buffer = await readBody(request, MAX_STORE_FILE_BYTES);
-  const parsed = await parseStoreListBuffer(buffer, { fileName, marketplace });
+  const parsed = await parseStoreListBuffer(buffer, { fileName, marketplace, detectMarketplace: true });
   sendJson(response, 200, { ok: true, data: parsed });
 }
 
@@ -1014,6 +1087,12 @@ async function handleProductSearch(request, response, signal) {
 }
 
 export async function executeProductSearch(input, signal) {
+  if (input.useSellerSprite) {
+    const capabilities = getSellerSpriteCapabilities(undefined, input.marketplace);
+    if (!capabilities.marketplaceSupported) throw new HttpError(422, "SELLSPRITE_MARKETPLACE_UNSUPPORTED", `SellerSprite 当前不支持 ${input.marketplace} 月销量查询；不能使用其他站点替代。`);
+    if (!getConnectionSummary().connected) throw new HttpError(409, "SELLSPRITE_CONNECT_REQUIRED", "请先主动连接 SellerSprite，再开始查询。");
+    if (!capabilities.monthlySales.available || !capabilities.monthlySales.marketplaceSupported) throw new HttpError(422, "SELLSPRITE_TOOL_UNAVAILABLE", "当前配置没有本站点的月销量查询接口。");
+  }
   const collectedAt = new Date().toISOString();
   const unresolved = [];
   const callableStores = [];
@@ -1943,6 +2022,7 @@ export async function analyzeDiscoveredAsins(
   signal,
   {
     detailLoader = loadSellerSpriteAsinDetail,
+    detailAvailable = detailLoader !== loadSellerSpriteAsinDetail || getSellerSpriteCapabilities().detail.available,
     detailPersistence = persistenceStore,
     competitorLookupLoader = null,
     competitorLookupPersistence = detailPersistence,
@@ -1957,6 +2037,16 @@ export async function analyzeDiscoveredAsins(
   const rateLimitEvents = [];
   for (const target of targets) {
     throwIfAborted(signal);
+    if (!detailAvailable) {
+      const item = normalizeSellerSpriteItem({ asin: target.asin }, {
+        marketplace: input.marketplace, sourceTool: "asin_detail", sourceStore: target.sourceStores[0] || {}, collectedAt, requestedAsin: target.asin,
+      });
+      results.push({ item: { ...item, id: `${input.marketplace}:${target.asin}`, asin: target.asin,
+        sourceAsin: target.asin, sourceStores: target.sourceStores, amazonSales30Evidence: target.sales30Evidence || null,
+        detailStatus: "not_requested", detailError: null, detailAttempts: 0, enrichmentTools: [] },
+        errors: [], cacheHit: false, callCount: 0, rateLimitRetryCount: 0, rateLimitWaitMs: 0 });
+      continue;
+    }
     let callCount = 0;
     let rateLimitRetryCount = 0;
     let rateLimitWaitMs = 0;
@@ -2001,6 +2091,7 @@ export async function analyzeDiscoveredAsins(
             sourceAsin: target.asin,
             sourceAsins: [target.asin],
             sourceStores: target.sourceStores,
+            amazonSales30Evidence: target.sales30Evidence || null,
             enrichmentTools: ["asin_detail"],
             detailStatus: "success",
             detailError: null,
@@ -2539,6 +2630,11 @@ function applyCompetitorLookupCheckpoint(result, target, entry, input, collected
     return;
   }
   result.item = mergeSellerSpriteCompetitorItem(result.item, normalized);
+  if (result.item.detailStatus === "not_requested") {
+    result.item.detailStatus = "success";
+    result.item.detailError = null;
+    result.item.detailErrorCode = null;
+  }
   result.item.competitorLookupStatus = "success";
   result.item.competitorLookupErrorCode = null;
   result.item.competitorLookupError = null;
@@ -2548,8 +2644,9 @@ function applyCompetitorLookupCheckpoint(result, target, entry, input, collected
 
 function mergeSellerSpriteCompetitorItem(primary, competitor) {
   const merged = { ...primary };
+  if (primary.sales30Evidence?.source?.startsWith("amazon_")) merged.amazonSales30Evidence = primary.sales30Evidence;
   const authoritativeFields = [
-    "parentAsin", "title", "currentPrice", "sales30", "salesAmount30", "sales30UpdatedAt", "parentSales30",
+    "parentAsin", "title", "currentPrice", "sales30", "sales30Evidence", "salesAmount30", "sales30UpdatedAt", "parentSales30",
     "parentSalesAmount30", "listingAvailableAt", "rating", "reviewCount", "hasAPlus", "fbaFee", "primePrice",
     "deliveryPrice", "productWeightKg", "fbaPackageWeightKg", "productDimensionsCm", "fbaPackageDimensionsCm",
     "fulfillment", "imageUrl",
@@ -2559,6 +2656,7 @@ function mergeSellerSpriteCompetitorItem(primary, competitor) {
       merged[field] = competitor[field];
     }
   }
+  if (Number.isFinite(competitor.sales30)) merged.sales30Evidence = competitor.sales30Evidence || null;
   merged.parentResolved = Boolean(competitor.parentResolved || primary.parentResolved);
   merged.fieldSources = { ...(primary.fieldSources || {}) };
   for (const [field, source] of Object.entries(competitor.fieldSources || {})) {
@@ -2713,7 +2811,7 @@ async function loadSellerSpriteCompetitorLookup({ runId, marketplace, month, asi
       marketplace,
       month,
       asins,
-      variation: "Y",
+      variation: "N",
       page: 1,
       size: asins.length,
       order: { field: "total_units", desc: true },
@@ -2782,6 +2880,9 @@ function failedSourceAsinResult(target, input, collectedAt, failure, audit = {})
     sellerName: sourceStore.sellerName || null,
     currentPrice: null,
     sales30: null,
+    sales30Evidence: null,
+    amazonSales30Evidence: target.sales30Evidence || null,
+    analysisSourceMode: "amazon_sellsprite",
     sales60: null,
     salesAmount30: null,
     sales30UpdatedAt: null,
@@ -2859,6 +2960,8 @@ function mergeMissingProductFields(primary, secondary) {
     if (secondary.fieldSources?.[field] !== undefined) fieldSources[field] = secondary.fieldSources[field];
   }
   merged.fieldSources = fieldSources;
+  merged.amazonSales30Evidence = primary.amazonSales30Evidence || secondary.amazonSales30Evidence || null;
+  if (merged.sales30 === secondary.sales30 && !primary.sales30Evidence) merged.sales30Evidence = secondary.sales30Evidence || null;
   return merged;
 }
 
@@ -2882,8 +2985,10 @@ export function candidateFilterExclusionReasons(item, filters) {
   const reasons = [];
   const detailPending = String(item?.detailStatus || "").toLowerCase() === "pending";
   const monthlySalesBand = filters.monthlySalesBand || "all";
-  const effectiveMonthlySales = amazonMonthlySalesValue(item);
-  if (effectiveMonthlySales === null || effectiveMonthlySales < 50) {
+  const effectiveMonthlySales = monthlySalesValue(item, filters);
+  if (effectiveMonthlySales === null) {
+    reasons.push("MONTHLY_SALES_EVIDENCE_MISSING");
+  } else if (effectiveMonthlySales < 50) {
     reasons.push("MONTHLY_SALES_BELOW_50");
   } else {
     if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
@@ -2929,7 +3034,12 @@ function extractToolData(result) {
 
 export function normalizeSellerSpriteItem(raw, context) {
   if (!isPlainObject(raw)) return null;
-  const sourceAsin = normalizeAsin(raw.sourceAsin) || normalizeAsin(raw.asin) || normalizeAsin(context.requestedAsin);
+  const requestedAsin = normalizeAsin(context.requestedAsin);
+  const returnedAsin = normalizeAsin(raw.asin) || normalizeAsin(raw.sourceAsin);
+  if ((raw.asin && !normalizeAsin(raw.asin)) || (requestedAsin && returnedAsin && returnedAsin !== requestedAsin)) return null;
+  const sourceAsin = returnedAsin || requestedAsin;
+  const providerMarketplace = sellerSpriteProviderFor(context.marketplace).providerMarketplace;
+  if (raw.marketplace && String(raw.marketplace).toUpperCase() !== providerMarketplace) return null;
   const explicitParentAsin = normalizeAsin(raw.parentAsin) || normalizeAsin(raw.parent) || normalizeAsin(raw.parent_asin);
   const parentAsin = explicitParentAsin || sourceAsin;
   if (!parentAsin) return null;
@@ -2940,9 +3050,13 @@ export function normalizeSellerSpriteItem(raw, context) {
   const currentPrice = firstNonNegativeNumber(raw.currentPrice, raw.price);
   const childSales30 = firstNonNegativeInteger(raw.amzUnit);
   const parentSales30 = context.sourceTool === "competitor_lookup" ? firstNonNegativeInteger(raw.units) : null;
-  const directSales30 = firstNonNegativeInteger(raw.sales30, raw.units30);
   const canUseParentMonthlyData = Boolean(explicitParentAsin && explicitParentAsin === sourceAsin);
-  const sales30 = directSales30 ?? childSales30 ?? (context.sourceTool === "competitor_lookup" && canUseParentMonthlyData ? parentSales30 : null);
+  const sales30 = context.sourceTool === "competitor_lookup" ? childSales30 : null;
+  const sales30Evidence = sales30 !== null && returnedAsin === sourceAsin && providerMarketplace === context.marketplace
+    ? { source: "sellsprite_api", sourceTool: context.sourceTool, period: "past_month", kind: "estimate", scope: "asin",
+      asin: sourceAsin, rawAsin: returnedAsin, marketplace: context.marketplace, providerMarketplace,
+      value: sales30, field: "amzUnit", updatedAt: normalizeDate(raw.amzUnitDate), collectedAt: context.collectedAt }
+    : null;
   const sales60 = firstNonNegativeInteger(raw.sales60, raw.units60);
   const childSalesAmount30 = firstNonNegativeNumber(raw.amzSales);
   const parentSalesAmount30 = context.sourceTool === "competitor_lookup" ? firstNonNegativeNumber(raw.revenue) : null;
@@ -2982,6 +3096,8 @@ export function normalizeSellerSpriteItem(raw, context) {
     averagePrice30: null,
     currentPrice,
     sales30,
+    sales30Evidence,
+    analysisSourceMode: "amazon_sellsprite",
     sales60,
     salesAmount30,
     sales30UpdatedAt,
@@ -3737,9 +3853,7 @@ async function resolveDefaultStoreFile() {
 
 function sellerSpriteProviderFor(marketplace) {
   const sourceMarketplace = String(marketplace || "").trim().toUpperCase();
-  return sourceMarketplace === "NL"
-    ? { sourceMarketplace, providerMarketplace: "DE", providerMode: "proxy" }
-    : { sourceMarketplace, providerMarketplace: sourceMarketplace, providerMode: "native" };
+  return { sourceMarketplace, providerMarketplace: sourceMarketplace, providerMode: "native" };
 }
 
 async function readJsonBody(request, maximumBytes = JSON_BODY_LIMIT) {
@@ -3857,6 +3971,7 @@ async function shutdown(signal) {
   process.stdout.write(`Scout Amazon local server closing (${signal}).\n`);
   const forceTimer = setTimeout(() => process.exit(1), 5_000);
   forceTimer.unref?.();
+  await programMonitor.stop();
   await amazonCollector.close();
   await supplierPipeline.close();
   await persistenceStore.writeQueue;

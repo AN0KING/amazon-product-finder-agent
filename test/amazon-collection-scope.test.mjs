@@ -68,7 +68,7 @@ test('detail collection visits every discovered ASIN then qualifies only explici
   assert.deepEqual(calls, asins.slice(0, 3));
   assert.equal(result.items.length, 3);
   assert.deepEqual(result.items.map(amazonMonthlySalesValue), [100, 20, null]);
-  assert.deepEqual(result.items.map(item => candidateFilterExclusionReasons(item, { minRating: null, minReviews: null })), [[], ['MONTHLY_SALES_BELOW_50'], ['MONTHLY_SALES_BELOW_50']]);
+  assert.deepEqual(result.items.map(item => candidateFilterExclusionReasons(item, { minRating: null, minReviews: null })), [[], ['MONTHLY_SALES_BELOW_50'], ['MONTHLY_SALES_EVIDENCE_MISSING']]);
 });
 
 test('detail normalization preserves product and package weight provenance separately', async () => {

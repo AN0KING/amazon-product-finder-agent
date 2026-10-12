@@ -93,7 +93,7 @@ const filters = (overrides = {}) => ({ monthlySalesBand: 'all', minRating: null,
 
 test('items without a monthly sales badge are excluded from screening once details are collected', () => {
   const missing = candidateFilterExclusionReasons(item({ sales30: null }), filters());
-  assert.deepEqual(missing, ['MONTHLY_SALES_BELOW_50']);
+  assert.deepEqual(missing, ['MONTHLY_SALES_EVIDENCE_MISSING']);
   const zero = candidateFilterExclusionReasons(item({ sales30: 0 }), filters());
   assert.deepEqual(zero, ['MONTHLY_SALES_BELOW_50']);
   const under = candidateFilterExclusionReasons(item({ sales30: 49 }), filters());
@@ -102,7 +102,7 @@ test('items without a monthly sales badge are excluded from screening once detai
 
 test('pending details without sales evidence cannot qualify as a candidate', () => {
   const pending = candidateFilterExclusionReasons(item({ detailStatus: 'pending', sales30: null }), filters());
-  assert.deepEqual(pending, ['MONTHLY_SALES_BELOW_50']);
+  assert.deepEqual(pending, ['MONTHLY_SALES_EVIDENCE_MISSING']);
 });
 
 test('items at or above the 50 floor pass the all band, and band ranges still apply', () => {
@@ -120,7 +120,7 @@ test('items at or above the 50 floor pass the all band, and band ranges still ap
 
 
 test('a numeric sales count without explicit Amazon evidence cannot qualify', () => {
-  assert.deepEqual(candidateFilterExclusionReasons(item({ sales30: 100, sales30Evidence: null }), filters()), ['MONTHLY_SALES_BELOW_50']);
+  assert.deepEqual(candidateFilterExclusionReasons(item({ sales30: 100, sales30Evidence: null }), filters()), ['MONTHLY_SALES_EVIDENCE_MISSING']);
 });
 
 test('ordinary spans with explicit monthly purchase text provide per-card evidence', () => {

@@ -179,7 +179,7 @@ syncBuiltinESMExports();
     const origin = `http://127.0.0.1:${port}`;
     const child = spawn(process.execPath, ["--import", pathToFileURL(guardPath).href, serverPath], {
       cwd: projectRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, SCOUT_DATA_DIR: dataDirectory, SCOUT_PORT: String(port), SCOUT_TEST_DENIED_LOG: deniedLog },
+      env: { ...process.env, SCOUT_MONITOR_ENABLED: "0", SCOUT_DATA_DIR: dataDirectory, SCOUT_PORT: String(port), SCOUT_TEST_DENIED_LOG: deniedLog },
     });
     let output = "";
     child.stdout.on("data", chunk => { output = (output + chunk).slice(-4_000); });

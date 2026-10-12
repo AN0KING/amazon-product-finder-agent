@@ -1,0 +1,19 @@
+# Optional integration. Scout runs in Amazon-only mode when this file is not configured.
+# Copy to config/sellersprite.local.toml (do not commit that file).
+# Set SCOUT_SELLERSPRITE_SECRET_KEY in the environment before starting Scout.
+# Use SCOUT_SELLERSPRITE_CONFIG_PATH to select another TOML file;
+# relative paths are resolved against the Scout installation, not the working directory.
+[sellersprite]
+enabled = true
+url = "https://mcp.sellersprite.com/mcp"
+env_http_headers = { "secret-key" = "SCOUT_SELLERSPRITE_SECRET_KEY" }
+
+# Alternatively, replace env_http_headers with a local header:
+# http_headers = { "secret-key" = "REPLACE_WITH_YOUR_KEY" }
+# Or, if your provider requires bearer authentication, replace it with:
+# bearer_token_env_var = "SCOUT_SELLERSPRITE_BEARER_TOKEN"
+
+# One existing [mcp_servers.sellersprite] (or sellsprite, sellersprite-mcp,
+# sellsprite-mcp) section can be copied here instead of [sellersprite].
+# Multiple recognized sections are rejected to avoid selecting the wrong credential.
+# Scout never reads an AI application's config automatically.
