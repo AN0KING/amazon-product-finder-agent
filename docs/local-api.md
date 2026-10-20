@@ -14,6 +14,8 @@
 
 若显式改变 `SCOUT_PORT`，地址、Host 和 Origin 要一并改变；Windows 自带启动器和守护默认管理 4173 端口。
 
+Amazon 商品链接在用户点击时可使用 `POST /api/amazon/open-in-edge`，JSON 为 `{ "url": "https://www.amazon.com.au/dp/ASIN?th=1" }`。该接口要求上述精确 Origin，仅接受支持站点的 Amazon 商品或店铺 HTTPS 链接，直接调用已安装 Edge，不回退其他浏览器。它是打开窗口的操作，不属于只读巡检。
+
 ## 只读状态
 
 | 方法和路径 | 内容 |
@@ -67,11 +69,14 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:4173/api/monitor'
 
 ## Amazon 后台任务
 
+商品列表的 Amazon 标题由 `POST /api/amazon/open-in-edge` 打开，请求体为 `{"url":"https://www.amazon.com.au/dp/B09NXS1BLL?th=1"}`。接口仅接受支持站点的 HTTPS 商品或店铺链接，保留原始查询参数；Windows 上直接调用已安装的 `msedge.exe`。Edge 缺失或启动失败时返回错误，不回退到 Chrome 或默认浏览器；成功响应 `{"opened":true,"browser":"edge"}` 只表示已启动打开操作，不代表页面采集完成。1688 链接不经过此接口。
+
 | 接口 | JSON 请求体 | 作用 |
 | --- | --- | --- |
 | `POST /api/amazon/collection/start` | `{"runId":"RUN_ID"}` | 启动已保存批次的后台采集；先检查现有任务，避免重复启动 |
 | `POST /api/amazon/collection/control` | `{"runId":"RUN_ID","action":"pause"}` | 人工暂停并保留断点 |
 | 同上 | `{"runId":"RUN_ID","action":"resume"}` | 按用户明确操作恢复当前任务 |
+| 同上 | `{"runId":"RUN_ID","action":"recheck"}` | 检查当前已结束任务中的可恢复缺项，使用原有有限补查预算；不重置次数、不解除暂停、不扩大范围 |
 | 同上 | `{"runId":"RUN_ID","action":"retry_missing"}` | 用户明确要求重新补采缺项 |
 | 同上 | `{"runId":"RUN_ID","action":"retry_missing","asins":["B000000001"]}` | 只补采当前任务中的指定 ASIN，数量 1–100；需先稳定暂停或处于可补采终态 |
 
@@ -79,7 +84,19 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:4173/api/monitor'
 
 后台控制成功返回 HTTP 202，表示命令已接收，完成情况继续读取状态。`409` 通常表示任务正在退出、另有请求运行或批次正在替换，应读取状态而非反复提交。
 
+`recheck` 适用于用户已授权的自动巡检：仅同一任务已结束、启用且无执行者、人工/验证/采购暂停时安排补查，每商品最多额外两次，间隔一分钟和两分钟。实际访问仍由后台调度。`data.recovery` 汇总 `eligible`、`scheduled`、`exhausted`、`blocked`，商品快照的 `collectionRecovery` 给出该商品的原因、次数及下次补查时间。重复命令不会重置预算；ASIN 身份冲突和已确认页面未提供的信息不会因此重跑。
+
 仅在新文件验证通过、明确替换旧任务时，界面调用 `POST /api/runs/RUN_ID/archive`，请求体为 `{"reason":"file_upload"}`，取消并归档旧任务后再切换批次。该接口不是普通暂停接口，也不是轮询恢复工具。上传解析本身与归档是两个步骤，不能先归档再验证文件。
+
+## ASIN 导入解析
+
+`POST /api/asin-list/parse` 仅解析输入，不创建任务、不归档旧任务、不访问 Amazon。JSON 请求体为 `{"marketplace":"AU","text":"B09V6TRGTD"}`；也接受 Amazon 商品链接，按链接域名确定站点，纯 ASIN 使用所选站点。跨站混合输入整批拒绝，不自动改写站点。
+
+上传 XLSX 时使用二进制请求体，`Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，并携带 `X-File-Name` 和 `X-Marketplace`。支持首行包含 `ASIN` 或 `商品链接`（可选 `marketplace` / `站点` 列），也支持无表头的单列 ASIN / 商品链接清单，第一行同样参与采集范围。有 ASIN 列时仅解析该列和可选站点列，空 ASIN 单元格跳过并记录提示；不会从其他商品链接或店铺链接补充 ASIN。商品链接只取明确的商品路径，不使用卖家参数扩展范围。有效返回的 `data` 包含 `inputMode: "asins"`、`marketplace`、去重后的 `rows`、无卖家身份的 `stores` 和 `audit`。单文件最多 5 MB，最多 10000 个不同 ASIN。
+
+`POST /api/store-list/parse` 同时返回来自同一原始文件的 `directAsinInput` 预览。`status: "ready"` 时含已校验的 `data`；`status: "unavailable"` 时含错误原因且 `data: null`，不影响合法店铺文件导入。该预览随任务快照保存，切换 ASIN 模式时不从历史发现商品、合并店铺行或断点反推输入范围。旧快照无预览且浏览器已无原始文件时，须重新选择文件。
+
+保存或分析 ASIN 批次时显式传递 `inputMode: "asins"`，仅访问所给 ASIN，不枚举店铺。`monthlySalesBand` 支持 `all`、`50_plus`、`50_to_100`、`100_plus`。ASIN 任务的 `all` 默认不限月销量，包含低销量和未知商品；其余档位主动筛选有效销量。店铺任务的 `all` 仍要求有效月销量至少 50。未知销量保留未知状态及原始记录；旧的跳过筛选标志不生效。筛选同时支持 `minReviews` 和 `maxReviews`，可为空，两端包含，要求非负整数且下限不超过上限。暂停和恢复沿用既有后台控制接口。
 
 ## 商品分析请求
 

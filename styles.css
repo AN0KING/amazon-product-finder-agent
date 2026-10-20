@@ -860,6 +860,62 @@ svg {
   color: #87332e;
 }
 
+.import-mode-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0 10px;
+}
+
+.import-mode-tabs button {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.import-mode-tabs button[aria-selected="true"] {
+  background: var(--accent-soft);
+  border-color: #27775b;
+  color: #14553f;
+  font-weight: 700;
+}
+
+.import-help {
+  margin: 8px 0 12px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.asin-import-panel:not([hidden]) {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.asin-import-panel label {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.asin-import-panel textarea,
+.asin-import-panel select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.asin-import-panel textarea { resize: vertical; }
+
 .upload-zone {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) 20px;
@@ -2089,14 +2145,73 @@ input[type="checkbox"]:checked {
 
 .results-filter-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 288px), 1fr));
-  gap: 0 24px;
+  grid-template-columns: minmax(180px, 1.2fr) repeat(3, minmax(110px, 0.8fr)) minmax(236px, 1.4fr);
+  gap: 12px;
   margin-top: 5px;
+  overflow-x: auto;
 }
 
 .results-filter-grid .filter-line {
+  grid-template-columns: 15px minmax(0, 1fr);
+  gap: 7px 6px;
   min-width: 0;
+  min-height: 0;
+  padding: 10px 0;
   border-bottom: 0;
+}
+
+.results-filter-grid .filter-line > .input-with-unit,
+.results-filter-grid .filter-line > .filter-select {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+}
+
+.amazon-listing-date-filter {
+  display: grid;
+  align-content: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 10px 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.amazon-listing-date-filter > label,
+.amazon-listing-date-control {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.amazon-listing-date-filter > label svg {
+  width: 15px;
+  height: 15px;
+  color: var(--accent-dark);
+}
+
+.amazon-listing-date-control input {
+  min-width: 0;
+  width: 144px;
+  height: 36px;
+  padding: 0 8px;
+}
+
+.amazon-listing-date-control > span,
+.amazon-listing-date-control > button {
+  white-space: nowrap;
+}
+
+.amazon-listing-date-coverage {
+  margin: 5px 0 10px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.product-copy .amazon-listing-date {
+  color: var(--ink-soft);
+  font-size: 10px;
 }
 
 .supplier-stage-bar {
@@ -2716,6 +2831,37 @@ input[type="checkbox"]:checked {
   white-space: normal;
 }
 
+.amazon-collection-note {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-left: 2px solid #b77722;
+  background: #fff8e9;
+  color: #805717;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.amazon-collection-note.is-error {
+  border-left-color: var(--danger);
+  background: #fff2ef;
+  color: var(--danger);
+}
+
+.amazon-collection-code {
+  display: block;
+  margin-top: 2px;
+  font-size: 9px;
+  opacity: .8;
+}
+
+.product-copy .amazon-listing-date.is-unknown {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
 .candidate-logistics {
   display: flex;
   align-items: flex-start;
@@ -2963,6 +3109,12 @@ input[type="checkbox"]:checked {
   font-variant-numeric: tabular-nums;
   line-height: 1.25;
   vertical-align: middle;
+}
+
+.numeric-cell.price-cell > small {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
 }
 
 .currency-primary {
@@ -4128,31 +4280,53 @@ input[type="checkbox"]:checked {
 
 .fba-calculation-note {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 3px 12px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
   margin-top: 14px;
-  padding: 11px 12px;
+  padding: 14px 16px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-small);
+  border-radius: var(--radius);
   background: var(--surface-muted);
   color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
 }
 
 .fba-calculation-note > span {
+  display: grid;
+  grid-template-columns: 6em minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
   min-width: 0;
-  font-size: 10px;
+  color: var(--ink);
 }
 
 .fba-calculation-note > span > b {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+.fba-calculation-note > strong {
   color: var(--ink);
-  font-weight: 700;
+  font-weight: 600;
+}
+
+.fba-calculation-note > p {
+  margin: 0;
 }
 
 .fba-calculation-note > small {
-  color: var(--warning);
-  font-size: 9px;
-  font-weight: 700;
-  text-align: right;
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.7;
+  text-align: left;
 }
 
 .profit-result {
@@ -5319,6 +5493,7 @@ input[type="checkbox"]:checked {
   .results-filter-grid {
     grid-template-columns: 1fr;
     gap: 0;
+    overflow-x: visible;
   }
 
   .results-filter-grid .filter-line + .filter-line {
@@ -5916,3 +6091,20 @@ input[type="checkbox"]:checked {
 @media (max-width: 700px) {
   .local-monitor-panel { width: calc(100% - 28px); margin-top: 16px; }
 }
+
+.product-information-audit { margin: 16px 0; padding: 12px; border: 1px solid var(--border, #dce3e8); border-radius: 8px; }
+.product-information-audit summary { cursor: pointer; line-height: 1.5; }
+.product-information-audit h4 { margin: 16px 0 8px; }
+.product-information-audit dd { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.import-selection-summary { margin: 12px 0; padding: 12px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--accent-soft); color: #14553f; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+#importMetrics[hidden], #importDataAudit[hidden], .import-selection-summary[hidden] { display: none; }
+/* Manual access recovery is visible only for the current paused Amazon task. */
+.collection-access-panel { margin: 14px 0; padding: 16px; border: 1px solid #d8a66b; border-radius: 8px; background: #fff9f0; }
+.collection-access-panel[hidden] { display: none; }
+.collection-access-panel h3 { margin: 0 0 8px; }
+.collection-access-panel p { line-height: 1.6; overflow-wrap: anywhere; }
+.collection-access-product { padding: 10px 0; border-bottom: 1px solid #ead9c3; }
+.collection-access-product a, .collection-access-product button { display: inline-block; margin: 4px 10px 4px 0; }
+.collection-access-panel > label { display: block; margin: 12px 0; }
+.amazon-collection-note [data-amazon-access] { margin-top: 8px; }

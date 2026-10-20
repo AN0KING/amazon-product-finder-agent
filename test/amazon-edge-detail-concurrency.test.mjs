@@ -11,6 +11,7 @@ const deferred = () => {
   return { promise, resolve };
 };
 const html = (asin) => `<input id="ASIN" value="${asin}"><h1 id="productTitle">Product ${asin}</h1>
+  <table id="productDetails_detailBullets_sections1"><tr><th>ASIN</th><td>${asin}</td></tr></table>
   <div id="corePriceDisplay_desktop_feature_div"><span class="a-price priceToPay"><span class="a-offscreen">$${prices.get(asin)}</span></span></div>`;
 const getDetail = (session, asin, signal) => session.fetchProductDetailWithEdgeCdp(`https://www.amazon.ca/dp/${asin}`, asin, signal);
 
@@ -40,6 +41,12 @@ async function mockedSession(t, { openGate, readGate, failingAsin } = {}) {
     if (readGate) await readGate.promise;
     calls.reads.push(this.mockAsin);
     return html(this.mockAsin);
+  });
+  t.mock.method(EdgeCdpSession.prototype, "inspectProductInformation", async function (asin) {
+    assert.equal(this.mockAsin, asin, "Inspection remains within the shared-tab lock.");
+    return { version: 3, status: "complete", stable: true, asin, rowCount: 1,
+      sections: [{selector: "#productDetails_detailBullets_sections1", rowCount: 1, status: "complete"}],
+      parsedSections: [{selector: "#productDetails_detailBullets_sections1", rowCount: 1}] };
   });
   t.mock.method(EdgeCdpSession.prototype, "close", async function () {});
   const unexpectedTransport = async () => { throw new Error("Unexpected network request"); };
@@ -78,7 +85,7 @@ test("a shared tab cannot navigate to the next ASIN before the previous DOM read
   readGate.resolve();
   const details = await Promise.all([first, second]);
   assert.deepEqual(details.map(({ asin, currentPrice }) => [asin, currentPrice]), [...prices]);
-  assert.deepEqual(calls.reads, asins);
+  assert.deepEqual(calls.reads, asins.flatMap(asin => [asin, asin]));
 });
 
 test("a failed CDP navigation does not block the next queued product", async (t) => {

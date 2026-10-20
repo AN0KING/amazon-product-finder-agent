@@ -11,12 +11,14 @@ import { confirm } from '../io/prompt.js';
 import { CliError } from '../io/errors.js';
 import { nowIso } from '../util/time.js';
 import { defaultProfileName, loginQrFile, ensureRoot } from '../session/paths.js';
+import { brokerSignalPath } from '../session/broker-paths.js';
 import { sleep, withTimeout } from '../session/wait.js';
 import { probeDefaultEdgeIdentityCookie } from '../session/cookie-store.js';
 import { ensureNativeVisibleEdgeWindow, withManualVisibleEdge, withNativeVisibleEdge, } from '../session/native-edge.js';
 import { detectPageState } from '../session/page-state.js';
 import { captureFailureArtifact } from '../session/artifacts.js';
-import { readImageResultId, readVerifiedImageUpload, resolveImageSearchUploadInput, submitImageSearchOnce, } from './image-search.js';
+import { startManagedImageSearchEvidence } from '../session/image-search-verification-evidence.js';
+import { matchesImageOfferRequest, readImageResultId, readVerifiedImageUpload, resolveImageSearchUploadInput, submitImageSearchOnce, } from './image-search.js';
 const LOGIN_URL = 'https://login.1688.com/member/signin.htm?tbpm=1';
 export const LOGIN_WARMUP_URL = 'https://www.1688.com/';
 export const IMAGE_SEARCH_VERIFICATION_URL = 'https://s.1688.com/youyuan/index.htm';
@@ -127,7 +129,9 @@ export async function run(opts) {
             return brokerControl
                 ? runWithBrokerLoginCancellation(brokerControl, complete)
                 : complete();
-        }, (identity) => verifyPersistedProfileWhileLocked(profile, identity));
+        }, (identity) => purpose === 'image_search' && managedImageSearchUpload
+            ? verifyPersistedProfileIdentityWhileLocked(profile, identity)
+            : verifyPersistedProfileWhileLocked(profile, identity));
     }
     else {
         const identity = await withSession({ headless: !headed, profile }, async (ctx) => {
@@ -281,6 +285,12 @@ async function completeManagedImageSearchVerification(ctx, page, timeoutMs, uplo
 }
 async function runManagedImageSearchVerification(ctx, page, timeoutMs, upload) {
     const deadline = Date.now() + timeoutMs;
+    // Preserve a failed navigation as a network diagnostic instead of
+    // silently navigating again and eventually reporting a missing upload UI.
+    if (/^(?:chrome|edge)-error:/i.test(page.url())) {
+        const state = await detectPageState(page);
+        throwForImageSearchTerminalState(state.kind, state.errorCode);
+    }
     // The native visible launcher already navigated to image search. Preserve
     // that page, including any challenge the user is completing manually.
     if (!isTrustedImageSearchBusinessUrl(page.url()) && !isImageSearchRiskUrl(page.url())) {
@@ -293,59 +303,80 @@ async function runManagedImageSearchVerification(ctx, page, timeoutMs, upload) {
     await waitForManagedImageSearchUploadPage(page, deadline);
     const previousUrl = page.url();
     const previousImageId = safeReadImageResultId(previousUrl);
-    logImageSearchVerificationStage('upload_control_ready');
-    await submitImageSearchOnce(page, upload);
-    logImageSearchVerificationStage('image_selected_waiting_result');
-    let consecutiveNormalSamples = 0;
-    let observedImageId = null;
-    let ordinaryResultSince = Date.now();
-    let waitingOnManualVerification = false;
-    while (Date.now() < deadline) {
-        await sleep(IMAGE_SEARCH_VERIFICATION_POLL_MS);
-        if (page.isClosed()) {
-            throw new CliError(130, 'CANCELED', 'Image-search verification was canceled.');
-        }
-        const state = await detectPageState(page);
-        throwForImageSearchTerminalState(state.kind);
-        if (state.kind === 'risk_challenge' || isImageSearchRiskUrl(state.url)) {
-            if (!waitingOnManualVerification) logImageSearchVerificationStage('waiting_manual_verification');
-            waitingOnManualVerification = true;
-            ordinaryResultSince = null;
-            consecutiveNormalSamples = 0;
-            observedImageId = null;
-            continue;
-        }
-        if (waitingOnManualVerification) logImageSearchVerificationStage('image_selected_waiting_result');
-        waitingOnManualVerification = false;
-        ordinaryResultSince ??= Date.now();
-        const imageId = state.kind === 'normal_1688_page'
-            ? safeReadImageResultId(state.url)
-            : null;
-        const isNewResult = imageId !== null
-            && state.url !== previousUrl
-            && imageId !== previousImageId;
-        if (isNewResult) {
-            if (imageId !== observedImageId) {
-                observedImageId = imageId;
+    const expectedIdentity = requireUniqueOfficialIdentity(await ctx.cookies());
+    const evidence = startManagedImageSearchEvidence(page, { previousImageId, matchesImageOfferRequest });
+    try {
+        logImageSearchVerificationStage('upload_control_ready');
+        await submitImageSearchOnce(page, upload);
+        logImageSearchVerificationStage('image_selected_waiting_result');
+        let consecutiveNormalSamples = 0;
+        let observedImageId = null;
+        let ordinaryResultSince = Date.now();
+        let waitingOnManualVerification = false;
+        let waitingForResponseChallenge = false;
+        while (Date.now() < deadline) {
+            await sleep(IMAGE_SEARCH_VERIFICATION_POLL_MS);
+            if (page.isClosed()) {
+                throw new CliError(130, 'CANCELED', 'Image-search verification was canceled.');
+            }
+            const state = await detectPageState(page);
+            throwForImageSearchTerminalState(state.kind, state.errorCode);
+            const imageId = state.kind === 'normal_1688_page'
+                ? safeReadImageResultId(state.url)
+                : null;
+            const failure = evidence.failure(imageId);
+            const visibleChallenge = state.kind === 'risk_challenge' || isImageSearchRiskUrl(state.url);
+            if (visibleChallenge || failure === 'RISK_CONTROL') {
+                if (!waitingOnManualVerification) logImageSearchVerificationStage('waiting_manual_verification');
+                // MTOP can report a challenge before its UI is mounted. Keep
+                // this same window open for the user's existing manual budget.
+                waitingForResponseChallenge = !visibleChallenge;
+                // Every observed challenge invalidates earlier/in-flight results.
+                // Only requests started after the last blocked sample may prove it.
+                evidence.reset();
+                waitingOnManualVerification = true;
+                ordinaryResultSince = null;
+                consecutiveNormalSamples = 0;
+                observedImageId = null;
+                continue;
+            }
+            if (failure) {
+                const exitCode = failure === 'NOT_LOGGED_IN' ? 3 : 9;
+                throw new CliError(exitCode, failure, '1688 did not allow this image search. Complete login or wait for the access limit before retrying.');
+            }
+            if (waitingForResponseChallenge && !evidence.forImage(imageId)) continue;
+            waitingForResponseChallenge = false;
+            if (waitingOnManualVerification) logImageSearchVerificationStage('image_selected_waiting_result');
+            waitingOnManualVerification = false;
+            ordinaryResultSince ??= Date.now();
+            const isNewResult = imageId !== null
+                && state.url !== previousUrl
+                && imageId !== previousImageId;
+            if (isNewResult) {
+                if (imageId !== observedImageId) {
+                    observedImageId = imageId;
+                    consecutiveNormalSamples = 0;
+                }
+                consecutiveNormalSamples += 1;
+                if (consecutiveNormalSamples >= IMAGE_SEARCH_VERIFICATION_NORMAL_SAMPLES
+                    && evidence.forImage(imageId)) {
+                    const identity = await verifiedImageSearchIdentity(ctx, expectedIdentity);
+                    logImageSearchVerificationStage('verified_result');
+                    return identity;
+                }
+            }
+            else {
+                observedImageId = null;
                 consecutiveNormalSamples = 0;
             }
-            consecutiveNormalSamples += 1;
-            if (consecutiveNormalSamples >= IMAGE_SEARCH_VERIFICATION_NORMAL_SAMPLES) {
-                const identity = await verifiedImageSearchIdentity(ctx);
-                logImageSearchVerificationStage('verified_result');
-                return identity;
+            if (Date.now() - ordinaryResultSince >= IMAGE_SEARCH_RESULT_TIMEOUT_MS) {
+                throw imageSearchResultTimeout(state.url, previousUrl, previousImageId);
             }
         }
-        else {
-            observedImageId = null;
-            consecutiveNormalSamples = 0;
-        }
-        if (Date.now() - ordinaryResultSince >= IMAGE_SEARCH_RESULT_TIMEOUT_MS) {
-            throw imageSearchResultTimeout(state.url, previousUrl, previousImageId);
-        }
+        if (!waitingOnManualVerification) throw imageSearchResultTimeout(page.url(), previousUrl, previousImageId);
+        throw imageSearchVerificationTimeout();
     }
-    if (!waitingOnManualVerification) throw imageSearchResultTimeout(page.url(), previousUrl, previousImageId);
-    throw imageSearchVerificationTimeout();
+    finally { evidence.dispose(); }
 }
 function imageSearchResultTimeout(currentUrl, previousUrl, previousImageId) {
     const imageId = safeReadImageResultId(currentUrl);
@@ -373,7 +404,7 @@ async function waitForManagedImageSearchUploadPage(page, deadline) {
             throw new CliError(130, 'CANCELED', 'Image-search verification was canceled.');
         }
         const state = await detectPageState(page);
-        throwForImageSearchTerminalState(state.kind);
+        throwForImageSearchTerminalState(state.kind, state.errorCode);
         if (state.kind === 'risk_challenge' || isImageSearchRiskUrl(state.url)) {
             if (!waitingOnManualVerification) logImageSearchVerificationStage('waiting_manual_verification');
             waitingOnManualVerification = true;
@@ -453,7 +484,14 @@ async function inspectImageSearchUploadPage(page) {
     const hasUploadControl = Boolean(uploadInput) || snapshot.hasUploadButton;
     return { currentUrl, recognized, hasUploadControl, ready: recognized && hasUploadControl };
 }
-function throwForImageSearchTerminalState(kind) {
+function throwForImageSearchTerminalState(kind, browserError) {
+    if (kind === 'network_error') {
+        const errorCode = /^ERR_[A-Z0-9_]{1,80}$/.test(browserError ?? '') ? browserError : null;
+        const reason = errorCode ? `（${errorCode}）` : '';
+        throw new CliError(14, 'IMAGE_SEARCH_NETWORK_ERROR', `1688 / 淘宝页面连接失败${reason}。请检查网络或代理；不能据此判断需要换号。图片验证未完成，队列保持暂停。`, {
+            browserError: errorCode,
+        });
+    }
     if (kind === 'not_logged_in') {
         throw new CliError(3, 'NOT_LOGGED_IN', 'The dedicated 1688 session is not signed in. Complete login first.');
     }
@@ -483,12 +521,12 @@ function safeReadImageResultId(value) {
         return null;
     }
 }
-async function verifiedImageSearchIdentity(ctx) {
-    const identity = parseIdentity(await ctx.cookies());
+async function verifiedImageSearchIdentity(ctx, expected) {
+    const identity = requireUniqueOfficialIdentity(await ctx.cookies());
     if (!identity) {
         throw new CliError(3, 'NOT_LOGGED_IN', 'The dedicated 1688 session is not signed in. Complete login first.');
     }
-    await requireOnlineIdentity(ctx, identity);
+    assertSameIdentity(expected, identity);
     return identity;
 }
 function imageSearchVerificationTimeout() {
@@ -788,14 +826,10 @@ function loginCookieSignal(cookies) {
 function requireBrokerLoginControl() {
     const cancelPath = process.env.BB1688_LOGIN_CANCEL;
     const token = process.env.BB1688_LOGIN_TOKEN;
-    const resolved = path.resolve(cancelPath ?? '');
-    const expectedParent = path.join('data', 'sourcing-console', 'runtime-cache', 'login-handshakes').toLowerCase();
-    if (!cancelPath
-        || !token
-        || !/^[a-f0-9]{64}$/.test(token)
-        || !/^D:\\/i.test(resolved)
-        || !path.dirname(resolved).toLowerCase().endsWith(expectedParent)
-        || !/^launch-\d+-[a-f0-9-]{36}\.cancel$/i.test(path.basename(resolved))) {
+    let resolved;
+    try { resolved = brokerSignalPath(cancelPath, 'cancel'); }
+    catch { throw new CliError(6, 'LOGIN_CANCEL_SIGNAL_INVALID', 'The verified login cancellation signal is invalid.'); }
+    if (!token || !/^[a-f0-9]{64}$/.test(token)) {
         throw new CliError(6, 'LOGIN_CANCEL_SIGNAL_INVALID', 'The verified login cancellation signal is invalid.');
     }
     return { cancelPath: resolved, token };
@@ -864,13 +898,10 @@ async function writeBrokerEdgeReadySignal() {
     if (!readyPath)
         return;
     const token = process.env.BB1688_LOGIN_TOKEN;
-    const resolved = path.resolve(readyPath);
-    const expectedParent = path.join('data', 'sourcing-console', 'runtime-cache', 'login-handshakes').toLowerCase();
-    if (!token
-        || !/^[a-f0-9]{64}$/.test(token)
-        || !/^D:\\/i.test(resolved)
-        || !path.dirname(resolved).toLowerCase().endsWith(expectedParent)
-        || !/^launch-\d+-[a-f0-9-]{36}\.ready$/i.test(path.basename(resolved))) {
+    let resolved;
+    try { resolved = brokerSignalPath(readyPath, 'ready'); }
+    catch { throw new CliError(6, 'LOGIN_READY_SIGNAL_INVALID', 'The verified Edge-ready signal path is invalid.'); }
+    if (!token || !/^[a-f0-9]{64}$/.test(token)) {
         throw new CliError(6, 'LOGIN_READY_SIGNAL_INVALID', 'The verified Edge-ready signal path is invalid.');
     }
     try {

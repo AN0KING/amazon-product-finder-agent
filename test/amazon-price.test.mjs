@@ -60,10 +60,16 @@ test("recommendations, variant prices and page-wide metadata never become a miss
 test("a recommendation ASIN is not interpreted as the detail-page ASIN", () => {
   const html = `<div data-asin="${OTHER_ASIN}">${amount("$279")}</div><h1 id="productTitle">${title}</h1>${mainPrice("$9.99")}`;
   assert.equal(parseAmazonProductPage(html, { marketplace: "CA", asin: ASIN }).currentPrice, 9.99);
-  assert.throws(() => parseAmazonProductPage(product(mainPrice("$9.99")).replace(`value="${ASIN}"`, `value="${OTHER_ASIN}"`), { marketplace: "CA", asin: ASIN }), { code: "AMAZON_PRODUCT_ASIN_MISMATCH" });
+  const result = parseAmazonProductPage(product(mainPrice("$9.99")).replace(`value="${ASIN}"`, `value="${OTHER_ASIN}"`), { marketplace: "CA", asin: ASIN });
+  assert.equal(result.currentPrice, 9.99);
+  assert.equal(result.asin, ASIN);
+  assert.equal(result.priceEvidence.asin, ASIN);
+  assert.equal(result.priceEvidence.observedAsin, OTHER_ASIN);
+  assert.equal(result.productInformation.identityDiagnostics.pageAsin, OTHER_ASIN);
+  assert.equal(result.productInformation.identityDiagnostics.policy, "observe_without_rejection");
 });
 
-test("main price excludes list prices, units, installments, used offers, other ASINs and hidden amounts", () => {
+test("main price excludes list prices, units, installments, used offers, recommendations and hidden amounts", () => {
   const rejected = [
     amount("$279.00", "a-text-price"),
     `<del>${amount("$279.00")}</del>`,
@@ -74,13 +80,19 @@ test("main price excludes list prices, units, installments, used offers, other A
     `<div id="installmentCalculator">${amount("$2.99")}</div>`,
     `<div id="usedBuySection">${amount("$7.99")}</div>`,
     `<div id="variation_color_name">${amount("$10.99")}</div>`,
-    `<div data-asin="${OTHER_ASIN}">${amount("$279.00")}</div>`,
+    `<div id="sp_detail" data-asin="${OTHER_ASIN}">${amount("$279.00")}</div>`,
     `<div class="aok-hidden">${amount("$279.00", "priceToPay")}</div>`,
     `<div style="display: none">${amount("$279.00", "priceToPay")}</div>`,
   ];
   const html = `<div id="apex_desktop">${rejected.join("")}${amount("$9.99")}</div>`;
   assert.equal(parse(html).currentPrice, 9.99);
   for (const secondary of rejected) assert.equal(parse(`<div id="apex_desktop">${secondary}</div>`).currentPrice, null, secondary);
+});
+
+test("a different data-asin alone does not exclude a visible main price", () => {
+  const result = parse(`<div id="apex_desktop"><div data-asin="${OTHER_ASIN}">${amount("$9.99")}</div></div>`);
+  assert.equal(result.currentPrice, 9.99);
+  assert.equal(result.priceEvidence.asin, ASIN);
 });
 
 test("split whole and fraction markup retains cents even without an offscreen amount", () => {
@@ -112,18 +124,28 @@ test("unidentified JSON-LD must match the actual product title", () => {
   assert.equal(parse("", { head: schema({ "@type": "Product", name: "Recommended sofa", offers: offer }) }).currentPrice, null);
 });
 
-test("JSON-LD rejects aggregate minima, ambiguous offers, unavailable offers and foreign currency or variants", () => {
+test("JSON-LD rejects aggregate minima, ambiguous offers, unavailable offers and foreign currency or sites", () => {
   const invalidOffers = [
     { "@type": "AggregateOffer", lowPrice: 9.99, highPrice: 29.99, priceCurrency: "CAD" },
     { lowPrice: 9.99, priceCurrency: "CAD" },
     { price: 9.99, priceCurrency: "USD" },
     { price: 9.99, priceCurrency: "CAD", availability: "https://schema.org/OutOfStock" },
-    { price: 9.99, priceCurrency: "CAD", url: `https://www.amazon.ca/dp/${OTHER_ASIN}` },
+    { price: 9.99, priceCurrency: "CAD", url: `https://www.amazon.com/dp/${ASIN}` },
+    { price: 9.99, priceCurrency: "CAD", url: `https://www.amazon.ca.example.com/dp/${ASIN}` },
+    { price: 9.99, priceCurrency: "CAD", itemOffered: { url: `https://www.amazon.com/dp/${ASIN}` } },
     [{ price: 9.99, priceCurrency: "CAD" }, { price: 29.99, priceCurrency: "CAD" }],
   ];
   for (const offers of invalidOffers) {
     assert.equal(parse("", { head: schema({ "@type": "Product", sku: ASIN, offers }) }).currentPrice, null, JSON.stringify(offers));
   }
+  assert.equal(parse("", { head: schema({ "@type": "Product", sku: ASIN, url: `https://www.amazon.com/dp/${ASIN}`, offers: { price: 9.99, priceCurrency: "CAD" } }) }).currentPrice, null);
+});
+
+test("JSON-LD same-market variant URLs remain usable under the task ASIN", () => {
+  const result = parse("", { head: schema({ "@type": "Product", sku: ASIN, offers: { price: 9.99, priceCurrency: "CAD", url: `https://www.amazon.ca/dp/${OTHER_ASIN}` } }) });
+  assert.equal(result.currentPrice, 9.99);
+  assert.equal(result.priceEvidence.asin, ASIN);
+  assert.equal(result.priceEvidence.source, "matching_product_json_ld");
 });
 
 test("unavailability blocks stale structured and attach prices", () => {
@@ -132,9 +154,18 @@ test("unavailability blocks stale structured and attach prices", () => {
   }).currentPrice, null);
 });
 
-test("attach prices require the current ASIN and are only a last resort", () => {
+test("attach prices belong to the displayed page product and are only a last resort", () => {
   assert.equal(parse(`<input id="attach-base-product-price" value="9.99">`).currentPrice, 9.99);
   assert.equal(parse(`<input id="attach-base-asin" value="${OTHER_ASIN}"><input id="attach-base-product-price" value="279">`).currentPrice, null);
+  const redirectedPage = product(`<input id="attach-base-asin" value="${OTHER_ASIN}"><input type="hidden" id="attach-base-product-price" value="9.99">`).replace(`value="${ASIN}"`, `value="${OTHER_ASIN}"`);
+  const result = parseAmazonProductPage(redirectedPage, { marketplace: "CA", asin: ASIN });
+  assert.equal(result.currentPrice, 9.99);
+  assert.equal(result.priceEvidence.asin, ASIN);
+  assert.equal(result.priceEvidence.observedAsin, OTHER_ASIN);
+  assert.equal(result.priceEvidence.source, "matching_product_attach_price");
+  for (const scope of [`id="sp_detail"`, `class="aok-hidden"`, `style="display: none"`, `id="variation_color_name"`]) {
+    assert.equal(parse(`<div ${scope}><input id="attach-base-product-price" value="279"></div>`).currentPrice, null, scope);
+  }
 });
 
 test("metadata is accepted only inside a main price scope with a matching currency", () => {

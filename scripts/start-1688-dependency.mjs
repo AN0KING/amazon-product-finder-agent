@@ -2,8 +2,30 @@ import path from "node:path";
 import { connect } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const PROCUREMENT_PROJECT_ROOT = "D:\\deliverables\\1688-procurement-assistant-2.3.0";
-export const BB1688_HOME = "D:\\deliverables\\1688-procurement-assistant-2.3.0\\data\\1688-session";
+import { resolve1688RuntimePaths } from "../1688-dependencies/1688-procurement-assistant-2.3.0/lib/runtime-paths.mjs";
+
+const SCOUT_PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Source installs execute the bridge version shipped with this application,
+// while keeping the existing queue, managed images and logged-in session.
+// Installed packages already provide all four roots explicitly.
+export function resolveScout1688RuntimePaths({ env = process.env, scoutRoot = SCOUT_PROJECT_ROOT,
+  platform = process.platform, fsImpl } = {}) {
+  const options = { platform, ...(fsImpl ? { fsImpl } : {}) };
+  const existing = resolve1688RuntimePaths({ env, ...options });
+  if (env.SCOUT_1688_PROJECT_ROOT) return existing;
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  return resolve1688RuntimePaths({
+    env: { ...env,
+      SCOUT_1688_PROJECT_ROOT: paths.join(scoutRoot, "1688-dependencies", "1688-procurement-assistant-2.3.0"),
+      BB1688_DATA_ROOT: existing.dataRoot,
+    }, ...options,
+  });
+}
+
+const runtimePaths = resolveScout1688RuntimePaths();
+export const PROCUREMENT_PROJECT_ROOT = runtimePaths.procurementRoot;
+export const BB1688_HOME = runtimePaths.sessionRoot;
 export const PROCUREMENT_HEALTH_URL = "http://127.0.0.1:16880/api/v1/health";
 export const PROCUREMENT_INTEGRATION_PROTOCOL = 8;
 const HEALTH_PROBE_ATTEMPTS = 2;
@@ -131,6 +153,12 @@ export async function start1688Dependency({ launchConsoleImpl } = {}) {
   const launchConsole = launchConsoleImpl || await loadLauncher();
   const result = await launchConsole({
     projectRoot: PROCUREMENT_PROJECT_ROOT,
+    runtimeEnv: {
+      SCOUT_1688_PROJECT_ROOT: runtimePaths.procurementRoot,
+      BB1688_IMAGE_FINDER_ROOT: runtimePaths.imageFinderRoot,
+      BB1688_HOME: runtimePaths.sessionRoot,
+      BB1688_DATA_ROOT: runtimePaths.dataRoot,
+    },
     interactive: true,
     startupTimeoutMs: 60_000,
     brokerStartupTimeoutMs: 30_000,
@@ -186,7 +214,7 @@ if (isMain) {
   start1688Dependency()
     .then((result) => {
       process.stdout.write(
-        `1688 采购助手已就绪；固定会话目录：${result.sessionRoot}\n`,
+        `1688 采购助手已就绪；会话目录：${result.sessionRoot}\n`,
       );
     })
     .catch((error) => {

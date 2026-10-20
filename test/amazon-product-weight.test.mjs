@@ -1,95 +1,143 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { parseAmazonProductPage } from '../lib/amazon-store-client.mjs';
-import { mergeAmazonCollectionProduct } from '../lib/amazon-collection-merge.mjs';
+
 const asin = 'B0A0000001';
 const parse = body => parseAmazonProductPage('<input id="ASIN" value="' + asin + '"><h1 id="productTitle">Sample</h1>' + body, { marketplace: 'AU', asin });
+const table = rows => '<table>' + rows.map(([label, value]) => '<tr><th>' + label + '</th><td>' + value + '</td></tr>').join('') + '</table>';
+const details = rows => '<div id="productDetails_feature_div">' + table(rows) + '</div>';
+const panel = (heading, rows) => '<div class="a-expander-container"><a class="a-expander-header" aria-expanded="false">' + heading + '</a><div class="a-expander-content" style="display:none">' + table(rows) + '</div></div>';
 
-test('Item details, technical details and Facts layouts retain exact product and package weights', () => {
-  for (const root of ['itemDetails_feature_div', 'productFactsDesktopExpander', 'productFactsMobileExpander', 'productDetails_feature_div']) {
-    const result = parse('<section id="' + root + '"><table><tr><th>Item Weight</th><td>125 g</td></tr><tr><th>Package Weight</th><td>0.18 kilograms</td></tr></table></section>');
-    assert.equal(result.productWeightKg, 0.125, root);
-    assert.equal(result.packageWeightKg, 0.18, root);
-    assert.deepEqual(result.productWeightEvidence, { source: 'amazon_product_page', label: 'item weight', rawText: '125 g', selector: '#' + root, value: 0.125, unit: 'kg', asin, kind: 'product' });
-    assert.equal(result.packageWeightEvidence.kind, 'package');
-  }
-  const row = parse('<section id="productFactsMobile_feature_div"><div role="row"><span role="cell">Item Weight</span><span role="cell">2 ounces</span></div></section>');
-  assert.equal(row.productWeightKg, 0.056699);
-  const definition = parse('<section id="itemDetails_feature_div"><dl><dt>Item Weight</dt><dd>0.2 lb</dd></dl></section>');
-  assert.equal(definition.productWeightKg, 0.090718);
+test('captured CREST collapsed information retains Item Weight and all specification sections', () => {
+  const source = readFileSync(new URL('./fixtures/amazon-b08pszmzrq-product-information.html', import.meta.url), 'utf8');
+  const result = parseAmazonProductPage(source, { marketplace: 'AU', asin: 'B08PSZMZRQ' });
+  assert.equal(result.productWeightKg, 0.02);
+  assert.equal(result.productWeightEvidence.rawText, '0.02 Kilograms');
+  assert.equal(result.productWeightEvidence.label, 'item weight');
+  assert.equal(result.productInformation.rowCount, 23);
+  assert.equal(result.productInformation.sections.length, 4);
+  assert.equal(result.productInformation.weightSelection.policy, 'item_weight_only');
 });
 
-test('inline product and package labels select their adjacent quantities, not unrelated earlier units', () => {
-  const result = parse('<div id="productDescription">Supports up to 10 kg. Net Weight: 90 g; Package Weight: 130 g.</div>');
-  assert.equal(result.productWeightKg, 0.09);
-  assert.equal(result.packageWeightKg, 0.13);
-  assert.equal(result.productWeightEvidence.rawText, 'Net Weight: 90 g');
-  assert.equal(result.packageWeightEvidence.rawText, 'Package Weight: 130 g');
+test('captured laundry-bag Measurements reads 170g and keeps 4.54kg load capacity out of weight', () => {
+  const source = readFileSync(new URL('./fixtures/amazon-b08ywzc4c6-product-information.html', import.meta.url), 'utf8');
+  const result = parseAmazonProductPage(source, { marketplace: 'AU', asin: 'B08YWZC4C6' });
+  assert.equal(result.productWeightKg, 0.17);
+  assert.equal(result.productWeightEvidence.rawText, '170 Grams');
+  assert.equal(result.productWeightEvidence.asin, 'B08YWZC4C6');
+  assert.equal(result.productInformation.weightStatus, 'found');
 });
 
-test('an inline package weight cannot invent a product weight and vice versa', () => {
-  const packageOnly = parse('<div id="productDescription">Package Weight: 0.2 lb</div>');
-  assert.equal(packageOnly.productWeightKg, null);
-  assert.equal(packageOnly.productWeightEvidence, null);
-  assert.equal(packageOnly.packageWeightKg, 0.090718);
-  const productOnly = parse('<div id="productDescription">Item Weight: 125 g</div>');
-  assert.equal(productOnly.productWeightKg, 0.125);
-  assert.equal(productOnly.packageWeightKg, null);
-  assert.equal(productOnly.packageWeightEvidence, null);
-});
+for (const label of ['Product Weight', 'Net Weight', 'Weight', 'Package Weight', 'Shipping Weight', 'Gross Weight', 'Item Display Weight', 'Load Capacity', 'Maximum Weight', 'Product Dimensions', 'Package Dimensions']) {
+  test(label + ' cannot substitute for Item Weight', () => {
+    const result = parse(details([[label, '150 g']]));
+    assert.equal(result.productWeightKg, null);
+    assert.equal(result.productWeightEvidence, null);
+    assert.equal(result.productInformation.weightSelection.selected, null);
+    assert.notEqual(result.productInformation.weightStatus, 'found');
+  });
+}
 
-test('dimension rows distinguish embedded item mass from parcel mass and never treat size as weight', () => {
-  const result = parse('<div id="detailBullets_feature_div"><ul><li><b>Product Dimensions:</b> 12 x 4 x 2 cm; 60 g</li><li><b>Parcel Dimensions:</b> 14 x 5 x 3 cm; 80 g</li></ul></div>');
-  assert.equal(result.productWeightKg, 0.06);
-  assert.equal(result.packageWeightKg, 0.08);
-  assert.equal(result.productWeightEvidence.label, 'product dimensions');
-  const absent = parse('<table id="productDetails_techSpec_section_1"><tr><th>Product Dimensions</th><td>20 x 10 x 4 cm</td></tr></table>');
-  assert.equal(absent.productWeightKg, null);
-  assert.equal(absent.packageWeightKg, null);
-});
-
-test('hidden, comparison, recommendation and other-ASIN weights cannot fill a missing current-product weight', () => {
-  for (const wrapper of ['hidden', 'id="recommendations"', 'id="comparison"', 'data-asin="B0A0000009"']) {
-    const result = parse('<div ' + wrapper + '><table id="productDetails_detailBullets_sections1"><tr><th>Item Weight</th><td>999 g</td></tr></table></div>');
-    assert.equal(result.productWeightKg, null, wrapper);
-  }
-  const nested = parse('<div id="productDescription">Description <div data-asin="B0A0000009">Item Weight: 999 g</div></div>');
-  assert.equal(nested.productWeightKg, null);
-  assert.equal(parse('<div id="productDescription">Maximum weight: 100 kg</div>').productWeightKg, null);
-});
-
-test('weights accept standard JSON-LD unit codes only for the current product', () => {
-  for (const [unitCode, value, expected] of [['GRM', 120, 0.12], ['KGM', 0.2, 0.2], ['ONZ', 2, 0.056699], ['LBR', 0.2, 0.090718]]) {
-    const json = { '@type': 'Product', sku: asin, name: 'Sample', weight: { value, unitCode } };
-    const result = parse('<script type="application/ld+json">' + JSON.stringify(json) + '</script>');
-    assert.equal(result.productWeightKg, expected, unitCode);
-    assert.equal(result.packageWeightKg, null);
-    assert.equal(result.productWeightEvidence.source, 'matching_product_json_ld');
+test('Item Weight normalizes formatting and units without mixing unrelated labels', () => {
+  for (const [text, expected] of [['170 Grams', .17], ['0.37 Pounds', .167829], ['2 ounces', .056699], ['0.02 Kilograms', .02]]) {
+    const result = parse(details([['Item\u200e Weight :', text], ['Net Weight', '900 g'], ['Item Display Weight', '3 kg'], ['Package Weight', '4 kg']]));
+    assert.equal(result.productWeightKg, expected);
+    assert.equal(result.productWeightEvidence.label, 'item weight');
+    assert.equal(result.productWeightEvidence.rawText, text);
+    assert.equal(result.productInformation.weightConflicts, undefined);
   }
 });
 
-test('missing page weights stay null and never fabricate a verified minimum weight', () => {
-  const result = parse('<div id="itemDetails_feature_div"><p>No weight supplied</p></div>');
+test('native Measurements and technical Item Weight take priority over old bullets and other structured rows', () => {
+  const old = '<div id="detailBullets_feature_div"><ul><li><b>Item Weight:</b> 0.37 Pounds</li></ul></div>';
+  const main = '<div id="productDetails_feature_div">' + panel('Item details', [['Item Weight', '200 g']]) + panel('Measurements', [['Item Weight', '170 Grams']]) + '</div>';
+  const result = parse(old + main);
+  assert.equal(result.productWeightKg, .17);
+  assert.equal(result.productWeightEvidence.rawText, '170 Grams');
+  assert.equal(result.productInformation.weightSelection.alternatives.length, 2);
+  assert.ok(result.productInformation.weightSelection.alternatives.some(reading => reading.rawText === '0.37 Pounds'));
+  assert.equal(result.productInformation.reason, null);
+  const technical = parse(old + '<table id="productDetails_techSpec_section_1"><tr><th>Item Weight</th><td>140 g</td></tr></table>');
+  assert.equal(technical.productWeightKg, .14);
+});
+
+test('different Item Weight readings retain one prioritized reading and diagnostics instead of rejecting the product', () => {
+  for (const values of [['20 g', '30 g'], ['170 g', '0.3700 pounds'], ['1 kg', '2.3 lb']]) {
+    const result = parse(details(values.map(value => ['Item Weight', value])));
+    assert.ok(result.productWeightKg > 0);
+    assert.equal(result.productWeightEvidence.rawText, values[0]);
+    assert.equal(result.productInformation.status, 'complete');
+    assert.equal(result.productInformation.reason, null);
+    assert.equal(result.productInformation.weightConflicts, undefined);
+    assert.equal(result.productInformation.weightSelection.alternatives[0].rawText, values[1]);
+  }
+  const combined = parse(details([['Item Weight', '20 g (0.02 kg)']]));
+  assert.equal(combined.productWeightKg, .02);
+  assert.equal(combined.productInformation.weightSelection.alternatives.length, 1);
+});
+
+test('page, canonical, nested-owner and specification ASIN differences are diagnostics, preserving task ASIN', () => {
+  const other = 'B0A0000009';
+  const result = parseAmazonProductPage('<input id="ASIN" value="' + other + '"><link rel="canonical" href="https://www.amazon.com.au/dp/' + other + '"><h1 id="productTitle">Sample</h1>'
+    + details([['ASIN', other], ['Item Weight', '<span data-asin="' + other + '">140 g</span>'], ['Date First Available', '21 December 2021']]), { marketplace: 'AU', asin });
+  assert.equal(result.asin, asin);
+  assert.equal(result.productWeightKg, .14);
+  assert.equal(result.productWeightEvidence.asin, asin);
+  assert.equal(result.amazonFirstAvailableDate, '2021-12-21');
+  assert.equal(result.productInformation.identityDiagnostics.pageAsin, other);
+  assert.deepEqual(result.productInformation.identityDiagnostics.specificationAsins, [other]);
+  assert.equal(result.productInformation.discardedSections, undefined);
+});
+
+test('captured mixed-ASIN Voyager page keeps its displayed date without refusing the source product', () => {
+  const source = readFileSync(new URL('./fixtures/amazon-b09nxs1bll-mixed-identity.html', import.meta.url), 'utf8');
+  const result = parseAmazonProductPage(source, { marketplace: 'AU', asin: 'B09NXS1BLL' });
+  assert.equal(result.asin, 'B09NXS1BLL');
+  assert.equal(result.amazonFirstAvailableDate, '2021-12-21');
+  assert.ok(result.productInformation.identityDiagnostics.specificationAsins.includes('B09QHCKV68'));
+  assert.ok(result.productInformation.identityDiagnostics.specificationAsins.includes('B09NXS1BLL'));
   assert.equal(result.productWeightKg, null);
-  assert.equal(result.packageWeightKg, null);
-  assert.equal(result.productWeightEvidence, null);
-  assert.equal(result.packageWeightEvidence, null);
-  assert.equal(result.fieldSources.productWeightKg, undefined);
+  assert.equal(result.productInformation.discardedSections, undefined);
 });
 
-test('merged weight evidence remains separate and cannot overwrite manual weight provenance', () => {
-  const parsed = parse('<div id="productDescription">Item Weight: 125 g; Package Weight: 150 g</div>');
-  const item = { ...parsed, marketplace: 'AU', detailStatus: 'success' };
-  const base = { id: 'AU:' + asin, asin, marketplace: 'AU', suppliers: [{ unitPriceCny: 25 }], manualPurchaseCost: true, purchaseCost: 25 };
-  const merged = mergeAmazonCollectionProduct(base, item);
-  assert.deepEqual(merged.productWeightEvidence, parsed.productWeightEvidence);
-  assert.deepEqual(merged.packageWeightEvidence, parsed.packageWeightEvidence);
-  assert.equal(merged.productWeight, 0.125);
-  assert.equal(merged.fbaWeight, 0.15);
-  assert.deepEqual(merged.suppliers, base.suppliers);
-  assert.equal(merged.purchaseCost, 25);
-  const manual = { ...base, manualWeight: true, productWeight: 0.6, productWeightEvidence: { source: 'manual' } };
-  const protectedProduct = mergeAmazonCollectionProduct(manual, item);
-  assert.equal(protectedProduct.productWeight, 0.6);
-  assert.deepEqual(protectedProduct.productWeightEvidence, { source: 'manual' });
+test('hidden, template, review and recommendation Item Weight rows remain excluded', () => {
+  for (const wrapper of ['hidden', 'class="aok-hidden"', 'style="display:none"', 'id="recommendations"', 'class="product-template"', 'class="comparison-table"', 'data-component-type="sponsored-products"']) {
+    assert.equal(parse('<div ' + wrapper + '>' + details([['Item Weight', '999 g']]) + '</div>').productWeightKg, null, wrapper);
+  }
+  for (const hidden of ['hidden', 'aria-hidden="true"', 'style="display:none"']) {
+    assert.equal(parse('<div id="productDetails_feature_div"><table><tr><th>Item Weight</th><td ' + hidden + '>999 g</td></tr></table></div>').productWeightKg, null);
+  }
+  const folded = parse('<div id="productDetails_feature_div">' + panel('Measurements', [['Item Weight', '140 g']]) + '</div>');
+  assert.equal(folded.productWeightKg, .14);
+});
+
+test('definition lists, table cells and labelled grids read only explicit Item Weight', () => {
+  for (const body of [
+    '<dl><dt>Item Weight</dt><dd>125 g</dd></dl>',
+    '<div role="row"><span role="cell">Item Weight</span><span role="cell">125 g</span></div>',
+    '<div class="a-row"><span class="a-text-bold">Item Weight</span><span>125 g</span></div>',
+    '<div class="a-fixed-left-grid"><div class="a-fixed-left-grid-col">Item Weight</div><div class="a-fixed-left-grid-col">125 g</div></div>',
+  ]) assert.equal(parse('<div id="itemDetails_feature_div">' + body + '</div>').productWeightKg, .125);
+});
+
+test('marketing prose and JSON-LD do not provide an Item Weight substitute', () => {
+  for (const body of [
+    '<div id="productDescription">Net Weight: 125 g; Item Weight: 130 g</div>',
+    '<div id="productDescription"><table><tr><th>Net Weight</th><td>125 g</td></tr></table></div>',
+    '<script type="application/ld+json">' + JSON.stringify({ '@type': 'Product', sku: asin, name: 'Sample', weight: '125 g' }) + '</script>',
+    '<div id="feature-bullets"><ul><li>Maximum weight capacity 50 kg</li></ul></div>',
+  ]) assert.equal(parse(body).productWeightKg, null);
+});
+
+test('an unavailable Item Weight stays unresolved and structural HTML alone never proves absence', () => {
+  const invalid = parse(details([['Item Weight', 'not available']]));
+  assert.equal(invalid.productWeightKg, null);
+  assert.equal(invalid.productInformation.weightStatus, 'unresolved');
+  const absent = parse(details([['Brand', 'Example'], ['Package Weight', '500 g']]));
+  assert.equal(absent.productWeightKg, null);
+  assert.equal(absent.packageWeightKg, .5);
+  assert.equal(absent.productInformation.weightStatus, 'unresolved');
+  const bounded = parse(details(Array.from({length: 301}, (_, index) => ['Field ' + index, 'Value'])));
+  assert.equal(bounded.productInformation.status, 'incomplete');
 });

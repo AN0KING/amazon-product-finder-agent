@@ -8,7 +8,8 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ImageSearchRatePolicy, classifySearchFailure } from '../lib/image-search-rate-policy.mjs';
+import { ImageSearchRatePolicy, classifySearchFailure, isSearchExecutionPause } from '../lib/image-search-rate-policy.mjs';
+import { resolve1688RuntimePaths } from '../lib/runtime-paths.mjs';
 
 // Evaluate bridge functions with all external session/browser dependencies mocked.
 // Never import the executable server or open its production state / HTTP port.
@@ -16,6 +17,7 @@ const original = await fs.readFile(new URL('../server.mjs', import.meta.url), 'u
 async function harness(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bb1688-bridge-test-'));
   let calls = 0;
+  let workerActive = false;
   let verifies = 0;
   let spawns = 0;
   let dispatchImpl = async () => ({ offers: [] });
@@ -27,12 +29,18 @@ async function harness(t) {
     serverUrl: pathToFileURL(path.join(dir, 'server.mjs')).href,
     process: { env: {}, pid: process.pid, execPath: process.execPath, stdout: { write: () => true } },
     ImageSearchRatePolicy: class extends ImageSearchRatePolicy { constructor(options) { super({ ...options, now: () => clock }); } },
-    classifySearchFailure,
+    classifySearchFailure, isSearchExecutionPause,
+    resolve1688RuntimePaths: ({ projectRoot }) => resolve1688RuntimePaths({ projectRoot, env: {
+      BB1688_IMAGE_FINDER_ROOT: path.join(dir, 'image-finder'),
+      BB1688_HOME: path.join(dir, 'session'),
+    } }),
     readState: async () => ({ version: 1, memberId: 'cached-account', nick: 'cached-name' }),
     writeState: async () => {}, parseIdentity: () => ({ memberId: 'cached-account' }),
     verifyOnlineStatus: async () => { verifies++; return { ok: true }; },
     withSession: async (_options, callback) => callback({ cookies: async () => [] }),
-    dispatch: async (...args) => { calls++; return dispatchImpl(...args); },
+    hasActiveSearchProcess: () => workerActive,
+    SEARCH_EXECUTION_TIMEOUT_MS: 180_000,
+    runImageSearchProcess: async (...args) => { calls++; return dispatchImpl(...args); },
     CliError: Error, detectProcurementImageType: () => null,
     spawn: () => {
       spawns++;
@@ -50,7 +58,7 @@ async function harness(t) {
   source = source.slice(0, source.lastIndexOf('\nmain().catch'));
   source += `\nglobalThis.api = { tasks, taskQueue, searchPolicy, auth, pumpQueue, executeTask, applyTaskError,
     publicTask, publicAuth, queueSummary, handleRequest, handleConfirmTask, handleResumeQueue, handleStartRateTrial, openLogin,
-    spawnLoginChild, loginChildAlive, loadTasksFromDisk, healthPayload,
+    spawnLoginChild, loginChildAlive, loadTasksFromDisk, preserveInterruptedSearchPause, healthPayload,
     ready: () => { queueReady = true; }, child: () => loginChild,
     flush: async () => { await logWriteQueue; }, cleanup: () => { cancelQueueWake(); queueReady = false; } };`;
   vm.runInContext(source, context, { filename: 'bridge-isolated-test.mjs' });
@@ -62,6 +70,7 @@ async function harness(t) {
   return { ...api, dir, spawned,
     logText: async () => { await api.flush(); return fs.readFile(path.join(dir, 'data', 'sourcing-console', 'logs', 'service.log'), 'utf8'); },
     counts: () => ({ calls, verifies, spawns }),
+    workerActive: value => { workerActive = value; },
     dispatch: impl => { dispatchImpl = impl; }, advance: ms => { clock += ms; }, now: () => clock,
     writeFile: impl => { writeFileImpl = impl; },
     post: async (url, payload) => {
@@ -162,7 +171,7 @@ test('explicit resume refuses missing proof, then requeues only after confirmati
   assert.equal(result.queue.ratePolicy.manualResumeRequired, false);
   assert.equal(h.tasks.get('risk').status, 'queued');
   assert.equal(h.counts().calls, 0);
-  assert.equal(h.searchPolicy.waitMs(), 18_000);
+  assert.equal(h.searchPolicy.waitMs(), 60_000);
 });
 
 test('429 enters a shared persisted cooldown and bounded retry instead of a manual pause', async t => {
@@ -564,3 +573,107 @@ test('executeTask propagates the original result-record error if recording the m
   assert.equal(h.searchPolicy.view().pausedReason, 'RATE_TRIAL_RECORD_FAILED');
   assert.equal(h.counts().calls, 1);
 });
+
+for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED']) {
+  test(`${code} preserves the task and stops the queue without repeating an unknown search`, async t => {
+    const h = await harness(t);
+    await h.handleStartRateTrial(rateTrialConfig);
+    for (const id of ['stalled', 'next']) { h.tasks.set(id, task(id)); h.taskQueue.push(id); }
+    h.dispatch(async () => { throw Object.assign(new Error('owned search did not complete'), { code }); });
+    h.ready(); await h.pumpQueue();
+    assert.equal(h.counts().calls, 1);
+    assert.equal(h.tasks.get('stalled').status, 'failed');
+    assert.equal(h.tasks.get('stalled').failure.code, code);
+    assert.equal(h.tasks.get('next').status, 'queued');
+    assert.equal(h.searchPolicy.view().manualResumeRequired, true);
+    assert.equal(h.searchPolicy.view().pausedReason, code);
+    const trial = h.searchPolicy.view().rateTrial;
+    assert.equal(trial.activeSearch, null);
+    assert.equal(trial.currentStage.started, 1);
+    assert.equal(trial.currentStage.failed, 1);
+    assert.equal(trial.status, 'stopped_manual');
+    h.advance(24 * 3_600_000); await h.pumpQueue();
+    assert.equal(h.counts().calls, 1);
+    const saved = JSON.parse(await fs.readFile(path.join(h.dir, 'data', 'sourcing-console', 'tasks', 'stalled.json'), 'utf8'));
+    assert.equal(saved.failure.code, code);
+    assert.ok(saved.execution.finishedAt);
+  });
+}
+
+test('an unconfirmed worker stop blocks login, queue resume, and new execution even after policy confirmation', async t => {
+  const h = await harness(t);
+  h.workerActive(true);
+  h.tasks.set('pending', task('pending')); h.taskQueue.push('pending');
+  h.ready(); await h.pumpQueue();
+  assert.equal(h.counts().calls, 0);
+  assert.equal(h.queueSummary().running, 1);
+  await assert.rejects(h.handleResumeQueue({ confirmed: true }), { code: 'SEARCH_WORKER_STOP_FAILED' });
+  await assert.rejects(h.openLogin({ purpose: 'login', restart: false }), { code: 'SEARCH_WORKER_STOP_FAILED' });
+  assert.equal(h.counts().spawns, 0);
+});
+
+test('worker progress preserves in-memory phases while rate trial records exactly one result', async t => {
+  const h = await harness(t);
+  await h.handleStartRateTrial(rateTrialConfig);
+  h.tasks.set('phases', task('phases'));
+  h.dispatch(async ({ onProgress, imagePath, max }) => {
+    assert.equal(imagePath, '/mock/image.png'); assert.equal(max, 40);
+    for (const phase of ['validating_image', 'uploading_image', 'searching_offers', 'saving_candidates']) {
+      onProgress({ phase });
+      assert.equal(h.publicTask(h.tasks.get('phases')).execution.phase, phase);
+    }
+    return { offers: [{ offerId: '123' }], imageId: '456' };
+  });
+  await h.executeTask('phases');
+  assert.equal(h.tasks.get('phases').candidates.length, 1);
+  assert.equal(h.publicTask(h.tasks.get('phases')).execution.phase, 'finished');
+  assert.equal(h.searchPolicy.view().rateTrial.currentStage.started, 1);
+  assert.equal(h.searchPolicy.view().rateTrial.currentStage.succeeded, 1);
+});
+
+test('a restart preserves unknown running work for inspection rather than submitting it twice', async t => {
+  const h = await harness(t);
+  const taskDir = path.join(h.dir, 'data', 'sourcing-console', 'tasks');
+  await fs.mkdir(taskDir, { recursive: true });
+  await fs.writeFile(path.join(taskDir, 'interrupted.json'), JSON.stringify(task('interrupted', 'running')));
+  await fs.writeFile(path.join(taskDir, 'next.json'), JSON.stringify(task('next')));
+  await h.loadTasksFromDisk();
+  await h.searchPolicy.initialize([...h.tasks.values()]);
+  await h.preserveInterruptedSearchPause();
+  h.ready(); await h.pumpQueue();
+  assert.equal(h.counts().calls, 0);
+  assert.equal(h.tasks.get('interrupted').failure.code, 'SEARCH_INTERRUPTED');
+  assert.equal(h.tasks.get('interrupted').status, 'failed');
+  assert.equal(h.tasks.get('next').status, 'queued');
+  assert.equal(h.searchPolicy.view().pausedReason, 'SEARCH_INTERRUPTED');
+  const saved = JSON.parse(await fs.readFile(path.join(taskDir, 'interrupted.json'), 'utf8'));
+  assert.equal(saved.failure.code, 'SEARCH_INTERRUPTED');
+});
+
+test('restart inspection never overwrites an existing challenge or human pause', async t => {
+  const h = await harness(t);
+  const interrupted = task('interrupted', 'failed'); interrupted.failure = { code: 'SEARCH_INTERRUPTED' };
+  h.tasks.set(interrupted.id, interrupted);
+  await h.searchPolicy.pauseForManual('RISK_VERIFICATION_REQUIRED', 'risk');
+  const before = h.searchPolicy.view();
+  await h.preserveInterruptedSearchPause();
+  assert.deepEqual(h.searchPolicy.view(), before);
+});
+
+for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED']) {
+  test(`explicit resume after ${code} retries only that checkpoint using its existing task ID`, async t => {
+    const h = await harness(t);
+    const blocked = task('blocked', 'failed'); blocked.failure = { code };
+    const historical = task('older', 'failed'); historical.failure = { code };
+    h.tasks.set(blocked.id, blocked); h.tasks.set(historical.id, historical);
+    await h.searchPolicy.pauseForManual(code, blocked.id);
+    await assert.rejects(h.handleResumeQueue({}), { code: 'RESUME_CONFIRMATION_REQUIRED' });
+    const resumed = await h.handleResumeQueue({ confirmed: true });
+    assert.equal(resumed.queue.ratePolicy.manualResumeRequired, false);
+    assert.equal(h.tasks.get('blocked').status, 'queued');
+    assert.equal(h.tasks.get('blocked').failure, null);
+    assert.equal(h.tasks.get('older').status, 'failed');
+    assert.deepEqual(Array.from(h.taskQueue), ['blocked']);
+    assert.equal(h.counts().calls, 0); // no timer, no implicit user action
+  });
+}

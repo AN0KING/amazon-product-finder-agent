@@ -17,13 +17,13 @@ async function fixture(t, options = {}) {
 
 test('configuration can only slow conservative task frequency; Infinity uses defaults', async t => {
   const { policy, file } = await fixture(t, { minGapMs: 1, cooldownMs: 1 });
-  assert.equal(policy.view().minGapMs, 18_000);
+  assert.equal(policy.view().minGapMs, 60_000);
   assert.equal(policy.view().maxConcurrent, 1);
-  assert.equal(policy.view().cooldownMs, 20_000);
+  assert.equal(policy.view().cooldownMs, 120_000);
   const slow = new ImageSearchRatePolicy({ file, minGapMs: 120_000, cooldownMs: 600_000 });
   assert.equal(slow.view().minGapMs, 120_000);
   assert.equal(slow.view().cooldownMs, 600_000);
-  assert.equal(new ImageSearchRatePolicy({ file, minGapMs: Infinity }).view().minGapMs, 18_000);
+  assert.equal(new ImageSearchRatePolicy({ file, minGapMs: Infinity }).view().minGapMs, 60_000);
 });
 
 test('reservation persists before dispatch and tenth search adds a short pacing rest', async t => {
@@ -32,12 +32,12 @@ test('reservation persists before dispatch and tenth search adds a short pacing 
     assert.equal(await f.policy.beginSearch(), true);
     assert.equal(await f.policy.beginSearch(), false);
     assert.equal(JSON.parse(await fs.readFile(f.file)).searchCount, i);
-    assert.equal(f.policy.waitMs(), i === 10 ? 38_000 : 18_000);
-    if (i < 10) f.advance(18_000);
+    assert.equal(f.policy.waitMs(), i === 10 ? 180_000 : 60_000);
+    if (i < 10) f.advance(60_000);
   }
-  f.advance(18_000);
+  f.advance(60_000);
   assert.equal(await f.policy.beginSearch(), false);
-  f.advance(20_000);
+  f.advance(120_000);
   assert.equal(await f.policy.beginSearch(), true);
 });
 
@@ -48,11 +48,11 @@ test('simultaneous reservation requests allow one search only', async t => {
 
 test('timestamps and count survive restart, including tenth-search cooldown', async t => {
   const f = await fixture(t);
-  for (let i = 0; i < 10; i++) { await f.policy.beginSearch(); if (i < 9) f.advance(18_000); }
+  for (let i = 0; i < 10; i++) { await f.policy.beginSearch(); if (i < 9) f.advance(60_000); }
   const restarted = new ImageSearchRatePolicy({ file: f.file, now: f.now });
   await restarted.initialize();
   assert.equal(restarted.state.searchCount, 10);
-  assert.equal(restarted.waitMs(), 38_000);
+  assert.equal(restarted.waitMs(), 180_000);
   assert.equal(await restarted.beginSearch(), false);
 });
 
@@ -79,7 +79,7 @@ test('only successful image verification then explicit confirmation resumes risk
   assert.equal(await f.policy.resume({}), false);
   assert.equal(await f.policy.resume({ confirmed: true }), true);
   assert.equal(await f.policy.beginSearch(), false);
-  f.advance(20_000);
+  f.advance(120_000);
   assert.equal(await f.policy.beginSearch(), true);
 });
 
@@ -339,14 +339,16 @@ test('first slider freezes its measured rate and queue resume never restarts the
   assert.equal(await f.policy.resume({ confirmed: true }), true);
   f.advance(3 * 3_600_000);
   const frozen = structuredClone(f.policy.view().rateTrial.trigger);
-  await runSearch(f, 'user-resumed');
+  assert.equal(await f.policy.beginSearch({ taskId: 'user-resumed' }), true);
+  assert.equal(await f.policy.finishSearch({ taskId: 'user-resumed', success: true }), false,
+    'ordinary results do not modify the stopped trial');
   await f.policy.startTrial();
   trial = f.policy.view().rateTrial;
   assert.equal(trial.status, 'stopped_risk');
   assert.equal(trial.targetPerHour, 100);
   assert.deepEqual(trial.trigger, frozen);
   assert.equal(trial.history.length, 1);
-  assert.equal(f.policy.waitMs(), 36_000);
+  assert.equal(f.policy.waitMs(), 60_000);
 });
 
 test('enabling the trial during a manual pause cannot clear that pause or verification proof', async t => {

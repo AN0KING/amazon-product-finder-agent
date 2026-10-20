@@ -12,9 +12,8 @@
 //   GET  /api/v1/tasks/:id           任务详情（轮询）
 //   POST /api/v1/tasks/:id/confirm   确认任务并排队执行
 //
-// 浏览器能力全部复用 D:\deliverables\1688-image-finder 的专用 Edge 会话
-// （持久化档案 + proper-lockfile 会话锁 + 原生可见窗口扫码登录），
-// 会话数据目录固定为 D:\deliverables\1688-image-finder\data\1688-session。
+// 浏览器能力使用独立的 1688-image-finder 专用 Edge 会话。
+// 安装包通过环境变量指定组件与数据路径；未配置时保留旧安装的会话位置。
 import crypto from "node:crypto";
 import fsp from "node:fs/promises";
 import http from "node:http";
@@ -22,20 +21,24 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ImageSearchRatePolicy, classifySearchFailure } from "./lib/image-search-rate-policy.mjs";
+import { ImageSearchRatePolicy, classifySearchFailure, isSearchExecutionPause } from "./lib/image-search-rate-policy.mjs";
+import { resolve1688RuntimePaths } from "./lib/runtime-paths.mjs";
+import { runImageSearchProcess, hasActiveSearchProcess, SEARCH_EXECUTION_TIMEOUT_MS } from "./lib/image-search-process.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = 16880;
-const IMAGE_FINDER_ROOT = "D:\\deliverables\\1688-image-finder";
-const BB1688_HOME = "D:\\deliverables\\1688-image-finder\\data\\1688-session";
+const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const runtimePaths = resolve1688RuntimePaths({ projectRoot: PROJECT_ROOT });
+const IMAGE_FINDER_ROOT = runtimePaths.imageFinderRoot;
+const BB1688_HOME = runtimePaths.sessionRoot;
+const DATA_ROOT = runtimePaths.dataRoot;
 const CLI_ENTRY = path.join(IMAGE_FINDER_ROOT, "dist", "cli.js");
 
-// paths.js 在 Windows 下强制要求 BB1688_HOME 等于上述固定目录，
-// 必须在导入任何会话模块之前设置好。
+// Set the dedicated session before importing browser modules. Child processes
+// inherit the same explicit location; no logged-in profile is moved or copied.
 process.env.BB1688_HOME = BB1688_HOME;
+process.env.BB1688_DATA_ROOT = DATA_ROOT;
 
-const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
-const DATA_ROOT = path.join(PROJECT_ROOT, "data", "sourcing-console");
 const HANDSHAKE_DIR = path.join(DATA_ROOT, "runtime-cache", "login-handshakes");
 const TASK_IMAGE_DIR = path.join(DATA_ROOT, "runtime-cache", "task-images");
 const TASKS_DIR = path.join(DATA_ROOT, "tasks");
@@ -63,13 +66,12 @@ const searchPolicy = new ImageSearchRatePolicy({
 
 // ── CLI 会话模块（延迟动态导入：必须先设好 BB1688_HOME） ──────────────────
 const importCli = (rel) => import(pathToFileURL(path.join(IMAGE_FINDER_ROOT, "dist", rel)).href);
-const [{ withSession }, { readState, writeState }, { parseIdentity }, { verifyOnlineStatus }, { dispatch }, { CliError }, { detectProcurementImageType }] =
+const [{ withSession }, { readState, writeState }, { parseIdentity }, { verifyOnlineStatus }, { CliError }, { detectProcurementImageType }] =
   await Promise.all([
     importCli("session/context.js"),
     importCli("session/state.js"),
     importCli("auth/cookies.js"),
     importCli("auth/verify.js"),
-    importCli("session/dispatch.js"),
     importCli("io/errors.js"),
     importCli("procurement/store.js"),
   ]);
@@ -277,10 +279,16 @@ async function loadTasksFromDisk() {
       const task = JSON.parse(raw);
       if (!task?.id || typeof task.status !== "string") continue;
       queueSequence = Math.max(queueSequence, Number(task.queueSequence) || 0);
-      if (task.status === "queued" || task.status === "running") {
-        task.status = "queued";
+      if (task.status === "running") {
+        // A service exit cannot prove whether an upload/search already reached
+        // 1688. Keep this checkpoint for inspection instead of submitting twice.
+        task.status = "failed";
+        task.failure = { code: "SEARCH_INTERRUPTED", message: "上次搜图随服务中断，结果尚未确认，请检查后再继续。" };
+        tasks.set(task.id, task);
+        await persistTask(task);
+      } else {
+        tasks.set(task.id, task);
       }
-      tasks.set(task.id, task);
     } catch (error) {
       log(`任务文件 ${entry} 读取失败：${shortMessage(error)}`);
     }
@@ -304,7 +312,7 @@ async function pumpQueue() {
     while (taskQueue.length > 0) {
       const policy = searchPolicy.view();
       // A failed result write retains its reservation. Never spin/requeue it.
-      if (policy.manualResumeRequired || policy.rateTrial?.activeSearch) break;
+      if (policy.manualResumeRequired || policy.rateTrial?.activeSearch || hasActiveSearchProcess()) break;
       if (loginChildAlive() || loginLaunchPending) break; // 专用 Edge 被登录/验证占用时暂停出队，避免会话锁冲突
       const waitMs = searchPolicy.waitMs();
       if (waitMs > 0) {
@@ -350,7 +358,7 @@ function scheduleQueueWake(waitMs) {
 async function executeTask(taskId) {
   const task = tasks.get(taskId);
   if (!task || task.status !== "queued") return;
-  if (loginChildAlive() || !(await searchPolicy.beginSearch({ taskId }))) {
+  if (loginChildAlive() || hasActiveSearchProcess() || !(await searchPolicy.beginSearch({ taskId }))) {
     enqueueTask(taskId, { front: true });
     return;
   }
@@ -358,14 +366,15 @@ async function executeTask(taskId) {
     task.status = "running";
     task.searchStartedAt = new Date().toISOString();
     task.failure = null;
+    task.execution = { startedAt: task.searchStartedAt,
+      deadlineAt: new Date(Date.now() + SEARCH_EXECUTION_TIMEOUT_MS).toISOString(), phase: "starting" };
     await persistTask(task);
     log(`任务 ${taskId} 开始以图搜款（image=${task.fileName}）`);
     try {
-      const data = await dispatch(
-        "image-search",
-        { imagePath: task.imageFile, max: SEARCH_MAX_OFFERS, headed: false },
-        { headed: false, profile: "default" },
-      );
+      const data = await runImageSearchProcess({
+        imageFinderRoot: IMAGE_FINDER_ROOT, imagePath: task.imageFile, max: SEARCH_MAX_OFFERS,
+        onProgress: progress => { task.execution.phase = progress.phase; },
+      });
       const offers = Array.isArray(data?.offers) ? data.offers : [];
       task.candidates = offers.map(mapOfferToCandidate);
       task.imageId = data?.imageId ?? null;
@@ -376,6 +385,7 @@ async function executeTask(taskId) {
       await applyTaskError(task, error);
       log(`任务 ${taskId} 失败：${task.failure?.code} ${task.failure?.message}`);
     }
+    task.execution = { ...task.execution, finishedAt: new Date().toISOString(), phase: "finished" };
     await persistTask(task);
   } finally {
     try {
@@ -395,6 +405,13 @@ async function executeTask(taskId) {
 async function applyTaskError(task, error) {
   const code = String(error?.code || "").toUpperCase();
   const classification = classifySearchFailure(error);
+  if (isSearchExecutionPause(code)) {
+    task.status = "failed";
+    task.failure = { code, message: shortMessage(error) };
+    cancelQueueWake();
+    await searchPolicy.pauseForManual(code, task.id);
+    return;
+  }
   if (classification === "manual") {
     task.status = "risk_blocked";
     task.failure = { code: "RISK_VERIFICATION_REQUIRED", message: shortMessage(error) || "1688 要求人工滑块验证。" };
@@ -500,6 +517,7 @@ function queueSummary() {
     || String(left.updatedAt).localeCompare(String(right.updatedAt)));
   return {
     ...counts,
+    running: Math.max(counts.running, hasActiveSearchProcess() ? 1 : 0),
     activeTasks,
     waitingLogin: loginChildAlive(),
     riskAutoRetryAt: null,
@@ -522,6 +540,7 @@ function publicTask(task) {
     imageId: task.imageId ?? null,
     candidates: Array.isArray(task.candidates) ? task.candidates : [],
     failure: task.failure ?? null,
+    execution: task.execution ?? null,
   };
 }
 
@@ -714,6 +733,9 @@ function childHasExited(child) {
 }
 
 async function openLogin({ restart, purpose, taskId }) {
+  if (hasActiveSearchProcess() && !runningTaskId) {
+    throw new ApiError(409, "SEARCH_WORKER_STOP_FAILED", "搜图工作进程尚未确认退出，请先检查服务。");
+  }
   const deadline = Date.now() + LOGIN_READY_TIMEOUT_MS;
   if (purpose === "image_search" && !tasks.has(taskId)) {
     throw new ApiError(404, "PROCUREMENT_TASK_NOT_FOUND", "未找到对应的 1688 找厂任务。");
@@ -962,6 +984,12 @@ function runtimePayload() {
     service: { pid: process.pid, startedAt: startedAtIso } };
 }
 
+async function preserveInterruptedSearchPause() {
+  if (searchPolicy.view().manualResumeRequired) return;
+  const interrupted = [...tasks.values()].find(task => task.failure?.code === "SEARCH_INTERRUPTED");
+  if (interrupted) await searchPolicy.pauseForManual("SEARCH_INTERRUPTED", interrupted.id);
+}
+
 async function handleStartRateTrial(body) {
   const allowed = new Set(["confirmed", "startPerHour", "stepPerHour", "stageDurationMs"]);
   if (!body || typeof body !== "object" || Array.isArray(body)
@@ -969,7 +997,7 @@ async function handleStartRateTrial(body) {
     || body.startPerHour !== 90 || body.stepPerHour !== 10 || body.stageDurationMs !== 3_600_000) {
     throw new ApiError(422, "RATE_TRIAL_INPUT_INVALID", "请确认每小时90个起步、每档一小时、逐档增加10个的测试参数。");
   }
-  if (runningTaskId || workerPumping || loginChildAlive() || loginLaunchPending) {
+  if (runningTaskId || workerPumping || hasActiveSearchProcess() || loginChildAlive() || loginLaunchPending) {
     throw new ApiError(409, "RATE_TRIAL_BUSY", "当前搜图或人工验证尚未结束，请稍后启用速率测试。");
   }
   try {
@@ -987,12 +1015,17 @@ async function handleStartRateTrial(body) {
 
 async function handleResumeQueue(body) {
   if (body?.confirmed !== true) throw new ApiError(422, "RESUME_CONFIRMATION_REQUIRED", "请明确确认继续搜图（confirmed 必须为 true）。");
+  if (hasActiveSearchProcess()) throw new ApiError(409, "SEARCH_WORKER_STOP_FAILED", "搜图工作进程尚未确认退出，请先检查服务。");
   if (loginChildAlive() || loginLaunchPending) throw new ApiError(409, "VERIFICATION_IN_PROGRESS", "请等待人工验证窗口完成后再继续搜图。");
+  const beforeResume = searchPolicy.view();
   if (!await searchPolicy.resume({ confirmed: true })) {
     throw new ApiError(409, "MANUAL_VERIFICATION_REQUIRED", "请先在专用 Edge 完成本次人工验证，再点击继续搜图。", { ratePolicy: searchPolicy.view() });
   }
   for (const task of [...tasks.values()].sort((a, b) => Number(a.queueSequence || 0) - Number(b.queueSequence || 0))) {
-    if (task.status !== "risk_blocked" && !(task.status === "failed" && task.failure?.code === "AUTH_REQUIRED")) continue;
+    const interruptedTask = isSearchExecutionPause(beforeResume.pausedReason)
+      && task.id === beforeResume.blockedTaskId && task.status === "failed"
+      && task.failure?.code === beforeResume.pausedReason;
+    if (!interruptedTask && task.status !== "risk_blocked" && !(task.status === "failed" && task.failure?.code === "AUTH_REQUIRED")) continue;
     task.status = "queued";
     task.failure = null;
     await persistTask(task);
@@ -1087,6 +1120,7 @@ async function main() {
   }
   await loadTasksFromDisk();
   await searchPolicy.initialize([...tasks.values()]);
+  await preserveInterruptedSearchPause();
   await loadAuthFromDisk();
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {

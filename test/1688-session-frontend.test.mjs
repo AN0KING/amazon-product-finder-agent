@@ -1,3 +1,4 @@
+import * as listingDate from "../lib/amazon-listing-date.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -29,7 +30,7 @@ function harness() {
   let resumeCount = 0;
   let respond = async (path) => { throw new Error(`Unexpected request ${path}`); };
   const context = vm.createContext({
-    ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry, ...salesPolicy, structuredClone, AbortController, DOMException, URL,
+    ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry, ...salesPolicy, structuredClone, AbortController, DOMException, URL,
     document: { addEventListener() {}, getElementById: element, querySelector() { return null; }, querySelectorAll() { return []; } },
     window: { setInterval(callback, ms) { intervals.push({ callback, ms }); return intervals.length; }, clearInterval() {},
       setTimeout(callback, ms) { timeouts.push({ callback, ms, canceled: false }); return timeouts.length; },
@@ -345,4 +346,92 @@ test("an actual manual challenge is shown separately from a cached risk pause", 
     queue: { ratePolicy: ratePolicy({ pausedReason: "RISK_VERIFICATION_REQUIRED" }) } }));
   assert.match(fixture.element("supplier1688StatusText").textContent, /正在要求人工验证/);
   assert.equal(fixture.element("resume1688Button").hidden, true);
+});
+
+for (const [code, expected] of [
+  ['EDGE_STARTUP_TIMEOUT', /启动连接超时/],
+  ['EDGE_WINDOW_PROOF_TIMEOUT', /窗口检查超时/],
+  ['EDGE_WINDOW_WRONG_DESKTOP', /当前可操作桌面/],
+  ['EDGE_WINDOW_CHECK_FAILED', /窗口检查程序执行失败/],
+  ['EDGE_WINDOW_NOT_VISIBLE', /未确认可操作的 Edge 窗口/],
+]) {
+  test(`${code} explains window closure while preserving the existing verification pause`, () => {
+    const fixture = harness();
+    fixture.app.apply(runtime({ auth: { ready: true, windowOpen: false, lastWindowError: {
+      code, message: 'Microsoft Edge did not create a visible, usable login window.',
+    } }, queue: { riskBlocked: 1, activeTasks: [{ id: taskId, status: 'risk_blocked' }],
+      ratePolicy: ratePolicy({ minGapMs: 40_000, pausedReason: 'RISK_VERIFICATION_REQUIRED',
+        manualResumeRequired: true, manualVerificationCompletedAt: null }) } }));
+    const message = fixture.element('supplier1688StatusText').textContent;
+    assert.match(message, expected);
+    assert.match(message, /验证未完成/);
+    assert.doesNotMatch(message, /Microsoft Edge did not create|上次窗口处理未完成/);
+    assert.equal(fixture.app.state().queue.ratePolicy.minGapMs, 40_000);
+    assert.equal(fixture.app.state().queue.ratePolicy.pausedReason, 'RISK_VERIFICATION_REQUIRED');
+    assert.equal(fixture.element('resume1688Button').hidden, true);
+    assert.equal(fixture.resumes(), 0);
+    assert.equal(fixture.calls.length, 0);
+  });
+}
+
+test("an online login probe failure explains the unconfirmed check without treating an opened result page as verification", async () => {
+  const fixture = harness();
+  fixture.app.apply(runtime({ auth: { ready: true, windowOpen: true, imageSearchPhase: "image_selected_waiting_result" } }));
+  const windowPoll = fixture.timeouts.find(item => item.ms === 3000 && !item.canceled);
+  assert.ok(windowPoll);
+  const observedRuntime = runtime({
+    auth: {
+      ready: true, reason: "ready", checking: false, windowOpen: false, checkedAt: null,
+      imageSearchPhase: null,
+      lastWindowError: {
+        code: "LOGIN_ONLINE_VERIFICATION_FAILED",
+        message: "1688 did not confirm the signed-in session online.",
+      },
+    },
+    queue: {
+      riskBlocked: 1, activeTasks: [{ id: taskId, status: "risk_blocked" }],
+      ratePolicy: ratePolicy({ minGapMs: 40_000, pausedReason: "RISK_VERIFICATION_REQUIRED",
+        manualResumeRequired: true, manualVerificationCompletedAt: null }),
+    },
+  });
+  fixture.respond(async path => {
+    assert.equal(path, "/api/v1/runtime");
+    return observedRuntime;
+  });
+  await windowPoll.callback();
+  const message = fixture.element("supplier1688StatusText").textContent;
+  assert.match(message, /在线登录校验.*未确认/);
+  assert.match(message, /图片搜索队列保持暂停/);
+  assert.doesNotMatch(message, /上次窗口处理未完成|did not confirm/);
+  assert.match(message, /图片阻塞 1 项/);
+  assert.equal(fixture.app.state().status, "image_verification_required");
+  assert.equal(fixture.element("resume1688Button").hidden, true);
+  assert.equal(fixture.app.state().queue.ratePolicy.minGapMs, 40_000);
+  assert.equal(fixture.app.state().queue.ratePolicy.pausedReason, "RISK_VERIFICATION_REQUIRED");
+  assert.equal(fixture.resumes(), 0);
+  assert.deepEqual(fixture.calls.map(call => [call.path, call.method]), [["/api/v1/runtime", "GET"]]);
+});
+
+test("a confirmed image verification supersedes an earlier online probe failure without auto-resuming the queue", async () => {
+  const fixture = harness();
+  const oldError = {
+    code: "LOGIN_ONLINE_VERIFICATION_FAILED", message: "1688 did not confirm the signed-in session online.",
+  };
+  const current = runtime({ auth: { ready: true, windowOpen: false, lastWindowError: oldError }, queue: {
+    riskBlocked: 1, activeTasks: [{ id: taskId, status: "risk_blocked" }],
+    ratePolicy: ratePolicy({ pausedReason: "RISK_VERIFICATION_REQUIRED" }),
+  } });
+  fixture.app.apply(current);
+  fixture.respond(async path => {
+    assert.equal(path, "/api/v1/runtime");
+    return { ...current, queue: { ...current.queue, ratePolicy: { ...current.queue.ratePolicy,
+      manualVerificationCompletedAt: "2026-10-15T01:35:00.000Z" } } };
+  });
+  assert.equal(await fixture.app.load(), true);
+  assert.match(fixture.element("supplier1688StatusText").textContent, /图片验证已完成，等待继续搜图/);
+  assert.doesNotMatch(fixture.element("supplier1688StatusText").textContent, /上次窗口处理未完成|did not confirm/);
+  assert.equal(fixture.element("resume1688Button").hidden, false);
+  assert.equal(fixture.app.state().queue.ratePolicy.pausedReason, "RISK_VERIFICATION_REQUIRED");
+  assert.equal(fixture.resumes(), 0);
+  assert.deepEqual(fixture.calls.map(call => [call.path, call.method]), [["/api/v1/runtime", "GET"]]);
 });

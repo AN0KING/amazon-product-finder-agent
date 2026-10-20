@@ -318,3 +318,12 @@ test("a missing existing task returns its ID and never silently creates a replac
   assert.equal(fixture.calls.some(call => call.method === "POST"), false);
   assert.equal(fixture.images.downloaded, 0);
 });
+
+
+for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED']) {
+  test(`${code} is reported as execution interruption and never creates another task`, async () => {
+    const fixture = clientHarness({runtime: runtimePayload({ratePolicy: {manualResumeRequired: true, pausedReason: code}})});
+    await assert.rejects(fixture.client.searchByImage(searchInput()), error => error.code === code && !error.message.includes('图片验证'));
+    assert.equal(fixture.calls.some(call => call.pathname === '/api/v1/tasks' && call.method === 'POST'), false);
+  });
+}

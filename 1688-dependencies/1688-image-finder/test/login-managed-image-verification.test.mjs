@@ -4,9 +4,10 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import test from 'node:test';
 import { CliError } from '../dist/io/errors.js';
-import { CURRENT_IMAGE_SEARCH_OFFER_METHODS, readImageResultId } from '../dist/commands/image-search.js';
+import { startManagedImageSearchEvidence } from '../dist/session/image-search-verification-evidence.js';
 import { readSearchMtopRequestMeta, SEARCH_APP_ID, SEARCH_MTOP_API } from '../dist/session/search-mtop.js';
 import { withTimeout } from '../dist/session/wait.js';
+import { classifyPageState } from '../dist/session/page-state.js';
 
 const loginSource = await readFile(new URL('../dist/commands/login.js', import.meta.url), 'utf8');
 const imageSource = await readFile(new URL('../dist/commands/image-search.js', import.meta.url), 'utf8');
@@ -16,6 +17,11 @@ const block = (source, first, next) => {
   assert.ok(start >= 0 && end > start);
   return source.slice(start, end).replace(/^export /gm, '');
 };
+const { CURRENT_IMAGE_SEARCH_OFFER_METHODS, readImageResultId, matchesImageOfferRequest } = vm.runInNewContext([
+  block(imageSource, 'export const CURRENT_IMAGE_SEARCH_OFFER_METHODS =', 'export async function execute('),
+  block(imageSource, 'export function readImageResultId(', 'async function waitPastImageSearchRiskControl('),
+  '({ CURRENT_IMAGE_SEARCH_OFFER_METHODS, readImageResultId, matchesImageOfferRequest })',
+].join('\n'), { URL, SEARCH_APP_ID });
 const source = [
   block(loginSource, "const LOGIN_URL =", 'async function readBrokerManagedImageSearchUpload('),
   block(loginSource, 'async function completeManagedImageSearchVerification(', 'async function waitForImageSearchVerification('),
@@ -93,13 +99,25 @@ function harness({
   const context = {
     pages: () => [page],
     newPage: async () => { throw new Error('The native image-search page must be reused.'); },
-    cookies: async () => [{ name: 'fixture-logged-in', value: 'yes' }],
+    cookies: async () => [{ name: 'unb', domain: '.1688.com', value: identity.memberId, expires: 86400 }],
   };
   const advance = async ms => {
     time += ms;
     if (calls.uploads) {
       state = after[Math.min(afterSamples, after.length - 1)];
       afterSamples += 1;
+      const imageId = readImageResultId(new URL(state.url));
+      if (state.kind === 'normal_1688_page' && imageId) {
+        const data = JSON.stringify({ appId: SEARCH_APP_ID, params: {
+          method: 'imageOfferSearchService', imageId, imageIdList: imageId,
+          pageSize: 60, beginPage: 1, searchScene: 'pcImageSearch', appName: 'pctusou', tab: 'imageSearch',
+        } });
+        const request = { url: () => `https://h5api.m.1688.com/h5/${SEARCH_MTOP_API}/1.0/?data=${encodeURIComponent(data)}`, postData: () => null };
+        page.emit('request', request);
+        page.emit('response', { request: () => request, url: request.url, status: () => 200,
+          text: async () => JSON.stringify({ ret: ['SUCCESS::ok'], data: { data: { OFFER: { items: [{ data: { offerId: '987654321012' } }] } } } }) });
+        await Promise.resolve();
+      }
     } else {
       state = before[Math.min(beforeSamples, before.length - 1)];
       beforeSamples += 1;
@@ -107,7 +125,7 @@ function harness({
   };
   const mock = vm.createContext({
     URL, Error, CliError, Date: { now: () => time }, readImageResultId, withTimeout,
-    readSearchMtopRequestMeta, SEARCH_APP_ID, CURRENT_IMAGE_SEARCH_OFFER_METHODS,
+    readSearchMtopRequestMeta, SEARCH_APP_ID, CURRENT_IMAGE_SEARCH_OFFER_METHODS, matchesImageOfferRequest, startManagedImageSearchEvidence,
     resolveImageSearchUploadInput: async candidate => {
       assert.equal(candidate, page);
       calls.inputResolutions += 1;
@@ -168,7 +186,7 @@ function harness({
       return closed();
     },
     requireBoundPersistentIdentity: async () => identity,
-    verifyPersistedProfileIdentityWhileLocked: async () => identity,
+    verifyPersistedProfileIdentityWhileLocked: async () => { events.push('persistent-verified'); return identity; },
     verifyPersistedProfileWhileLocked: async (_profile, verified) => {
       assert.equal(verified, identity);
       events.push('persistent-verified');
@@ -176,9 +194,10 @@ function harness({
     },
     withSession: async () => { throw new Error('Managed image verification must use the native visible branch.'); },
     parseIdentity: () => identity,
+    requireUniqueOfficialIdentity: () => identity,
     requireOnlineIdentity: async () => { events.push('online-verified'); },
     persistOfficialSessionCookies: async () => { events.push('cookies-persisted'); return identity; },
-    assertSameIdentity: (a, b) => assert.equal(a.memberId, b.memberId),
+    assertSameIdentity: (a, b) => { assert.equal(a.memberId, b.memberId); },
     nowIso: () => '2026-01-01T00:00:00.000Z',
     writeState: async value => { calls.finalStates.push(value); },
     emit: value => { calls.emitted.push(value.data); },
@@ -250,6 +269,35 @@ function assertStageLogs(mock, stages) {
   assert.doesNotMatch(mock.calls.stageLogs.join(''), /https?:|secret|fixture-member|fixture-account|fixture-token|fixture-attempt|same-task-image|synthetic-verified-image|private-fragment/);
 }
 
+test('a saved Edge network error stops verification without upload, success, or retry navigation', async () => {
+  const networkError = classifyPageState({
+    url: 'chrome-error://chromewebdata/', title: 'login.taobao.com',
+    text: '无法访问此页面 ERR_CONNECTION_CLOSED',
+  });
+  const mock = harness({ before: [networkError] });
+  await assert.rejects(mock.run(), error => {
+    assert.equal(error.code, 'IMAGE_SEARCH_NETWORK_ERROR');
+    assert.match(error.message, /ERR_CONNECTION_CLOSED/);
+    assert.match(error.message, /连接失败/);
+    assert.doesNotMatch(error.message, /not signed in|上传控件|不支持/);
+    return true;
+  });
+  assert.equal(mock.calls.uploads, 0);
+  assert.deepEqual(mock.calls.navigation, []);
+  assertUnverified(mock);
+});
+
+test('a connection error while waiting for current image results cannot be mistaken for verification success', async () => {
+  const networkError = classifyPageState({
+    url: 'chrome-error://chromewebdata/', title: 'login.taobao.com',
+    text: 'ERR_CONNECTION_CLOSED',
+  });
+  const mock = harness({ after: [networkError] });
+  await assert.rejects(mock.run(), { code: 'IMAGE_SEARCH_NETWORK_ERROR' });
+  assert.equal(mock.calls.uploads, 1);
+  assertUnverified(mock);
+});
+
 test('broker image verification reuses native image search and publishes success only after six normal new-result samples', async () => {
   const mock = harness();
   await mock.run();
@@ -261,11 +309,14 @@ test('broker image verification reuses native image search and publishes success
   assert.equal(mock.samples().after, 6);
   assert.equal(mock.calls.finalStates.length, 1);
   assert.equal(mock.calls.emitted[0].ok, true);
-  assert.deepEqual(mock.events, ['ready', 'front', 'upload', 'online-verified', 'cookies-persisted', 'native-visible-verified', 'context-closed', 'persistent-verified']);
+  assert.deepEqual(mock.events, ['ready', 'front', 'upload', 'cookies-persisted', 'native-visible-verified', 'context-closed', 'persistent-verified']);
   assert.deepEqual(mock.calls.artifacts, []);
   assertStageLogs(mock, ['waiting_upload_page', 'upload_control_ready', 'image_selected_waiting_result', 'verified_result']);
   const verifiedStage = mock.calls.stageEvents.find(entry => entry.stage === 'verified_result');
-  assert.ok(verifiedStage.events.includes('online-verified'), 'The account identity must be verified before announcing a verified result.');
+  assert.ok(verifiedStage.events.includes('upload'), 'The current task must submit its image before announcing a verified result.');
+  assert.ok(!mock.events.includes('online-verified'), 'Managed image verification must not probe an unrelated workspace.');
+  assert.equal(mock.page.listenerCount('response'), 0);
+  assert.equal(mock.page.listenerCount('close'), 0);
 });
 
 test('successful verification emits only four fixed stage logs without the page URL or private fields', async () => {

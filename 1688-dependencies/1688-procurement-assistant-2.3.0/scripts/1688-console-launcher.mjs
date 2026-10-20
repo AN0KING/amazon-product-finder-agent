@@ -7,11 +7,10 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolve1688RuntimePaths } from "../lib/runtime-paths.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SERVER_PATH = path.join(PROJECT_ROOT, "server.mjs");
 const HEALTH_URL = "http://127.0.0.1:16880/api/v1/health";
-const BB1688_HOME = "D:\\deliverables\\1688-image-finder\\data\\1688-session";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -30,8 +29,24 @@ async function healthOk(timeoutMs = 2_000) {
   }
 }
 
+export function resolveConsoleRuntime({ projectRoot = PROJECT_ROOT, runtimeEnv = {}, env = process.env,
+  platform = process.platform, fsImpl } = {}) {
+  const inherited = { ...env };
+  for (const key of ["SCOUT_1688_PROJECT_ROOT", "BB1688_IMAGE_FINDER_ROOT", "BB1688_HOME", "BB1688_DATA_ROOT"]) {
+    if (Object.hasOwn(runtimeEnv, key)) inherited[key] = runtimeEnv[key];
+  }
+  const runtimePaths = resolve1688RuntimePaths({ projectRoot, env: inherited, platform, ...(fsImpl ? { fsImpl } : {}) });
+  return { runtimePaths, childEnv: { ...inherited,
+    SCOUT_1688_PROJECT_ROOT: runtimePaths.procurementRoot,
+    BB1688_IMAGE_FINDER_ROOT: runtimePaths.imageFinderRoot,
+    BB1688_HOME: runtimePaths.sessionRoot,
+    BB1688_DATA_ROOT: runtimePaths.dataRoot,
+  } };
+}
+
 export async function launchConsole({
   projectRoot = PROJECT_ROOT,
+  runtimeEnv = {},
   interactive = false,
   startupTimeoutMs = 60_000,
   brokerStartupTimeoutMs = 30_000,
@@ -41,17 +56,18 @@ export async function launchConsole({
   if (await healthOk()) {
     return { alreadyRunning: true, healthUrl: HEALTH_URL, projectRoot };
   }
-  const root = path.resolve(projectRoot || PROJECT_ROOT);
-  const logDir = path.join(root, "data", "sourcing-console", "logs");
+  const { runtimePaths, childEnv } = resolveConsoleRuntime({ projectRoot: projectRoot || PROJECT_ROOT, runtimeEnv });
+  const root = runtimePaths.procurementRoot;
+  const logDir = path.join(runtimePaths.dataRoot, "logs");
   await fsp.mkdir(logDir, { recursive: true });
   const stdout = fs.openSync(path.join(logDir, "service-stdout.log"), "a");
   const stderr = fs.openSync(path.join(logDir, "service-stderr.log"), "a");
-  const child = spawn(process.execPath, [SERVER_PATH], {
+  const child = spawn(process.execPath, [path.join(root, "server.mjs")], {
     cwd: root,
     detached: true,
     windowsHide: true,
     stdio: ["ignore", stdout, stderr],
-    env: { ...process.env, BB1688_HOME },
+    env: childEnv,
   });
   child.unref();
   fs.closeSync(stdout);

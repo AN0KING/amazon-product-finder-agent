@@ -81,12 +81,15 @@ test('detail normalization preserves product and package weight provenance separ
   assert.equal(result.items[0].fbaPackageWeightKg, 0.08);
   assert.deepEqual(result.items[0].productWeightEvidence, productWeightEvidence);
   assert.deepEqual(result.items[0].packageWeightEvidence, packageWeightEvidence);
-  const fallback = await analyzeAmazonDiscoveredAsins([{ asins: [asins[0]], sourceStore, salesByAsin: {} }],
+  const packageOnly = await analyzeAmazonDiscoveredAsins([{ asins: [asins[0]], sourceStore, salesByAsin: {} }],
     { runId: 'package-evidence-offline', marketplace: 'AU' }, '2026-10-10T01:00:00.000Z', undefined,
     { detailLoader: async asin => ({ asin, productWeightKg: null, packageWeightKg: 0.08, packageWeightEvidence, fieldSources: { packageWeightKg: 'amazon_product_page' } }) });
-  assert.equal(fallback.items[0].productWeightKg, 0.08);
-  assert.equal(fallback.items[0].productWeightEvidence.kind, 'package');
-  assert.equal(fallback.items[0].fieldSources.productWeightKg, 'amazon_package_weight_fallback');
+  assert.equal(packageOnly.items[0].productWeightKg, null);
+  assert.equal(packageOnly.items[0].productWeightEvidence, null);
+  assert.equal(packageOnly.items[0].fieldSources.productWeightKg, undefined);
+  assert.equal(packageOnly.items[0].fbaPackageWeightKg, 0.08);
+  assert.deepEqual(packageOnly.items[0].packageWeightEvidence, packageWeightEvidence);
+  assert.ok(packageOnly.items[0].missingFields.includes('weight'));
 });
 
 

@@ -1,3 +1,6 @@
+import * as salesPolicy from "../lib/monthly-sales-policy.mjs";
+import * as listingDate from "../lib/amazon-listing-date.mjs";
+import * as reviewRange from "../lib/review-range.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -8,6 +11,52 @@ import * as profitModel from "../lib/profit-model.mjs";
 import * as pieceCount from "../lib/title-piece-count.mjs";
 import * as handoff from "../lib/analysis-handoff.mjs";
 import * as coverage from "../lib/analysis-coverage.mjs";
+
+function absentInformationItem(version = 3) {
+  const asin = "B09NXS1BLL";
+  const selector = "#productDetails";
+  return {
+    asin, sourceAsin: asin, detailStatus: "success", amazonFirstAvailableDateStatus: "not_provided",
+    collectionQuality: { fields: { weight: { status: "missing", reason: "product_information_incomplete" } } },
+    productInformation: { version: 1, asin, status: "complete", reason: null, weightStatus: "not_provided", rowCount: 1,
+      sections: [{ selector, rows: [{ label: "Brand", value: "Fixture" }] }],
+      inspection: { version, asin, status: "complete", stable: true, rowCount: 1,
+        sections: [{ selector, rowCount: 1, status: "complete", busy: false, closed: false }],
+        parsedSections: [{ selector, rowCount: 1 }] } },
+  };
+}
+
+test("obsolete absence inspection can use the existing recovery budget for missing weight or date", () => {
+  for (const missing of ["weight", "date"]) {
+    const item = absentInformationItem(2);
+    if (missing === "weight") item.amazonFirstAvailableDateStatus = "found";
+    else item.collectionQuality.fields.weight.status = "verified";
+    const before = structuredClone(item);
+    assert.equal(detailRetry.amazonCollectionRecoveryReason(item)?.reasonCode, "AMAZON_PRODUCT_INFORMATION_INCOMPLETE", missing);
+    assert.deepEqual(item, before, "Eligibility evaluation must not rewrite saved evidence or retry counters.");
+  }
+});
+
+test("current complete absence remains final and does not schedule another visit", () => {
+  assert.equal(detailRetry.amazonCollectionRecoveryReason(absentInformationItem(3)), null);
+});
+
+test("obsolete absence cannot override manual weight/date decisions or an access restriction", () => {
+  for (const manual of [
+    { manualWeight: true }, { manualProductWeight: true }, { manualAmazonFields: { productWeightKg: true } },
+    { fieldSources: { productWeightKg: "manual" } },
+  ]) {
+    const item = { ...absentInformationItem(2), ...manual, amazonFirstAvailableDateStatus: "found" };
+    assert.equal(detailRetry.amazonCollectionRecoveryReason(item), null);
+  }
+  const manualDate = absentInformationItem(2);
+  manualDate.collectionQuality.fields.weight.status = "verified";
+  manualDate.manualAmazonFields = { amazonFirstAvailableDate: true };
+  assert.equal(detailRetry.amazonCollectionRecoveryReason(manualDate), null);
+  for (const code of ["AMAZON_ACCESS_CHALLENGE", "AMAZON_HTTP_429", "AMAZON_LOGIN_REQUIRED", "USER_PAUSED"]) {
+    assert.equal(detailRetry.amazonCollectionRecoveryReason(absentInformationItem(2), { lastCode: code }), null);
+  }
+});
 
 test("transient detail failures get exactly two additional retries", () => {
   assert.deepEqual(detailRetry.decideAmazonDetailRetry(), { action: "retry", retriesUsed: 1 });
@@ -33,7 +82,7 @@ function appHarness({ count = 45, respond } = {}) {
   const element = { hidden: false, disabled: false, value: "", checked: false, innerHTML: "",
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {} };
   const context = vm.createContext({
-    ...detailRetry, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage,
+    ...salesPolicy, ...detailRetry, ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...reviewRange,
     fixtureAsins: asins,
     document: { addEventListener() {}, getElementById() { return element; }, querySelector() { return null; }, querySelectorAll() { return []; } },
     setTimeout() {}, structuredClone, AbortController, DOMException,

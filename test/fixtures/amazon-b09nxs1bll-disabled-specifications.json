@@ -1,0 +1,46 @@
+{
+  "source": "Reduced from run 38d07a28-9316-4d31-b74d-06cda050abe6 on 2026-10-15. This records an unavailable specification entry, not proof of 110 g.",
+  "asin": "B09NXS1BLL",
+  "detailParserVersion": 12,
+  "productWeight": null,
+  "productWeightEvidence": null,
+  "amazonFirstAvailableDate": "2021-12-21",
+  "amazonFirstAvailableDateStatus": "found",
+  "amazonFirstAvailableDateEvidence": {
+    "asin": "B09NXS1BLL",
+    "marketplace": "AU",
+    "source": "amazon_product_information",
+    "label": "Date First Available ‏",
+    "rawText": "‎ 21 December 2021",
+    "selector": "#detailBullets_feature_div > ul:nth-of-type(1)",
+    "value": "2021-12-21"
+  },
+  "collectionRecovery": {
+    "attempts": 2,
+    "maxAttempts": 2,
+    "status": "exhausted",
+    "reasonCode": "AMAZON_PRODUCT_INFORMATION_INCOMPLETE",
+    "message": "商品信息展开或重量、上架日期检查未完成；已达到自动补查上限，保留原因等待处理",
+    "nextRetryAt": null,
+    "checkedAt": "2026-10-15T03:06:11.423Z"
+  },
+  "productInformation": {
+    "version": 1,
+    "asin": "B09NXS1BLL",
+    "status": "incomplete",
+    "reason": "inspection_timeout",
+    "weightStatus": "unresolved",
+    "inspection": {
+      "version": 3,
+      "asin": "B09NXS1BLL",
+      "status": "incomplete",
+      "reason": "inspection_timeout",
+      "specifications": {
+        "entryCount": 1,
+        "visible": false,
+        "pending": true,
+        "disabled": true
+      }
+    }
+  }
+}

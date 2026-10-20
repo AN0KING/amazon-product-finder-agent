@@ -1,5 +1,7 @@
 import { amazonMonthlySalesValue } from "./lib/amazon-sales-policy.mjs";
-import { monthlySalesValue } from "./lib/monthly-sales-policy.mjs";
+import { monthlySalesValue, isMonthlySalesFilterRequired } from "./lib/monthly-sales-policy.mjs";
+import { normalizeReviewRange, reviewRangeExclusionReasons } from "./lib/review-range.mjs";
+import { MAX_IMPORTED_ASINS, parseAsinText, parseAsinListBuffer, validateDirectAsinStores, validateDirectAsinProductUrls, buildUploadedAsinProjection } from "./lib/asin-list.mjs";
 import "./lib/fetch-proxy.mjs";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -20,10 +22,12 @@ import {
   AMAZON_PRODUCT_DETAIL_PARSER_VERSION,
   AmazonStoreError,
   buildSellerUrl,
-  createAmazonStoreSession,
+  createAmazonSearchSession as createAmazonStoreSession,
   normalizeAmazonProductUrl,
 } from "./lib/amazon-store-client.mjs";
 import { checkAmazonConnection } from "./lib/amazon-connection-check.mjs";
+import { AMAZON_SEARCH_BASELINE, AMAZON_SEARCH_POLICY } from "./lib/amazon-search-v0950.mjs";
+import { openAmazonInEdge, AmazonEdgeOpenError } from "./lib/amazon-edge-opener.mjs";
 import { AmazonCollectionRunner } from "./lib/amazon-collection-runner.mjs";
 import { SupplierPipelineRunner } from "./lib/supplier-pipeline-runner.mjs";
 import { ProgramMonitor } from "./lib/program-monitor.mjs";
@@ -82,7 +86,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.50";
+const APP_VERSION = "0.9.67";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -122,6 +126,9 @@ const STATIC_FILES = new Map([
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
   ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
   ["/lib/amazon-sales-policy.mjs", { file: "lib/amazon-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/lib/amazon-listing-date.mjs", { file: "lib/amazon-listing-date.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/lib/amazon-product-information.mjs", { file: "lib/amazon-product-information.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/lib/review-range.mjs", { file: "lib/review-range.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/monthly-sales-policy.mjs", { file: "lib/monthly-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/profit-model.mjs", { file: "lib/profit-model.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-handoff.mjs", { file: "lib/analysis-handoff.mjs", type: "text/javascript; charset=utf-8" }],
@@ -136,15 +143,17 @@ const ALLOWED_FILTERS = new Set([
   "monthlySalesBand",
   "minRating",
   "minReviews",
+  "maxReviews",
 ]);
 
 const NUMERIC_FILTERS = new Set([
   "minRating",
   "minReviews",
+  "maxReviews",
 ]);
 
 // 采集保留全部已发现商品；只有当前 ASIN 具备 Amazon 50+ 月购买量证据才进入候选。
-const MONTHLY_SALES_FILTER_BANDS = new Set(["all", "50_to_100", "100_plus"]);
+const MONTHLY_SALES_FILTER_BANDS = new Set(["all", "50_plus", "50_to_100", "100_plus"]);
 
 class HttpError extends Error {
   constructor(status, code, message, details = null) {
@@ -179,6 +188,7 @@ const amazonCollector = new AmazonCollectionRunner({
   discover: discoverAmazonCollection,
   loadDetails: loadAmazonCollectionDetails,
   canRun: () => !archivingRunId && !draining && !shuttingDown && activeAmazonRequests === 0 && active1688Requests === 0 && !supplierPipeline.isRunnable(),
+  canMaintain: () => !archivingRunId && !draining && !shuttingDown,
   onBusy: (busy) => {
     activeSearchRequests = Math.max(0, activeSearchRequests + (busy ? 1 : -1));
     activeAmazonRequests = Math.max(0, activeAmazonRequests + (busy ? 1 : -1));
@@ -188,6 +198,7 @@ let collectorReady = Promise.resolve();
 const supplierPipeline = new SupplierPipelineRunner({
   store: {
     readSnapshot: (runId) => persistenceStore.getRunSnapshot(runId),
+    readPipeline: (runId) => persistenceStore.getSupplierPipelineStatus(runId),
     updateSnapshot: (runId, updater) => persistenceStore.updateSupplierSnapshot(runId, updater),
     getActiveRunId: () => persistenceStore.getActiveSupplierRunId(),
     setActiveRunId: (runId) => persistenceStore.setActiveSupplierRunId(runId),
@@ -326,6 +337,17 @@ async function routeRequest(request, response, url, signal) {
     throw new HttpError(400, "QUERY_NOT_ALLOWED", "Query parameters are not accepted by this endpoint.");
   }
 
+  if (url.pathname === "/api/amazon/open-in-edge") {
+    requireMethod(request, ["POST"]);
+    requireContentType(request, ["application/json"]);
+    const body = await readJsonBody(request);
+    if (!isPlainObject(body) || Object.keys(body).some(key => key !== "url")) {
+      throw new HttpError(422, "INVALID_AMAZON_BROWSER_REQUEST", "请提供要在 Edge 打开的 Amazon 链接。");
+    }
+    sendJson(response, 200, { ok: true, data: await openAmazonInEdge(body.url) });
+    return;
+  }
+
   if (url.pathname === "/api/events") {
     requireMethod(request, ["GET"]);
     response.writeHead(200, { ...securityHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -401,6 +423,8 @@ async function routeRequest(request, response, url, signal) {
       ok: true,
       data: {
         version: APP_VERSION,
+        amazonSearchBaseline: AMAZON_SEARCH_BASELINE,
+        amazonSearchPolicy: AMAZON_SEARCH_POLICY,
         activeSearchRequests,
         activeAmazonRequests,
         active1688Requests,
@@ -507,7 +531,9 @@ async function routeRequest(request, response, url, signal) {
       throw new HttpError(422, "INVALID_ANALYSIS_HANDOFF", "初筛商品或筛选条件格式无效。");
     }
     if (!handoff.products.length) {
-      throw new HttpError(422, "NO_REVIEWED_PRODUCTS", "当前没有具备 Amazon 50+ 月购买量证据且人工初审通过的商品，未生成采购交接包。");
+      throw new HttpError(422, "NO_REVIEWED_PRODUCTS", body.runState.inputMode === 'asins'
+        ? "当前没有满足筛选条件且人工初审通过的商品，未生成采购交接包。"
+        : "当前没有具备 Amazon 50+ 月购买量证据且人工初审通过的商品，未生成采购交接包。");
     }
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
     const market = body.runState.marketplace;
@@ -686,6 +712,11 @@ async function routeRequest(request, response, url, signal) {
   if (url.pathname === "/api/store-list/parse") {
     requireMethod(request, ["POST"]);
     await handleUploadedStoreList(request, response);
+    return;
+  }
+  if (url.pathname === "/api/asin-list/parse") {
+    requireMethod(request, ["POST"]);
+    await handleUploadedAsinList(request, response);
     return;
   }
   if (url.pathname === "/api/amazon/check") {
@@ -1070,6 +1101,27 @@ async function handleUploadedStoreList(request, response) {
   const marketplace = validateMarketplace(marketplaceHeader);
   const buffer = await readBody(request, MAX_STORE_FILE_BYTES);
   const parsed = await parseStoreListBuffer(buffer, { fileName, marketplace, detectMarketplace: true });
+  const directAsinInput = await buildUploadedAsinProjection(buffer, { fileName, marketplace });
+  sendJson(response, 200, { ok: true, data: { ...parsed, directAsinInput } });
+}
+
+async function handleUploadedAsinList(request, response) {
+  requireContentType(request, ["application/json", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"]);
+  let parsed;
+  if (String(request.headers["content-type"]).split(";", 1)[0].trim().toLowerCase() === "application/json") {
+    const body = await readJsonBody(request);
+    if (!isPlainObject(body) || Object.keys(body).some(key => !["text", "marketplace"].includes(key))) {
+      throw new HttpError(422, "INVALID_ASIN_INPUT", "ASIN 导入仅接受 text 和 marketplace。");
+    }
+    parsed = parseAsinText(body.text, { marketplace: validateMarketplace(body.marketplace) });
+  } else {
+    const fileName = singleHeader(request.headers["x-file-name"]);
+    if (!fileName) throw new HttpError(400, "FILE_NAME_REQUIRED", "X-File-Name is required.");
+    const marketplace = validateMarketplace(singleHeader(request.headers["x-marketplace"]));
+    parsed = await parseAsinListBuffer(await readBody(request, MAX_STORE_FILE_BYTES), { fileName, marketplace });
+  }
+  // Parsing is read-only; the existing explicit replacement/archive flow owns
+  // task transitions only after the entire new input has passed validation.
   sendJson(response, 200, { ok: true, data: parsed });
 }
 
@@ -1086,7 +1138,8 @@ async function handleProductSearch(request, response, signal) {
   sendJson(response, 200, { ok: true, data: responseData });
 }
 
-export async function executeProductSearch(input, signal) {
+export async function executeProductSearch(input, signal, { store = persistenceStore, createSession = createAmazonStoreSession } = {}) {
+  const productUrls = importedAmazonProductUrls(input.stores, input.marketplace);
   if (input.useSellerSprite) {
     const capabilities = getSellerSpriteCapabilities(undefined, input.marketplace);
     if (!capabilities.marketplaceSupported) throw new HttpError(422, "SELLSPRITE_MARKETPLACE_UNSUPPORTED", `SellerSprite 当前不支持 ${input.marketplace} 月销量查询；不能使用其他站点替代。`);
@@ -1116,7 +1169,7 @@ export async function executeProductSearch(input, signal) {
   let amazonSessionError = null;
   let responseData;
   try {
-    const checkpointMap = await persistenceStore.getAmazonStoreCheckpoints(input.runId);
+    const checkpointMap = await store.getAmazonStoreCheckpoints(input.runId);
     const needsStoreDiscovery = input.phase !== "analyze";
     const needsAmazonProductDetails = input.phase !== "discover" && !input.useSellerSprite;
     const needsAmazonSession = callableStores.length && (
@@ -1125,7 +1178,7 @@ export async function executeProductSearch(input, signal) {
     );
     if (needsAmazonSession) {
       try {
-        amazonSession = await createAmazonStoreSession(input.marketplace, { signal });
+        amazonSession = await createSession(input.marketplace, { signal });
       } catch (error) {
         throwIfAborted(signal);
         amazonSessionError = error;
@@ -1136,7 +1189,7 @@ export async function executeProductSearch(input, signal) {
     let amazonAccessPause = null;
     for (const store of callableStores) {
       throwIfAborted(signal);
-      const checkpoint = amazonCheckpointForStore(checkpointMap, input.marketplace, store);
+      const checkpoint = input.inputMode === 'asins' ? null : amazonCheckpointForStore(checkpointMap, input.marketplace, store);
       const discovery = input.phase === "analyze"
         ? discoveryFromAmazonCheckpoint(store, checkpoint)
         : !store.sellerId
@@ -1170,19 +1223,13 @@ export async function executeProductSearch(input, signal) {
         competitorLookupLoader: loadSellerSpriteCompetitorLookup,
         amazonDetailLoader: (asin, options) => {
           if (!amazonSession) throw amazonSessionError || new AmazonStoreError("AMAZON_SESSION_FAILED", "Amazon product session is unavailable.");
-          return amazonSession.getProductDetail(asin, options);
+          return amazonSession.getProductDetail(asin, { ...options, ...(productUrls[asin] ? { productUrl: productUrls[asin] } : {}) });
         },
       },
     );
     const baseItems = deduplicateSourceAsins(analysis.items);
-    const items = selectFinalCandidatesPerStore(baseItems, input).map((item) => {
-      const filterExclusionReasons = candidateFilterExclusionReasons(item, input.filters);
-      return {
-        ...item,
-        filterMatch: filterExclusionReasons.length === 0,
-        filterExclusionReasons,
-      };
-    });
+    const items = selectFinalCandidatesPerStore(baseItems, input)
+      .map(item => applyCandidateFilters(item, input.filters, input));
     const storeVisits = discoveries.map((discovery, index) => ({
       ...discovery.visit,
       analysis: analysis.storeAudits[index] || emptyStoreAnalysisAudit(),
@@ -1208,6 +1255,7 @@ export async function executeProductSearch(input, signal) {
       phase: input.phase,
       marketplace: input.marketplace,
       sourceMarketplace: input.marketplace,
+      inputMode: input.inputMode,
       providerMarketplace: input.useSellerSprite ? sellerSpriteProviderFor(input.marketplace).providerMarketplace : null,
       providerMode: input.useSellerSprite ? sellerSpriteProviderFor(input.marketplace).providerMode : null,
       analysisSourceMode: input.useSellerSprite ? "amazon_sellsprite" : "amazon_only",
@@ -1223,7 +1271,7 @@ export async function executeProductSearch(input, signal) {
       visitAudit: summarizeStoreVisits(storeVisits),
       analysisAudit,
       enrichment: null,
-      appliedFilters: asinDetailFilters(input.filters),
+      appliedFilters: asinDetailFilters(input.filters, input),
       deferredFilters,
       dataSource: input.phase === "discover"
         ? "amazon-store-checkpoint"
@@ -1231,7 +1279,7 @@ export async function executeProductSearch(input, signal) {
       collectedAt,
     };
   } catch (error) {
-    await persistenceStore.appendSearchBatch(input.runId, {
+    await store.appendSearchBatch(input.runId, {
       collectedAt,
       marketplace: input.marketplace,
       phase: input.phase,
@@ -1248,8 +1296,8 @@ export async function executeProductSearch(input, signal) {
   }
 
   responseData.toolCallCount = getConnectionSummary().toolCallCount;
-  responseData.runToolCallCount = persistenceStore.getRunToolCalls(input.runId).total;
-  await persistenceStore.appendSearchBatch(input.runId, {
+  responseData.runToolCallCount = store.getRunToolCalls(input.runId).total;
+  await store.appendSearchBatch(input.runId, {
     collectedAt,
     marketplace: input.marketplace,
     phase: input.phase,
@@ -1262,18 +1310,22 @@ export async function executeProductSearch(input, signal) {
   return responseData;
 }
 
-async function seedAmazonCollection(snapshot) {
+export async function seedAmazonCollection(snapshot, { store = persistenceStore } = {}) {
   const runId = snapshot.runState.id;
-  await persistenceStore.writeQueue;
-  const document = await persistenceStore.readRunFile(runId);
+  try { normalizeReviewRange(snapshot.runState.criteria || {}); }
+  catch (error) { throw new HttpError(422, "INVALID_REVIEW_COUNT", error.message); }
+  await store.writeQueue;
+  const document = await store.readRunFile(runId);
   const marketplace = snapshot.runState.marketplace;
+  const directAsins = snapshot.storeList?.inputMode === 'asins' || snapshot.runState.inputMode === 'asins';
+  if (directAsins) validateDirectAsinStores(snapshot.storeList?.stores, marketplace);
   const checkpoints = document?.amazonStoreCheckpoints || {};
   const discoveries = (snapshot.storeList?.stores || []).map((store, storeIndex) =>
-    discoveryFromAmazonCheckpoint({ ...store, marketplace, storeIndex }, amazonCheckpointForStore(checkpoints, marketplace, store)));
+    discoveryFromAmazonCheckpoint({ ...store, marketplace, storeIndex }, directAsins ? null : amazonCheckpointForStore(checkpoints, marketplace, store)));
   const targets = new Map(collectDiscoveredAsinTargets(discoveries).map(target => [target.asin, target]));
   for (const product of snapshot.products || []) {
     const asin = normalizeAsin(product.sourceAsin || product.asin);
-    if (asin && !targets.has(asin)) targets.set(asin, {
+    if (!directAsins && asin && !targets.has(asin)) targets.set(asin, {
       asin, sales30: amazonMonthlySalesValue(product),
       sales30Evidence: amazonMonthlySalesValue(product) === null ? null : product.sales30Evidence,
       sourceStores: product.sourceStores || [{ sellerId: product.sellerId }],
@@ -1285,11 +1337,14 @@ async function seedAmazonCollection(snapshot) {
     for (const item of batch.response?.items || []) {
       const asin = normalizeAsin(item.sourceAsin || item.asin);
       if (asin && targets.has(asin) && item.detailStatus === 'success'
-        && Number(item.detailParserVersion) >= AMAZON_PRODUCT_DETAIL_PARSER_VERSION) items.set(asin, item);
+        && Number(item.detailParserVersion) >= AMAZON_PRODUCT_DETAIL_PARSER_VERSION) {
+        items.set(asin, applyCandidateFilters(item, collectionFilters({ filters: snapshot.runState.criteria }),
+          { inputMode: directAsins ? 'asins' : 'stores' }));
+      }
     }
   }
   return { targets: [...targets.values()], items: [...items.values()],
-    discoveryComplete: discoveries.length > 0 && discoveries.every(discovery => discovery.visit.complete === true) };
+    discoveryComplete: directAsins || discoveries.length > 0 && discoveries.every(discovery => discovery.visit.complete === true) };
 }
 
 function collectionFilters(job) {
@@ -1297,8 +1352,13 @@ function collectionFilters(job) {
     .map(key => [key, job.filters[key]]));
 }
 
-async function discoverAmazonCollection(job, signal) {
-  const checkpointMap = await persistenceStore.getAmazonStoreCheckpoints(job.runId);
+export async function discoverAmazonCollection(job, signal, { store = persistenceStore, search = executeProductSearch } = {}) {
+  if (job.inputMode === 'asins') {
+    const asins = validateDirectAsinStores(job.stores, job.marketplace);
+    return { targets: asins.map(asin => ({ asin, sourceStores: [] })), items: [], complete: true,
+      cursor: job.discoveryCursor, storeVisits: [], visitAudit: summarizeStoreVisits([]), progressed: true };
+  }
+  const checkpointMap = await store.getAmazonStoreCheckpoints(job.runId);
   const stores = job.stores.map((store, storeIndex) => ({ ...store, marketplace: job.marketplace, storeIndex }));
   const previousDiscoveries = stores.map(store => discoveryFromAmazonCheckpoint(store,
     amazonCheckpointForStore(checkpointMap, job.marketplace, store)));
@@ -1306,20 +1366,21 @@ async function discoverAmazonCollection(job, signal) {
     amazonCheckpointForStore(checkpointMap, job.marketplace, store)).visit.complete);
   let data = null;
   if (unfinished.length) {
-    const store = unfinished[job.discoveryCursor % unfinished.length];
+    const sourceStore = unfinished[job.discoveryCursor % unfinished.length];
     const input = validateSearchInput({ runId: job.runId, marketplace: job.marketplace,
-      stores: [store], useSellerSprite: false, phase: 'discover', filters: collectionFilters(job) });
-    data = await executeProductSearch(input, signal);
+      stores: [sourceStore], useSellerSprite: false, phase: 'discover', filters: collectionFilters(job) });
+    data = await search(input, signal);
   }
-  const updated = await persistenceStore.getAmazonStoreCheckpoints(job.runId);
+  const updated = await store.getAmazonStoreCheckpoints(job.runId);
   const discoveries = stores.map(store => discoveryFromAmazonCheckpoint(store,
     amazonCheckpointForStore(updated, job.marketplace, store)));
   const visits = discoveries.map(discovery => discovery.visit);
-  const restrictionCode = (data?.errors || []).map(error => error.code)
-    .find(code => ['AMAZON_ACCESS_CHALLENGE', 'AMAZON_HTTP_429'].includes(code))
-    || (data?.storeVisits || []).map(visit => visit.code)
-      .find(code => ['AMAZON_ACCESS_CHALLENGE', 'AMAZON_HTTP_429'].includes(code));
+  const accessCodes = new Set([...(data?.errors || []), ...(data?.storeVisits || [])].map(item => item.code));
+  // A CAPTCHA requires user action even if another store first reported 429.
+  const restrictionCode = ['AMAZON_ACCESS_CHALLENGE', 'AMAZON_HTTP_429'].find(code => accessCodes.has(code));
   const terminal = (data?.errors || []).find(error => error.retryable === false);
+  const failure = (data?.errors || []).find(error => error.code)
+    || (data?.storeVisits || []).find(visit => visit.code);
   const noProgress = (data?.storeVisits || []).find(visit => TERMINAL_AMAZON_PAGINATION_CODES.has(visit.code));
   const signature = values => JSON.stringify(values.map(value => [value.asins.length,
     value.visit.pagesVisited, value.visit.complete, value.visit.nextHref]));
@@ -1327,12 +1388,23 @@ async function discoverAmazonCollection(job, signal) {
     complete: discoveries.length > 0 && discoveries.every(discovery => discovery.visit.complete === true),
     cursor: job.discoveryCursor + 1, storeVisits: visits, visitAudit: summarizeStoreVisits(visits),
     restrictionCode, terminalCode: terminal?.code || noProgress?.code,
+    failure: failure ? { code: failure.code, message: failure.message } : null,
     progressed: signature(previousDiscoveries) !== signature(discoveries),
     message: terminal?.message || noProgress?.message };
 }
 
-async function loadAmazonCollectionDetails(job, asins, signal) {
-  const session = await createAmazonStoreSession(job.marketplace, { signal });
+function importedAmazonProductUrls(stores, marketplace) {
+  const result = {};
+  for (const source of stores || []) {
+    const validated = validateDirectAsinProductUrls(source.productUrls, source.asins || [], marketplace);
+    for (const [asin, productUrl] of Object.entries(validated)) result[asin] ??= productUrl;
+  }
+  return result;
+}
+
+export async function loadAmazonCollectionDetails(job, asins, signal, onItem, { createSession = createAmazonStoreSession } = {}) {
+  const productUrls = importedAmazonProductUrls(job.stores, job.marketplace);
+  const session = await createSession(job.marketplace, { signal });
   try {
     const discoveries = asins.flatMap(asin => {
       const sources = job.tasks[asin]?.sourceStores || [];
@@ -1341,14 +1413,15 @@ async function loadAmazonCollectionDetails(job, asins, signal) {
         salesByAsin: { [asin]: { sales30: job.tasks[asin]?.sales30Evidence?.value, rawText: job.tasks[asin]?.sales30Evidence?.rawText } },
       }));
     });
+    const applyFilters = item => applyCandidateFilters(item, collectionFilters(job), job);
     const result = await analyzeAmazonDiscoveredAsins(discoveries, {
-      runId: job.runId, marketplace: job.marketplace, detailAsins: asins,
-      detailConcurrency: 2, filters: collectionFilters(job),
-    }, new Date().toISOString(), signal, { detailLoader: (asin, options) => session.getProductDetail(asin, options) });
-    return result.items.map(item => {
-      const reasons = candidateFilterExclusionReasons(item, collectionFilters(job));
-      return { ...item, filterMatch: reasons.length === 0, filterExclusionReasons: reasons };
+      runId: job.runId, marketplace: job.marketplace, detailAsins: asins, inputMode: job.inputMode,
+      detailConcurrency: 1, filters: collectionFilters(job),
+    }, new Date().toISOString(), signal, {
+      detailLoader: (asin, options) => session.getProductDetail(asin, { ...options, ...(productUrls[asin] ? { productUrl: productUrls[asin] } : {}) }),
+      onItem: typeof onItem === 'function' ? item => onItem(applyFilters(item)) : undefined,
     });
+    return result.items.map(applyFilters);
   } finally {
     await session.close();
   }
@@ -1425,10 +1498,10 @@ export function discoveryFromAmazonCheckpoint(store, checkpoint) {
   const paginationIncomplete = !complete && Boolean(checkpoint?.nextHref) && !interruption;
   const code = interruption?.code
     || (paginationIncomplete ? "AMAZON_PAGINATION_INCOMPLETE" : null)
-    || (checkpoint ? null : "AMAZON_DISCOVERY_REQUIRED");
+    || (checkpoint || complete ? null : "AMAZON_DISCOVERY_REQUIRED");
   const message = interruption?.message
     || (paginationIncomplete ? "Amazon store pagination is waiting to continue." : null)
-    || (checkpoint ? null : "Amazon store discovery has not completed yet.");
+    || (checkpoint || complete ? null : "Amazon store discovery has not completed yet.");
   const omissionReasons = complete
     ? completedAmazonCheckpointOmissionReasons(checkpoint, asins)
     : pendingAmazonCheckpointOmissionReasons(checkpoint, interruption, code, message);
@@ -2208,31 +2281,38 @@ export async function analyzeAmazonDiscoveredAsins(
   input,
   collectedAt,
   signal,
-  { detailLoader } = {},
+  { detailLoader, onItem } = {},
 ) {
   if (typeof detailLoader !== "function") throw new TypeError("detailLoader must be a function.");
   const requestedDetailAsins = new Set(Array.isArray(input.detailAsins) ? input.detailAsins : []);
   const targets = collectDiscoveredAsinTargets(discoveries)
     .filter((target) => !requestedDetailAsins.size || requestedDetailAsins.has(target.asin));
-  // 同节点适度并发：多个详情请求并行，摊薄单请求的串行等待，同时受并发上限约束避免触发 WAF。
+  // Keep interactive detail requests conservative; background collection uses one worker.
   const detailConcurrency = Number.isFinite(Number(input.detailConcurrency)) && Number(input.detailConcurrency) > 0
     ? Math.min(6, Math.max(1, Math.trunc(Number(input.detailConcurrency))))
     : Number.isFinite(Number(process.env.AMAZON_DETAIL_CONCURRENCY)) && Number(process.env.AMAZON_DETAIL_CONCURRENCY) > 0
       ? Math.min(6, Math.max(1, Math.trunc(Number(process.env.AMAZON_DETAIL_CONCURRENCY))))
-      : 3;
+      : 2;
   const results = await mapWithConcurrency(targets, detailConcurrency, async (target) => {
     throwIfAborted(signal);
+    let result;
     try {
       const detail = await detailLoader(target.asin, { signal });
       const item = normalizeAmazonProductItem(detail, target, input, collectedAt);
       if (!item) {
         throw new AmazonStoreError("AMAZON_PRODUCT_INVALID", "Amazon returned an unusable product detail page.");
       }
-      return { item, errors: [], callCount: 1, cacheHit: false, rateLimitRetryCount: 0, rateLimitWaitMs: 0 };
+      result = { item, errors: [], callCount: 1, cacheHit: false, rateLimitRetryCount: 0, rateLimitWaitMs: 0 };
     } catch (error) {
       throwIfAborted(signal);
-      return failedAmazonProductResult(target, input, collectedAt, error);
+      result = failedAmazonProductResult(target, input, collectedAt, error);
     }
+    // Persist the individual result before this worker starts another ASIN.
+    // Persistence failures must propagate, never become an Amazon page failure.
+    throwIfAborted(signal);
+    if (typeof onItem === 'function') await onItem(result.item);
+    throwIfAborted(signal);
+    return result;
   }, signal);
 
   const successfulAsins = new Set(results.flatMap((result) => result.item.detailStatus === "success" ? [result.item.sourceAsin] : []));
@@ -2280,13 +2360,12 @@ function normalizeAmazonProductItem(detail, target, input, collectedAt) {
   const sourceStore = target.sourceStores[0] || {};
   const directProductWeightKg = firstNonNegativeNumber(detail.productWeightKg);
   const fbaPackageWeightKg = firstNonNegativeNumber(detail.packageWeightKg);
-  const productWeightKg = directProductWeightKg ?? fbaPackageWeightKg;
+  // Product mass comes only from the collector's Item Weight selection.
+  // Packaging remains separate reference data and cannot fill this field.
+  const productWeightKg = directProductWeightKg;
   const fieldSources = { ...(detail.fieldSources || {}) };
   if (fieldSources.packageWeightKg && !fieldSources.fbaPackageWeightKg) {
     fieldSources.fbaPackageWeightKg = fieldSources.packageWeightKg;
-  }
-  if (directProductWeightKg === null && fbaPackageWeightKg !== null) {
-    fieldSources.productWeightKg = "amazon_package_weight_fallback";
   }
   // 亚马逊准则 2026-10-09：详情页未展示月销量角标时，回退使用店铺首页卡片读到的角标下界
   //（卡片 50+/100+/200+/1000+ → 50/100/200/1000+），保证店铺首页观察到的销量档位不丢失。
@@ -2316,6 +2395,11 @@ function normalizeAmazonProductItem(detail, target, input, collectedAt) {
     currentPrice: firstNonNegativeNumber(detail.currentPrice),
     priceEvidence: detail.priceEvidence || null,
     pageContextEvidence: detail.pageContextEvidence || null,
+    priceReadAttempt: detail.priceReadAttempt || null,
+    productInformation: detail.productInformation ? structuredClone(detail.productInformation) : null,
+    amazonFirstAvailableDate: detail.amazonFirstAvailableDate || null,
+    amazonFirstAvailableDateStatus: detail.amazonFirstAvailableDateStatus || "unresolved",
+    amazonFirstAvailableDateEvidence: detail.amazonFirstAvailableDateEvidence ? structuredClone(detail.amazonFirstAvailableDateEvidence) : null,
     sales30,
     sales30Evidence,
     sales60: null,
@@ -2334,7 +2418,8 @@ function normalizeAmazonProductItem(detail, target, input, collectedAt) {
     reviewCountEvidence: detail.reviewCountEvidence || null,
     hasAPlus: null,
     productWeightKg,
-    productWeightEvidence: directProductWeightKg !== null ? detail.productWeightEvidence || null : detail.packageWeightEvidence || null,
+    productWeightEvidence: directProductWeightKg !== null ? detail.productWeightEvidence || null : null,
+    weightSelection: structuredClone(detail.productInformation?.weightSelection || detail.weightSelection || { policy: "item_weight_only" }),
     fbaPackageWeightKg,
     packageWeightEvidence: detail.packageWeightEvidence || null,
     productDimensionsCm: null,
@@ -2393,7 +2478,7 @@ function collectAmazonProductMissingFields(item) {
   if (!Number.isFinite(item.currentPrice)) missing.push("currentPrice");
   if (!Number.isFinite(item.rating)) missing.push("rating");
   if (!Number.isFinite(item.reviewCount)) missing.push("reviewCount");
-  if (!Number.isFinite(item.productWeightKg) && !Number.isFinite(item.fbaPackageWeightKg)) missing.push("weight");
+  if (!Number.isFinite(item.productWeightKg) || item.productWeightKg <= 0) missing.push("weight");
   if (!item.imageUrl) missing.push("imageUrl");
   return missing;
 }
@@ -2977,25 +3062,34 @@ export function selectFinalCandidatesPerStore(items, input) {
   return selectStoreCandidates(items, input.filters, input.candidateLimit);
 }
 
-export function matchesCandidateFilters(item, filters) {
-  return candidateFilterExclusionReasons(item, filters).length === 0;
+function applyCandidateFilters(item, filters, context) {
+  const filterExclusionReasons = candidateFilterExclusionReasons(item, filters, context);
+  return { ...item, filterMatch: filterExclusionReasons.length === 0, filterExclusionReasons };
 }
 
-export function candidateFilterExclusionReasons(item, filters) {
+export function matchesCandidateFilters(item, filters, context) {
+  return candidateFilterExclusionReasons(item, filters, context).length === 0;
+}
+
+export function candidateFilterExclusionReasons(item, filters, { inputMode = 'stores' } = {}) {
   const reasons = [];
   const detailPending = String(item?.detailStatus || "").toLowerCase() === "pending";
-  const monthlySalesBand = filters.monthlySalesBand || "all";
-  const effectiveMonthlySales = monthlySalesValue(item, filters);
-  if (effectiveMonthlySales === null) {
-    reasons.push("MONTHLY_SALES_EVIDENCE_MISSING");
-  } else if (effectiveMonthlySales < 50) {
-    reasons.push("MONTHLY_SALES_BELOW_50");
-  } else {
-    if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
-    if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
+  // ASIN "all" preserves every explicitly imported product; selected bands still apply.
+  if (isMonthlySalesFilterRequired(inputMode, filters.monthlySalesBand)) {
+    const monthlySalesBand = filters.monthlySalesBand || "all";
+    const effectiveMonthlySales = monthlySalesValue(item, filters);
+    if (effectiveMonthlySales === null) {
+      reasons.push("MONTHLY_SALES_EVIDENCE_MISSING");
+    } else if (effectiveMonthlySales < 50) {
+      reasons.push("MONTHLY_SALES_BELOW_50");
+    } else {
+      if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
+      if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
+    }
   }
-  if (filters.minRating !== null && (Number.isFinite(item.rating) ? item.rating < filters.minRating : !detailPending)) reasons.push("RATING_BELOW_MINIMUM");
-  if (filters.minReviews !== null && (Number.isFinite(item.reviewCount) ? item.reviewCount < filters.minReviews : !detailPending)) reasons.push("REVIEWS_BELOW_MINIMUM");
+  if (filters.minRating !== null && filters.minRating !== undefined
+    && (Number.isFinite(item.rating) ? item.rating < filters.minRating : !detailPending)) reasons.push("RATING_BELOW_MINIMUM");
+  reasons.push(...reviewRangeExclusionReasons(item.reviewCount, filters));
   return reasons;
 }
 
@@ -3240,21 +3334,25 @@ function completenessScore(item) {
   ].filter((value) => value !== null && value !== undefined).length;
 }
 
-function asinDetailFilters(filters) {
+function asinDetailFilters(filters, { inputMode = 'stores' } = {}) {
   return {
     monthlySalesBand: filters.monthlySalesBand,
+    monthlySalesFilterApplied: isMonthlySalesFilterRequired(inputMode, filters.monthlySalesBand),
     minReviews: filters.minReviews,
+    maxReviews: filters.maxReviews,
     minRating: filters.minRating,
   };
 }
 
 export function validateSearchInput(value) {
   if (!isPlainObject(value)) throw new HttpError(400, "INVALID_JSON_BODY", "The JSON body must be an object.");
-  const allowedKeys = new Set(["marketplace", "stores", "filters", "useSellerSprite", "runId", "phase", "detailAsins"]);
+  const allowedKeys = new Set(["marketplace", "stores", "filters", "useSellerSprite", "runId", "phase", "detailAsins", "inputMode"]);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
     throw new HttpError(422, "UNKNOWN_SEARCH_FIELD", "The search request contains an unsupported field.");
   }
   const marketplace = validateMarketplace(value.marketplace);
+  const inputMode = value.inputMode ?? 'stores';
+  if (!['stores', 'asins'].includes(inputMode)) throw new HttpError(422, "INVALID_INPUT_MODE", "inputMode must be stores or asins.");
   if (!Array.isArray(value.stores) || !value.stores.length || value.stores.length > MAX_STORES_PER_SEARCH) {
     throw new HttpError(422, "INVALID_STORES", `stores must contain 1 to ${MAX_STORES_PER_SEARCH} entries.`);
   }
@@ -3290,8 +3388,10 @@ export function validateSearchInput(value) {
   const runId = cleanRequiredText(value.runId, 128, "runId");
   if (!/^[A-Za-z0-9._:-]+$/.test(runId)) throw new HttpError(422, "INVALID_RUN_ID", "runId contains unsupported characters.");
   const filters = validateFilters(value.filters);
+  if (inputMode === 'asins') validateDirectAsinStores(value.stores, marketplace);
   const stores = value.stores.map((store, index) => validateSearchStore(store, index, marketplace));
-  return { marketplace, stores, filters, useSellerSprite, runId, phase, detailAsins };
+  if (inputMode === 'asins') validateDirectAsinStores(stores, marketplace);
+  return { marketplace, stores, filters, useSellerSprite, runId, phase, detailAsins, inputMode };
 }
 
 export function validateAmazonConnectionInput(value) {
@@ -3337,7 +3437,7 @@ function validateSearchStore(value, index, marketplace) {
     throw new HttpError(422, "INVALID_ASINS", `stores[${index}].asins must be an array.`);
   }
   const rawAsins = value.asins || [];
-  if (rawAsins.length > 100) throw new HttpError(422, "TOO_MANY_ASINS", `stores[${index}].asins exceeds 100 entries.`);
+  if (rawAsins.length > MAX_IMPORTED_ASINS) throw new HttpError(422, "TOO_MANY_ASINS", `stores[${index}].asins exceeds ${MAX_IMPORTED_ASINS} entries.`);
   const asins = [...new Set(rawAsins.map((asin) => {
     const normalized = normalizeAsin(asin);
     if (!normalized) throw new HttpError(422, "INVALID_ASIN", `stores[${index}] contains an invalid ASIN.`);
@@ -3346,7 +3446,9 @@ function validateSearchStore(value, index, marketplace) {
   const rowNumbers = Array.isArray(value.rowNumbers)
     ? value.rowNumbers.filter((row) => Number.isInteger(row) && row > 0).slice(0, 1_000)
     : [];
-  return { marketplace: storeMarketplace, sellerId, sellerName, asins, rowNumbers };
+  const productUrls = validateDirectAsinProductUrls(value.productUrls, asins, storeMarketplace);
+  return { marketplace: storeMarketplace, sellerId, sellerName, asins, rowNumbers,
+    ...(Object.keys(productUrls).length ? { productUrls } : {}) };
 }
 
 function validateFilters(value) {
@@ -3355,13 +3457,18 @@ function validateFilters(value) {
       monthlySalesBand: "all",
       minRating: null,
       minReviews: null,
+      maxReviews: null,
     };
   }
   if (!isPlainObject(value) || Object.keys(value).some((key) => !ALLOWED_FILTERS.has(key))) {
     throw new HttpError(422, "INVALID_FILTERS", "filters contains an unsupported field.");
   }
   const filters = {};
+  let reviewRange;
+  try { reviewRange = normalizeReviewRange(value); }
+  catch (error) { throw new HttpError(422, "INVALID_REVIEW_COUNT", error.message); }
   for (const key of ALLOWED_FILTERS) {
+    if (key === "minReviews" || key === "maxReviews") { filters[key] = reviewRange[key]; continue; }
     const raw = value[key];
     if (raw === undefined || raw === null || raw === "") {
       filters[key] = null;
@@ -3375,15 +3482,12 @@ function validateFilters(value) {
     }
     if (key === "monthlySalesBand") {
       if (typeof raw !== "string" || !MONTHLY_SALES_FILTER_BANDS.has(raw.trim())) {
-        throw new HttpError(422, "INVALID_MONTHLY_SALES_BAND", "monthlySalesBand must be all, 50_to_100, or 100_plus.");
+        throw new HttpError(422, "INVALID_MONTHLY_SALES_BAND", "monthlySalesBand must be all, 50_plus, 50_to_100, or 100_plus.");
       }
       filters[key] = raw.trim();
     }
   }
   if (filters.minRating !== null && filters.minRating > 5) throw new HttpError(422, "INVALID_RATING", "minRating cannot exceed 5.");
-  if (filters.minReviews !== null && !Number.isInteger(filters.minReviews)) {
-    throw new HttpError(422, "INVALID_REVIEW_COUNT", "minReviews must be an integer.");
-  }
   if (filters.monthlySalesBand === null) filters.monthlySalesBand = "all";
   return filters;
 }
@@ -3937,6 +4041,7 @@ function normalizeHttpError(error) {
     return new HttpError(error.status, error.code, error.message, taskId ? { taskId } : null);
   }
   if (error instanceof RunFolderOpenError) return new HttpError(error.status, error.code, error.message);
+  if (error instanceof AmazonEdgeOpenError) return new HttpError(error.status, error.code, error.message);
   if (error instanceof XlsxExportError) return new HttpError(error.status, error.code, error.message);
   if (error instanceof ExportFileStoreError) return new HttpError(error.status, error.code, error.message);
   if (error instanceof PersistenceStoreError) return new HttpError(error.status, error.code, error.message);

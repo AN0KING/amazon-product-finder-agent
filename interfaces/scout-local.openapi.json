@@ -1,0 +1,752 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Scout local integration for WorkBuddy",
+    "version": "1.0.0",
+    "description": "A deliberately restricted integration subset for Scout 0.9.50: read status and explicitly pause/resume an existing saved task. It is not a full server API or a WorkBuddy-specific plugin manifest. The program owns polling, persistence, retries, and recovery. No AI scheduler is needed. Loopback only; no cloud endpoint, provider authorization, health probes, verification actions, task creation, archive, deletion, or rate changes are exposed here."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:4173",
+      "description": "The colleague computer running Scout; not the cloud AI execution host."
+    }
+  ],
+  "tags": [
+    {
+      "name": "Read-only"
+    },
+    {
+      "name": "Explicit user control"
+    }
+  ],
+  "paths": {
+    "/api/version": {
+      "get": {
+        "operationId": "getVersion",
+        "summary": "Version and cached activity/call counts",
+        "description": "Read-only. Does not connect SellerSprite, query products, resume work, or change rates.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Version"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/monitor": {
+      "get": {
+        "operationId": "getMonitor",
+        "summary": "Cached background-monitor checks and saved events",
+        "description": "Cached read only; it does not force an upstream check. configured is the setting; enabled is the actual monitor state. Non-null errorCode/persistenceError require investigation. Normal waiting/cooldown/manual pause are not reasons to resume.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Monitor"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/amazon/collection": {
+      "get": {
+        "operationId": "getAmazonCollection",
+        "summary": "Current Amazon collection task",
+        "description": "Read-only. Does not connect SellerSprite, query products, resume work, or change rates.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Task"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/1688/pipeline": {
+      "get": {
+        "operationId": "get1688Pipeline",
+        "summary": "Current confirmed 1688 matching task",
+        "description": "Read-only. Does not connect SellerSprite, query products, resume work, or change rates.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Task"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/sellsprite/status": {
+      "get": {
+        "operationId": "getSellerSpriteStatus",
+        "summary": "Optional SellerSprite configuration and cached statistics",
+        "description": "The path intentionally uses sellsprite. Reads sanitized configuration and cached status; does not authorize or connect. Connected, business calls, and ASINs with valid monthly-sales evidence are different metrics.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "connected": {
+                          "type": "boolean"
+                        },
+                        "toolCallCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "sessionToolCallCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "configuration": {
+                          "type": "object"
+                        },
+                        "capabilities": {
+                          "type": "object"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/state": {
+      "get": {
+        "operationId": "getSavedRunOverview",
+        "summary": "Saved run overview for finding real runId values",
+        "description": "Read-only. Does not connect SellerSprite, query products, resume work, or change rates.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/runs/{runId}": {
+      "get": {
+        "operationId": "getSavedRun",
+        "summary": "Snapshot of a saved run",
+        "description": "May contain large amounts of business data. Read on demand, not in a frequent polling loop.",
+        "tags": [
+          "Read-only"
+        ],
+        "x-scout-read-only": true,
+        "responses": {
+          "200": {
+            "description": "Successful local response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "runId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RunId"
+            }
+          }
+        ]
+      }
+    },
+    "/api/amazon/collection/control": {
+      "post": {
+        "operationId": "controlAmazonCollection",
+        "summary": "Explicitly pause or resume the current saved task",
+        "description": "Restricted integration subset: pause and resume only. Require an explicit user instruction and read the current status to verify runId before sending. Never use for scheduled monitoring. A successful response acknowledges the command; read status for progress. Do not repeat a failed or timed-out POST automatically. This API has no confirmed field; the bundled client requires its own -Confirmed acknowledgement. A CAPTCHA or login block requires the person to resolve it in the browser before a separately requested resume.",
+        "tags": [
+          "Explicit user control"
+        ],
+        "x-scout-read-only": false,
+        "x-scout-explicit-user-action": true,
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskControl"
+              },
+              "example": {
+                "runId": "REPLACE_WITH_CURRENT_RUN_ID",
+                "action": "pause"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Command accepted. Continue reading task status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Task"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/1688/pipeline/control": {
+      "post": {
+        "operationId": "control1688Pipeline",
+        "summary": "Explicitly pause or resume the current saved task",
+        "description": "Restricted integration subset: pause and resume only. Require an explicit user instruction and read the current status to verify runId before sending. Never use for scheduled monitoring. A successful response acknowledges the command; read status for progress. Do not repeat a failed or timed-out POST automatically. This API has no confirmed field; the bundled client requires its own -Confirmed acknowledgement. A CAPTCHA or login block requires the person to resolve it in the browser before a separately requested resume.",
+        "tags": [
+          "Explicit user control"
+        ],
+        "x-scout-read-only": false,
+        "x-scout-explicit-user-action": true,
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskControl"
+              },
+              "example": {
+                "runId": "REPLACE_WITH_CURRENT_RUN_ID",
+                "action": "pause"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command accepted. Continue reading task status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "data"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Task"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Origin": {
+        "name": "Origin",
+        "in": "header",
+        "required": true,
+        "description": "Must exactly match the local origin. Host is supplied from the URL and must be 127.0.0.1:4173. No extra query parameters.",
+        "schema": {
+          "type": "string",
+          "const": "http://127.0.0.1:4173"
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Request rejected or failed. Inspect code/status; do not automatically retry controls.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "RunId": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+        "description": "Real saved task identifier obtained from current status or the saved run overview."
+      },
+      "TaskControl": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runId",
+          "action"
+        ],
+        "properties": {
+          "runId": {
+            "$ref": "#/components/schemas/RunId"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "pause",
+              "resume"
+            ]
+          }
+        }
+      },
+      "Task": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Current persisted task or null when no task exists. Details vary by task type.",
+        "properties": {
+          "runId": {
+            "$ref": "#/components/schemas/RunId"
+          },
+          "status": {
+            "type": "string"
+          },
+          "causeCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nextRetryAt": {
+            "type": [
+              "integer",
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "ok",
+          "error"
+        ],
+        "properties": {
+          "ok": {
+            "const": false
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "required": [
+          "version",
+          "activeSearchRequests",
+          "activeAmazonRequests",
+          "active1688Requests",
+          "draining"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "activeSearchRequests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "activeAmazonRequests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "active1688Requests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "toolCallCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sessionToolCallCount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "Monitor": {
+        "type": "object",
+        "required": [
+          "configured",
+          "enabled",
+          "errorCode",
+          "persistenceError",
+          "intervals",
+          "checks",
+          "events"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "errorCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "persistenceError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intervals": {
+            "type": "object",
+            "properties": {
+              "amazonMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 900000
+              },
+              "supplier1688Ms": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1800000
+              }
+            }
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "amazon": {
+                "$ref": "#/components/schemas/MonitorCheck"
+              },
+              "supplier1688": {
+                "$ref": "#/components/schemas/MonitorCheck"
+              }
+            }
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MonitorEvent"
+            }
+          }
+        }
+      },
+      "MonitorCheck": {
+        "type": "object",
+        "properties": {
+          "lastCheckedAt": {
+            "type": [
+              "number",
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "errorCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutiveFailures": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "MonitorEvent": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "source",
+          "message",
+          "createdAt",
+          "details"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "amazon",
+              "supplier1688"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": [
+              "number",
+              "string"
+            ]
+          },
+          "details": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  }
+}

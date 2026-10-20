@@ -89,7 +89,7 @@
               </button>
             </div>
           </div>
-          <p id="sidebarVersion" data-market-version>NL v0.9.50 · 单次任务</p>
+          <p id="sidebarVersion" data-market-version>NL v0.9.67 · 单次任务</p>
         </div>
       </aside>
 
@@ -125,6 +125,16 @@
             <p class="collection-progress" id="collectionProgress"></p>
             <p class="collection-message" id="collectionMessage"></p>
             <p class="collection-message" id="collectionCause"></p>
+              <p class="collection-message">商品重量与包裹重量取较重者计算利润，并标注所用来源；只有一种时使用已有值，两者均缺失时保留待核验。上架日期缺失不阻止分析。</p>
+            <section id="collectionAccessPanel" class="collection-access-panel" hidden aria-labelledby="collectionAccessTitle" tabindex="-1">
+              <h3 id="collectionAccessTitle">Amazon 访问人工处理</h3>
+              <p>先打开受阻商品原链接核对。若出现验证，请自行完成；若正常显示商品，可确认后继续原任务。普通浏览器与采集浏览器使用不同会话，打开成功不代表采集会话已恢复。</p>
+              <div id="collectionAccessProducts"></div>
+              <p>继续后仍遇到验证会再次停止并保留断点，不会创建新批次。也可在商品详情中人工填写已确认的数据。</p>
+              <label><input type="checkbox" id="collectionAccessConfirmed"> 我已核对页面，愿意继续原任务</label>
+              <button class="secondary-button" id="collectionAccessResumeButton" type="button" disabled>我已核对，继续原任务</button>
+              <p id="collectionAccessFeedback" role="status" aria-live="polite"></p>
+            </section>
             <p class="collection-editing-note" id="collectionEditingNote"></p>
             <div class="collection-times"><span>后台每 30 秒巡检 · 页面每 5 秒同步</span><span>最后进展 <time id="collectionLastProgress">—</time></span><span>下次自动重试 <time id="collectionNextRetry">—</time></span></div>
             <details class="collection-quality"><summary>查看字段完整度</summary><div id="collectionQualitySummary"></div></details>
@@ -155,26 +165,55 @@
                 <div class="panel-heading">
                   <div>
                     <span class="step-number">1</span>
-                    <h2 id="importTitle">导入店铺</h2>
+                    <h2 id="importTitle">导入采集清单</h2>
                   </div>
                   <span class="status-label" id="importStatusLabel"><i data-lucide="file-up" aria-hidden="true"></i>等待上传</span>
                 </div>
 
+                <div class="import-mode-tabs" role="tablist" aria-label="导入方式">
+                  <button id="storeImportTab" type="button" role="tab" aria-selected="true" aria-controls="storeImportHelp">导入店铺</button>
+                  <button id="asinImportTab" type="button" role="tab" aria-selected="false" aria-controls="asinImportPanel">导入 ASIN</button>
+                </div>
+                <p class="import-help" id="storeImportHelp" role="tabpanel" aria-labelledby="storeImportTab">上传店铺 Excel，先枚举店铺商品，再采集详情。</p>
+                <div id="asinImportPanel" class="asin-import-panel" role="tabpanel" aria-labelledby="asinImportTab" hidden>
+                  <label for="asinMarketplaceSelect">纯 ASIN 所属站点</label>
+                  <select id="asinMarketplaceSelect" aria-describedby="asinImportHelp">
+                    <option value="AU">澳大利亚 · amazon.com.au</option>
+                    <option value="CA">加拿大 · amazon.ca</option>
+                    <option value="UK">英国 · amazon.co.uk</option>
+                    <option value="DE">德国 · amazon.de</option>
+                    <option value="FR">法国 · amazon.fr</option>
+                    <option value="IT">意大利 · amazon.it</option>
+                    <option value="ES">西班牙 · amazon.es</option>
+                    <option value="PL">波兰 · amazon.pl</option>
+                    <option value="MX">墨西哥 · amazon.com.mx</option>
+                    <option value="BR">巴西 · amazon.com.br</option>
+                    <option value="US">美国 · amazon.com</option>
+                    <option value="NL">荷兰 · amazon.nl</option>
+                  </select>
+                  <p class="import-help">默认使用当前 Excel 的 ASIN 列；切换模式只预览，点击开始才创建独立 ASIN 批次。</p>
+                  <label for="asinTextInput">或者粘贴新的 ASIN / Amazon 商品链接</label>
+                  <textarea id="asinTextInput" rows="4" placeholder="B09V6TRGTD&#10;https://www.amazon.com.au/dp/B09V6TRGTD" aria-describedby="asinImportHelp"></textarea>
+                  <p id="asinImportHelp" class="import-help">每行一个，也可用空格或逗号分隔。链接按域名识别站点；纯 ASIN 使用上方站点。不同站点请分批导入。导入后点击“开始采集”。</p>
+                  <button id="importAsinsButton" type="button" class="secondary-button">确认导入粘贴的 ASIN</button>
+                </div>
                 <input id="storeFileInput" type="file" accept=".xlsx" hidden />
                 <button class="upload-zone" type="button" id="uploadZone">
                   <i data-lucide="file-spreadsheet" aria-hidden="true"></i>
-                  <span><strong id="uploadedFilename">选择店铺文件</strong><small>每行一个 Amazon 店铺链接 · 自动识别国家并切换站点</small></span>
+                  <span><strong id="uploadedFilename">选择店铺文件</strong><small id="uploadHelp">每行一个 Amazon 店铺链接 · 自动识别国家并切换站点</small></span>
                   <i data-lucide="upload" aria-hidden="true"></i>
                 </button>
 
-                <div class="import-metrics" aria-label="导入结果">
+                <p id="selectedInputSummary" class="import-selection-summary" role="status" hidden></p>
+                <button id="discardImportDraftButton" type="button" class="text-button" hidden>取消新输入，返回原清单</button>
+                <div id="importMetrics" class="import-metrics" aria-label="导入结果">
                   <div><strong id="rawRowsMetric">--</strong><span>原始行</span></div>
-                  <div><strong id="uniqueStoresMetric">--</strong><span>唯一卖家</span></div>
+                  <div><strong id="uniqueStoresMetric">--</strong><span id="uniqueImportMetricLabel">唯一卖家</span></div>
                   <div><strong id="duplicateRowsMetric">--</strong><span>重复归并</span></div>
                   <div class="has-warning"><strong id="repairedRowsMetric">--</strong><span>自动修复</span></div>
                 </div>
 
-                <div class="data-audit">
+                <div id="importDataAudit" class="data-audit">
                   <div class="audit-row">
                     <i data-lucide="store" aria-hidden="true"></i>
                     <span>站点识别</span>
@@ -199,7 +238,7 @@
                 <div class="store-manager" id="storeManager" hidden>
                   <div class="store-manager-heading">
                     <button class="store-manager-toggle" type="button" id="storeManagerToggle" aria-expanded="false" aria-controls="storeManagerBody">
-                      <span><i data-lucide="list" aria-hidden="true"></i>当前任务店铺 <strong id="currentStoreCount" aria-live="polite">0</strong></span>
+                      <span><i data-lucide="list" aria-hidden="true"></i><span id="currentImportListLabel">当前任务店铺</span> <strong id="currentStoreCount" aria-live="polite">0</strong></span>
                       <i class="store-manager-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
                     </button>
                     <button class="danger-text-button store-clear-button" type="button" id="clearStoreListButton" title="清空当前任务店铺，不修改源 Excel">
@@ -302,10 +341,10 @@
                 <li><span>05</span>Amazon 任务完成</li>
               </ol>
               <div class="progress-coverage" id="runCoverage" hidden aria-label="任务覆盖结果">
-                <div><span>输入店铺</span><strong id="coverageRequested">--</strong></div>
-                <div><span>访问成功</span><strong id="coverageQueried">--</strong></div>
+                <div><span id="coverageRequestedLabel">输入店铺</span><strong id="coverageRequested">--</strong></div>
+                <div><span id="coverageQueriedLabel">访问成功</span><strong id="coverageQueried">--</strong></div>
                 <div><span>源 ASIN</span><strong id="coverageUnresolved">--</strong></div>
-                <div><span>访问失败</span><strong id="coverageFailed">--</strong></div>
+                <div><span id="coverageFailedLabel">访问失败</span><strong id="coverageFailed">--</strong></div>
                 <div><span>详情成功</span><strong id="coverageParents">--</strong></div>
                 <div><span>全部候选</span><strong id="coverageProducts">--</strong></div>
                 <div class="coverage-source"><span>数据口径</span><strong id="coverageProvider">Amazon 官网商品页</strong></div>
@@ -336,7 +375,7 @@
                 <p>店铺采集与利润分析 → 您确认筛选、人工初审 → 手动导出</p>
               </div>
               <div class="export-menu" id="exportMenu">
-                <button class="secondary-button export-menu-trigger" type="button" id="exportButton" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenuList" title="保存到 D:\铺货筛选">
+                <button class="secondary-button export-menu-trigger" type="button" id="exportButton" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenuList" title="保存到本机导出目录">
                   <i data-lucide="folder-down" aria-hidden="true"></i>
                   <span>导出运营表</span>
                   <i class="export-menu-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
@@ -344,12 +383,12 @@
                 <div class="export-menu-list" id="exportMenuList" role="menu" aria-label="选择运营表导出范围" hidden>
                   <button class="export-menu-item" type="button" role="menuitem" id="exportAllCandidatesButton">
                     <i data-lucide="list" aria-hidden="true"></i>
-                    <span><strong>全部候选产品</strong><small>包含所有初审状态和完整度</small></span>
+                    <span><strong>当前筛选候选产品</strong><small>当前筛选范围内的全部分页</small></span>
                     <b id="exportAllCandidateCount">0</b>
                   </button>
                   <button class="export-menu-item" type="button" role="menuitem" id="exportApprovedProductsButton">
                     <i data-lucide="badge-check" aria-hidden="true"></i>
-                    <span><strong>已初审产品</strong><small>仅包含初审状态为已通过</small></span>
+                    <span><strong>当前筛选已初审产品</strong><small>当前筛选中初审已通过的商品</small></span>
                     <b id="exportApprovedProductCount">0</b>
                   </button>
                   <button class="export-menu-item export-menu-optional" type="button" role="menuitem" id="exportAnalysisHandoffButton" disabled>
@@ -380,7 +419,7 @@
               <div class="results-filter-heading">
                 <div>
                   <h2 id="resultsAmazonFiltersTitle">商品数据筛选</h2>
-                  <p>筛选只改变当前显示，全部已抓取 ASIN 保留在任务记录；未知月销量单独统计。</p>
+                  <p id="monthlySalesAdmissionNote">ASIN 导入默认显示全部商品；店铺导入按有效月销量 ≥50 初筛。可主动选择月销量档位，原始记录保留。</p>
                 </div>
                 <div class="results-filter-actions">
                   <button class="text-button" type="button" id="clearFiltersButton">恢复默认</button>
@@ -391,26 +430,41 @@
                 </div>
               </div>
               <div class="results-filter-grid">
-                <label class="filter-line filter-line-direct">
+                <label class="filter-line filter-line-direct" id="monthlySalesFilter">
                   <i data-lucide="chart-no-axes-column-increasing" aria-hidden="true"></i>
                   <span>近 30 天销量</span>
                   <select class="filter-select" id="monthlySalesBand" aria-label="有效月销量档位">
-                    <option value="all">全部合格月销量（有效值 ≥50）</option>
+                    <option value="all" id="monthlySalesAllOption">全部合格月销量（有效值 ≥50）</option>
+                    <option value="50_plus" id="monthlySales50PlusOption" hidden>至少 50（≥50）</option>
                     <option value="50_to_100">50+（50–&lt;100）</option>
                     <option value="100_plus">100+（≥100）</option>
                   </select>
                 </label>
                 <label class="filter-line filter-line-direct">
                   <i data-lucide="message-square-more" aria-hidden="true"></i>
-                  <span>最低评价数量</span>
-                  <span class="input-with-unit"><input id="minReviews" type="number" min="0" step="1" placeholder="留空" /><b>条</b></span>
+                  <span>最小评价数</span>
+                  <span class="input-with-unit"><input id="minReviews" type="number" min="0" max="9007199254740991" step="1" placeholder="不限下限" /><b>条</b></span>
+                </label>
+                <label class="filter-line filter-line-direct">
+                  <i data-lucide="message-square-more" aria-hidden="true"></i>
+                  <span>最大评价数</span>
+                  <span class="input-with-unit"><input id="maxReviews" type="number" min="0" max="9007199254740991" step="1" placeholder="不限上限" /><b>条</b></span>
                 </label>
                 <label class="filter-line filter-line-direct">
                   <i data-lucide="star" aria-hidden="true"></i>
                   <span>最低评价星级</span>
                   <span class="input-with-unit"><input id="minRating" type="number" min="0" max="5" step="0.1" placeholder="留空" /><b>星</b></span>
                 </label>
+                <div class="amazon-listing-date-filter">
+                  <label for="amazonFirstAvailableFrom"><i data-lucide="calendar-days" aria-hidden="true"></i><span>Amazon 上架起始日期</span></label>
+                  <div class="amazon-listing-date-control">
+                    <input id="amazonFirstAvailableFrom" type="date" aria-describedby="amazonListingDateCoverage" />
+                    <span>至今天</span>
+                    <button class="text-button" type="button" id="clearAmazonListingDateButton">清空</button>
+                  </div>
+                </div>
               </div>
+              <p class="amazon-listing-date-coverage" id="amazonListingDateCoverage" role="status">Amazon 上架日期：待载入；未知日期单独统计。</p>
             </section>
 
             <section class="supplier-stage-bar" id="supplierStagePanel" aria-labelledby="supplierStageTitle">
@@ -463,17 +517,17 @@
               <p class="analysis-coverage-line"><strong id="analysisCoverageStatus">尚未采集</strong><span id="analysisCoverageDetail">采集范围将随店铺分页和商品详情更新。</span></p>
             </section>
 
-            <section class="asin-coverage-summary" aria-label="店铺 ASIN 覆盖情况">
+            <section class="asin-coverage-summary" aria-label="ASIN 采集覆盖情况">
               <div class="asin-coverage-metric">
-                <span>Amazon 报告合计（估算）</span>
+                <span id="sourceAsinTotalLabel">Amazon 报告合计（估算）</span>
                 <strong id="storeAsinCount">未确认</strong>
               </div>
               <div class="asin-coverage-metric">
-                <span>已枚举唯一 ASIN</span>
+                <span id="retainedAsinLabel">已枚举唯一 ASIN</span>
                 <strong id="retainedAsinCount">0</strong>
               </div>
               <div class="asin-coverage-metric">
-                <span>待继续枚举（估算）</span>
+                <span id="pendingAsinLabel">待继续枚举（估算）</span>
                 <strong id="notIncludedAsinCount">未确认</strong>
               </div>
               <div class="asin-coverage-metric">
@@ -588,6 +642,7 @@
 
           <section class="detail-tab-panel is-active" id="amazonPanel" role="tabpanel" aria-labelledby="amazonTab" data-detail-panel="amazon">
             <dl class="metric-list" id="amazonMetrics"></dl>
+            <details id="amazonProductInformation" class="product-information-audit" hidden></details>
             <div class="source-note" id="sellerSpriteSourceNote" data-mode="idle"><i data-lucide="plug" aria-hidden="true"></i><span>等待一次手动连接 SellerSprite，数据来源尚未确认。</span></div>
           </section>
 

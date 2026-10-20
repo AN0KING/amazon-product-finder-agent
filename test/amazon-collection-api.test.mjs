@@ -138,6 +138,7 @@ syncBuiltinESMExports();
     asin, sourceAsin: asin, marketplace: "CA", currency: "CAD",
     title: "Synthetic complete product", imageUrl: "https://m.media-amazon.com/images/I/synthetic.jpg",
     currentPrice: 9.99, productWeightKg: 0.06, rating: 4.1, reviewCount: 22,
+    productWeightEvidence: { asin, label: "Item Weight", rawText: "60 Grams", value: 0.06, kind: "product", source: "amazon_product_page" },
     sales30: 100, sales30Evidence: { source: "amazon_product_page", asin, period: "past_month", kind: "lower_bound", value: 100, rawText: "100+ bought in past month" },
     detailStatus: "success", detailParserVersion: AMAZON_PRODUCT_DETAIL_PARSER_VERSION, detailRetryable: false,
     detailErrorCode: null, detailError: null, collectedAt: "2026-09-24T01:00:00.000Z",

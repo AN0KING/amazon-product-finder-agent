@@ -1,14 +1,24 @@
-import { monthlySalesValue, monthlySalesEvidence, hasQualifyingMonthlySales, summarizeMonthlySalesCoverage } from "./lib/monthly-sales-policy.mjs";
+import { normalizeReviewRange, reviewRangeExclusionReasons, intersectReviewRanges } from "./lib/review-range.mjs";
+import { monthlySalesValue, monthlySalesEvidence, hasQualifyingMonthlySales, summarizeMonthlySalesCoverage, isMonthlySalesFilterRequired } from "./lib/monthly-sales-policy.mjs";
+import { normalizeISODateOnly, todayDateOnly, matchesAmazonListingDate } from "./lib/amazon-listing-date.mjs";
 import {
   DEFAULT_PROFIT_RATES,
   DOMESTIC_FREIGHT_RATE_RANGE_CNY_PER_KG,
   PROFIT_FORMULA_VERSION,
   calculateProductProfit,
+  applyMissingWeightProfitAssumption,
+  hasInvalidProductWeight,
   estimateAu2026FbaFeeByProductWeight,
   estimateCa2026FbaFeeByProductWeight,
   estimateUs2023FbaFeeByProductWeight,
   isAmazonWeightUnavailable,
   resolveManualWeightOverride,
+  usesItemWeightOnly,
+  automaticProfitWeightKg,
+  resolveProductDimensionsCm, parseProductDimensionsCm, hasAnyProductShippingSpecification, estimateFbaByAvailableSpecifications, canadaDimensionalWeightKg,
+  automaticProductWeightKg,
+  automaticPackageWeightKg,
+  profitWeightSourceLabel,
   hasManualFulfillmentFee,
   estimateMinimumFbaFee,
 } from "./lib/profit-model.mjs";
@@ -27,6 +37,7 @@ import {
 import {
   AMAZON_PRICE_PARSER_VERSION,
   candidateCurrentPrice,
+  hasFailedAmazonDetailAttempt,
   hasManualAmazonPrice,
   invalidateLegacyAmazonPrice,
   isAmazonPagePrice,
@@ -38,8 +49,8 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.50";
-  const EXPORT_DIRECTORY_LABEL = "D:\\铺货筛选";
+  const APP_VERSION = "0.9.67";
+  const EXPORT_DIRECTORY_LABEL = "本机导出目录";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "standard";
   const AMAZON_STORE_BATCH_SIZE = 20;
@@ -466,6 +477,11 @@ import {
   let products = [];
   let selectedStoreFile = null;
   let storeList = null;
+  let importMode = "stores";
+  let asinImportPreview = null;
+  let failedImportFileDraft = null;
+  let asinPreviewPromise = null;
+  let asinPreviewGeneration = 0;
   let storeLoadGeneration = 0;
   let storeParseController = null;
   let storeImportPending = false;
@@ -537,6 +553,7 @@ import {
   let amazonCollectionSnapshotPromise = null;
   let amazonCollectionControlPromise = null;
   let amazonCollectionControlPending = false;
+  let amazonAccessRecoveryIdentity = "";
   let amazonCollectionRefreshError = null;
   let supplierCollectionTransition = false;
   let supplierPipelineState = null;
@@ -587,10 +604,48 @@ import {
         const update = JSON.parse(event.data);
         if (taskReplacementPending || update.runId !== runState.id) return;
         if (supplier1688ResumePromise && runState.supplier1688Pipeline?.owner !== 'server') return;
+        if (applyAmazonProductUpdate(update)) return;
         snapshotRefreshPending = true;
         void flushSnapshotUpdate();
       } catch { /* The regular status poll also catches up after reconnects. */ }
     };
+  }
+
+  function applyAmazonProductUpdate(update) {
+    if (update?.kind !== "amazon_product") return false;
+    // Product events use the Amazon revision; supplier events have an independent revision.
+    if (runState.archivedAt || update.runId !== runState.id) return true;
+    if (Number.isSafeInteger(update.revision) && Number.isSafeInteger(amazonCollectionRevision)
+      && update.revision <= amazonCollectionRevision) return true;
+    if (taskReplacementPending || amazonCollectionSnapshotPromise || snapshotRefreshPending
+      || profitEditorPendingSaves || profitAutoCommitTimer !== null
+      || isCurrentProfitEditorDraft(drawerProfitDraft) || (manualCostDraft && isManualCostDirty())
+      || update.formulaVersion !== PROFIT_FORMULA_VERSION
+      || !Number.isSafeInteger(update.baseRevision) || !Number.isSafeInteger(update.revision)
+      || update.revision <= update.baseRevision || amazonCollectionRevision !== update.baseRevision
+      || update.job?.owner !== "server" || update.job.runId !== runState.id
+      || update.job.revision !== update.revision || !Array.isArray(update.products) || !update.products.length) return false;
+    // A draft can exist before its debounce callback has recorded it.
+    if (drawerProfitBaseline) {
+      const pendingDraft = captureProfitEditorDraft();
+      if (pendingDraft) { drawerProfitDraft = pendingDraft; return false; }
+    }
+    const replacements = new Map(update.products.map((product) => [product?.id, product]));
+    if (replacements.size !== update.products.length || replacements.has(undefined)
+      || update.products.some((product) => !products.some((existing) => existing.id === product.id))) return false;
+    const scroll = [$(".view-stack"), $(".drawer-content")].filter(Boolean)
+      .map((element) => ({ element, top: element.scrollTop, left: element.scrollLeft }));
+    // Canonical products already include server-calculated fees and profit. Keep untouched objects intact.
+    products = products.map((product) => replacements.get(product.id) || product);
+    amazonCollectionRevision = update.revision;
+    runState.amazonCollectionRevision = update.revision;
+    if (update.runState && Object.hasOwn(update.runState, "mode")) runState.mode = update.runState.mode;
+    if (update.runState && Object.hasOwn(update.runState, "completedAt")) runState.completedAt = update.runState.completedAt;
+    applyAmazonCollectionJob(update.job);
+    if (replacements.has(activeProductId)) populateDrawer(replacements.get(activeProductId));
+    renderResults();
+    scroll.forEach(({ element, top, left }) => { element.scrollTop = top; element.scrollLeft = left; });
+    return true;
   }
 
   async function flushSnapshotUpdate() {
@@ -612,6 +667,84 @@ import {
     return supplierPipelineState;
   }
 
+  const pendingTaskControls = new Map();
+  const uncertainTaskControls = new Map();
+
+  function interruptedControlResponse(error) {
+    return ['REQUEST_TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED', 'HTTP_502', 'HTTP_503', 'HTTP_504'].includes(error?.code)
+      || error?.name === 'TypeError' || error?.name === 'AbortError'
+      || /failed to fetch|networkerror|network request failed|connection (?:closed|reset)/i.test(error?.message || '');
+  }
+
+  function taskControlConfirmed(kind, payload, state, before) {
+    if (!state || state.runId !== payload.runId) return false;
+    const advanced = Number.isFinite(Number(before?.revision)) && Number(state.revision) > Number(before.revision);
+    const active = ['queued', 'running', 'cooldown'].includes(state.status) && state.enabled !== false;
+    if (kind === 'amazon') {
+      if (payload.action === 'pause') return state.status === 'paused' && state.enabled === false && state.causeCode === 'USER_PAUSED';
+      if (payload.action === 'pause_for_supplier') return state.workerActive === false && ['paused', 'completed', 'needs_attention'].includes(state.status);
+      if (payload.action === 'retry_missing') return advanced && (active || state.status === 'completed');
+      if (payload.action === 'resume_after_supplier' && before?.causeCode !== 'SUPPLIER_MATCHING') {
+        return state.status === before?.status && state.causeCode === before?.causeCode && state.workerActive === false;
+      }
+      return active || (state.status === 'completed' && advanced);
+    }
+    if (payload.action === 'pause') return state.status === 'paused' && state.enabled === false;
+    if (payload.action === 'append') return advanced && payload.productIds.every(id => state.productIds?.includes(id));
+    return active || (state.status === 'complete' && advanced);
+  }
+
+  function requestTaskControl(kind, payload, { timeout = 30000, before } = {}) {
+    const base = kind === 'amazon' ? '/api/amazon/collection' : '/api/1688/pipeline';
+    const key = JSON.stringify([kind, payload.runId, payload.action, [...(payload.productIds || [])].sort(), payload.asins || []]);
+    if (pendingTaskControls.has(key)) return pendingTaskControls.get(key);
+    const pending = (async () => {
+      const saved = uncertainTaskControls.get(key);
+      const original = saved?.before || before || (kind === 'amazon' ? currentAmazonCollectionJob() : runState.supplier1688Pipeline);
+      const previous = original ? structuredClone(original) : null;
+      if (!saved) {
+        try {
+          return await apiRequest(`${base}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), timeout });
+        } catch (error) {
+          if (!interruptedControlResponse(error)) throw error;
+          uncertainTaskControls.set(key, { before: previous ? structuredClone(previous) : null });
+        }
+      }
+      // A lost response does not prove a failed command. Read once and never
+      // replay a mutation while its outcome is unknown, including another click.
+      try {
+        const state = await apiRequest(base, { timeout: 15000 });
+        if (taskControlConfirmed(kind, payload, state, previous)) {
+          uncertainTaskControls.delete(key);
+          return state;
+        }
+      } catch { /* Keep the original uncertain outcome; the next poll is read-only. */ }
+      throw createRunError('CONTROL_OUTCOME_UNKNOWN', '操作结果待确认：请求已发出，但尚未确认后台状态；请稍后查看进度，勿重复提交。');
+    })().finally(() => pendingTaskControls.delete(key));
+    pendingTaskControls.set(key, pending);
+    return pending;
+  }
+
+  async function refreshAfterTaskControl(label) {
+    try { await refreshAmazonCollectionSnapshot(); return true; }
+    catch {
+      showToast(`${label}已确认，页面进度待同步；当前结果保留，请等待状态刷新。`, 'info', 6500);
+      return false;
+    }
+  }
+
+  function applySupplierPipelineState(state, runId = runState.id) {
+    if (runState.id !== runId || state?.runId !== runId) return false;
+    supplierPipelineState = state;
+    runState.supplier1688Pipeline = state;
+    renderSupplier1688Stage();
+    return true;
+  }
+
+  function technical1688Pause(reason = supplier1688Queue?.ratePolicy?.pausedReason) {
+    return ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED'].includes(reason);
+  }
+
   function supplierNoPendingMessage(pipeline = runState.supplier1688Pipeline) {
     const excluded = Number(pipeline?.excludedMonthlySalesCount || 0);
     return excluded > 0
@@ -628,12 +761,10 @@ import {
       return false;
     }
     try {
-      supplierPipelineState = await apiRequest('/api/1688/pipeline/control', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId, action: 'resume' }), timeout: 30000,
-      });
+      supplierPipelineState = await requestTaskControl('supplier', { runId, action: 'resume' });
       if (runState.id !== runId) return false;
-      await refreshAmazonCollectionSnapshot();
+      applySupplierPipelineState(supplierPipelineState, runId);
+      const snapshotSynced = await refreshAfterTaskControl('匹配控制');
       if (runState.id !== runId) return false;
       const latest = runState.supplier1688Pipeline || supplierPipelineState;
       renderSupplier1688Stage();
@@ -645,7 +776,7 @@ import {
         showToast(latest?.message || '匹配仍处于暂停状态，断点已保留，请查看批次状态后继续。', 'info', 6200);
         return false;
       }
-      showToast(latest.status === 'cooldown'
+      if (snapshotSynced) showToast(latest.status === 'cooldown'
         ? '原批次正在冷却，断点已保留，冷却结束后后台会继续。'
         : '原批次已交给后台继续；每件商品取得报价后立即计算利润并更新列表。',
         latest.status === 'cooldown' ? 'info' : 'success', 6000);
@@ -662,14 +793,12 @@ import {
   }
 
   async function pauseServerSupplierPipeline() {
+    const runId = runState.id;
     try {
-      supplierPipelineState = await apiRequest('/api/1688/pipeline/control', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId: runState.id, action: 'pause' }), timeout: 30000,
-      });
-      await refreshAmazonCollectionSnapshot();
-      showToast('已暂停后续匹配，当前已提交商品返回后会保存结果。', 'info', 5200);
-    } catch (error) { showToast(error.message, 'error', 5200); }
+      const state = await requestTaskControl('supplier', { runId, action: 'pause' });
+      if (!applySupplierPipelineState(state, runId)) return;
+      if (await refreshAfterTaskControl('匹配暂停')) showToast('已暂停后续匹配，当前已提交商品返回后会保存结果。', 'info', 5200);
+    } catch (error) { showToast(error.message, error.code === 'CONTROL_OUTCOME_UNKNOWN' ? 'info' : 'error', 6200); }
   }
 
   function currentAmazonCollectionJob() {
@@ -698,9 +827,18 @@ import {
     return true;
   }
 
+  function withKnownAmazonWorkerState(job, previous) {
+    // Persisted snapshots and product events omit live worker state. Only an
+    // explicit status value can release a lock observed for this same run.
+    if (job?.owner !== "server" || typeof job.workerActive === "boolean" || !job.runId
+      || previous?.runId !== job.runId || typeof previous.workerActive !== "boolean") return job;
+    return { ...job, workerActive: previous.workerActive };
+  }
+
   function applyAmazonCollectionJob(job) {
     amazonCollectionStatusKnown = true;
-    amazonCollectionJob = job?.owner === "server" ? job : null;
+    const previous = amazonCollectionJob?.runId === job?.runId ? amazonCollectionJob : runState.amazonCollectionJob;
+    amazonCollectionJob = job?.owner === "server" ? withKnownAmazonWorkerState(job, previous) : null;
     if (amazonCollectionJob?.runId === runState.id) runState.amazonCollectionJob = amazonCollectionJob;
     renderAmazonCollection();
     updateStartAvailability();
@@ -735,10 +873,7 @@ import {
     amazonCollectionPollPromise = (async () => {
       try {
         if (hasActive1688Work() && currentAmazonCollectionJob()?.causeCode === 'SUPPLIER_MATCHING') {
-          await apiRequest('/api/amazon/collection/control', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ runId: runState.id, action: 'pause_for_supplier' }), timeout: 15000,
-          });
+          await requestTaskControl('amazon', { runId: runState.id, action: 'pause_for_supplier' }, { timeout: 15000 });
         }
         const job = await loadAmazonCollectionStatus();
         if (job?.runId === runState.id && job.revision !== amazonCollectionRevision) await refreshAmazonCollectionSnapshot();
@@ -767,7 +902,7 @@ import {
       const view = {
         criteria: { ...activeRunCriteria }, page: resultPage, productId: activeProductId,
         profitDraft: isCurrentProfitEditorDraft(drawerProfitDraft) ? captureProfitEditorDraft() : null,
-        filters: ["resultSearch", "resultMinMargin", "resultWeightBand", "resultsCompleteToggle", "monthlySalesBand", "minReviews", "minRating"].map((id) => {
+        filters: ["resultSearch", "resultMinMargin", "resultWeightBand", "resultsCompleteToggle", "monthlySalesBand", "minReviews", "maxReviews", "minRating", "amazonFirstAvailableFrom"].map((id) => {
           const input = byId(id); return { id, value: input?.value, checked: input?.checked };
         }),
         scroll: [$(".view-stack"), $(".drawer-content")].filter(Boolean).map((element) => ({ element, top: element.scrollTop, left: element.scrollLeft })),
@@ -788,11 +923,33 @@ import {
       renderResults();
       view.scroll.forEach(({ element, top, left }) => { element.scrollTop = top; element.scrollLeft = left; });
       renderAmazonCollection();
-    })().finally(() => { amazonCollectionSnapshotPromise = null; flushDeferredProfitEditorSnapshot(); });
+    })().finally(() => {
+      amazonCollectionSnapshotPromise = null;
+      flushDeferredProfitEditorSnapshot();
+      // Events received during a poll-triggered snapshot must also get a fresh read.
+      if (snapshotRefreshPending) void flushSnapshotUpdate();
+    });
     return amazonCollectionSnapshotPromise;
   }
 
   function bindAmazonCollection() {
+    byId("collectionAccessConfirmed")?.addEventListener("change", renderAmazonCollection);
+    byId("collectionAccessResumeButton")?.addEventListener("click", () => {
+      const job = currentAmazonCollectionJob();
+      if (!byId("collectionAccessConfirmed")?.checked || !job || job.workerActive
+        || job.status !== "needs_attention" || job.causeCode !== "AMAZON_ACCESS_CHALLENGE") return;
+      return controlAmazonCollection("resume");
+    });
+    byId("collectionAccessProducts")?.addEventListener("click", async event => {
+      const edge = event.target.closest("[data-amazon-url]");
+      if (edge) { event.preventDefault(); await openAmazonLinkInEdge(edge); return; }
+      const copy = event.target.closest("[data-copy-amazon-url]");
+      if (!copy) return;
+      try {
+        await navigator.clipboard.writeText(copy.dataset.copyAmazonUrl);
+        setText("collectionAccessFeedback", "原商品链接已复制。");
+      } catch { setText("collectionAccessFeedback", "未能复制，请右键商品链接选择复制链接地址。"); }
+    });
     byId("collectionPauseButton")?.addEventListener("click", () => void controlAmazonCollection("pause"));
     byId("collectionResumeButton")?.addEventListener("click", () => void controlAmazonCollection("resume"));
     byId("collectionRetryMissingButton")?.addEventListener("click", () => void controlAmazonCollection("retry_missing"));
@@ -828,14 +985,13 @@ import {
     renderAmazonCollection();
     updateStartAvailability();
     try {
-      const job = await apiRequest("/api/amazon/collection/control", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: controlledRunId, action }), timeout: 30000,
-      });
+      const job = await requestTaskControl('amazon', { runId: controlledRunId, action });
       if (runState.id !== controlledRunId) return;
       applyAmazonCollectionJob(job);
-      await refreshAmazonCollectionSnapshot();
+      await refreshAfterTaskControl('采集操作');
     } catch (error) {
-      showToast(`后台任务状态未更新：${error.message}`, "error", 6000);
+      showToast(error.code === 'CONTROL_OUTCOME_UNKNOWN' ? error.message : `后台任务状态未更新：${error.message}`,
+        error.code === 'CONTROL_OUTCOME_UNKNOWN' ? 'info' : 'error', 6500);
     } finally {
       amazonCollectionControlPending = false;
       renderAmazonCollection();
@@ -862,6 +1018,7 @@ import {
     const panel = byId("amazonCollectionPanel");
     if (!panel) return;
     const job = currentAmazonCollectionJob() || amazonCollectionJob;
+    renderAmazonAccessRecovery(job);
     panel.hidden = !job;
     if (!job) return;
     const sameRun = job.runId === runState.id;
@@ -873,6 +1030,7 @@ import {
     setText("collectionMessage", amazonCollectionRefreshError
       ? `暂未同步最新进度：${amazonCollectionRefreshError}。本地后台任务会继续运行。`
       : !sameRun ? "另一个任务正在后台采集；当前显示的是该任务的进度。"
+      : job.causeCode === "AMAZON_ACCESS_CHALLENGE" ? "采集会话的访问检查未通过，断点已保存。请使用下方人工处理入口核对；历史超时提示不代表当前页面一定有验证码。"
       : job.message || (job.status === "completed" ? "采集结果已保存；页面未提供的字段保留为空，可按需补采。" : "关闭页面后本地后台仍会继续采集。"));
     setText("collectionEditingNote", sameRun && editingLocked
       ? "采集中可查看、筛选并发起图片匹配；暂停或完成后可编辑。"
@@ -894,6 +1052,34 @@ import {
     if (pause) pause.disabled = busy || !["queued", "running", "cooldown"].includes(job.status);
     if (resume) resume.disabled = busy || !["paused", "needs_attention", "cooldown"].includes(job.status);
     if (retry) retry.disabled = busy || !["completed", "paused", "needs_attention"].includes(job.status);
+  }
+
+  function renderAmazonAccessRecovery(job) {
+    const panel = byId("collectionAccessPanel"), confirmed = byId("collectionAccessConfirmed");
+    const resume = byId("collectionAccessResumeButton"), list = byId("collectionAccessProducts");
+    if (!panel || !confirmed || !resume || !list) return;
+    const visible = job?.runId === runState.id && job?.status === "needs_attention"
+      && job.causeCode === "AMAZON_ACCESS_CHALLENGE" && !runState.archivedAt;
+    panel.hidden = !visible;
+    const identity = visible ? `${job.runId}:${job.revision}` : "";
+    if (amazonAccessRecoveryIdentity !== identity) {
+      amazonAccessRecoveryIdentity = identity;
+      confirmed.checked = false;
+      setText("collectionAccessFeedback", "");
+    }
+    resume.disabled = !visible || !confirmed.checked || job?.workerActive === true || amazonCollectionControlPending
+      || storeImportPending || taskReplacementPending || hasActive1688Work();
+    if (!visible) { list.innerHTML = ""; return; }
+    const blocked = products.filter(product => amazonCollectionFailure(product)?.code === "AMAZON_ACCESS_CHALLENGE");
+    list.innerHTML = blocked.map(product => {
+      const url = amazonProductUrl(product), failure = amazonCollectionFailure(product);
+      const legacyTimeout = failure.message === "Amazon browser page requires access verification.";
+      return `<div class="collection-access-product"><strong>${escapeHtml(product.sourceAsin || product.asin)}</strong>
+        <p>${escapeHtml(legacyTimeout ? "旧版将浏览器加载等待超时归类为访问验证；未保存验证页面证据，不能据此确认有验证码。" : failure.message || failure.reason)}</p>
+        ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">在新标签页打开原链接</a>
+        <button class="secondary-button" type="button" data-amazon-url="${escapeHtml(url)}">在 Edge 打开</button>
+        <button class="secondary-button" type="button" data-copy-amazon-url="${escapeHtml(url)}">复制链接</button>` : "<p>未找到有效商品链接，请核对原导入清单。</p>"}</div>`;
+    }).join("") || "<p>暂停发生在店铺访问阶段，请核对原导入的店铺页面后再继续。</p>";
   }
 
   function bindAmazonConnection() {
@@ -1115,10 +1301,10 @@ import {
   }
 
   function fbaPolicyDetail(market = activeMarket) {
-    if (market.code === "AU") return "标准信封≤33×23×2.5cm、≤475g；0–75g、76–225g、226–475g 售价≤13 AUD 分别为3.67、4.35、4.70，＞13 AUD 为4.58、5.26、5.61；尺寸未提供时按标准信封暂估，可手工覆盖";
+    if (market.code === "AU") return "标准信封≤33×23×2.5cm、≤475g；0–75g、76–225g、226–475g 售价≤13 AUD 分别为3.67、4.35、4.70，＞13 AUD 为4.58、5.26、5.61；超475g按最高重量档封顶估费，头程仍按实际重量；尺寸未提供时按标准信封暂估，可手工覆盖";
     const standardPolicy = FBA_WEIGHT_STANDARD_SIZE_POLICY === "small" ? "1 lb 内按小号标准件" : "20 lb 内按大号标准件保守档";
     if (market.code === "US") return `仅按商品重量套用 FBA 物流费用计算 SOP（${standardPolicy}），不使用尺寸或 SellerSprite FBA 原值，可手工覆盖`;
-    if (market.code === "CA") return `固定按加拿大旺季信封表暂估，≤500g；售价＜14 CAD 减0.8，恰好14不减；（基础费－优惠）×1.035，计算保留精度、显示两位小数，可手工覆盖`;
+    if (market.code === "CA") return `固定按加拿大旺季信封表暂估，超500g按最高重量档封顶估费，头程仍按实际重量；售价＜14 CAD 减0.8，恰好14不减；（基础费－优惠）×1.035，计算保留精度、显示两位小数，可手工覆盖`;
     return `仅按商品重量套用美国 FBA 物流费用计算 SOP（${standardPolicy}），费率数值按 ${market.currency} 名义估算，可手工覆盖`;
   }
 
@@ -1136,6 +1322,7 @@ import {
     activeRunCriteria = {};
     currentVisibleProducts = [];
     runState = createIdleRunState();
+    syncAmazonListingDateControl();
     restorePending1688RiskStatus();
     const progress = byId("progressPanel");
     if (progress) progress.hidden = true;
@@ -1200,85 +1387,257 @@ import {
     if (byId("resultsCompleteToggle")) byId("resultsCompleteToggle").checked = false;
   }
 
+  function isAsinImport(data = storeList) {
+    return data?.inputMode === "asins";
+  }
+
+  function currentTaskInputMode() {
+    // Only the current task or its imported source establishes admission rules.
+    // Changing the next-import tab must not change an existing task's candidates.
+    if (["asins", "stores"].includes(runState.inputMode)) return runState.inputMode;
+    return isAsinImport() ? "asins" : "stores";
+  }
+
+  function renderMonthlySalesAdmission() {
+    const direct = currentTaskInputMode() === "asins";
+    const control = byId("monthlySalesBand");
+    if (control) {
+      control.disabled = false;
+      control.title = direct ? "ASIN 默认显示全部商品；选择月销量档位后才按销量筛选。" : "店铺导入按有效月销量及所选档位筛选。";
+    }
+    setText("monthlySalesAllOption", direct ? "全部商品（不限月销量）" : "全部合格月销量（有效值 ≥50）");
+    if (byId("monthlySales50PlusOption")) byId("monthlySales50PlusOption").hidden = !direct;
+    const row = byId("monthlySalesFilter");
+    if (row) row.hidden = false;
+    setText("monthlySalesAdmissionNote", direct
+      ? "ASIN 导入：默认显示全部商品，包含月销量低于 50 和未知的商品；仅在主动选择销量档位时筛选。其他已选条件仍生效。"
+      : "店铺导入：按有效月销量 ≥50 及所选销量档位初筛；未知销量单独统计，原始记录保留。");
+  }
+
+  function importedItemCount(data = storeList) {
+    if (isAsinImport(data)) return new Set((data?.stores || []).flatMap((store) => store.asins || [])).size;
+    return data?.audit?.uniqueSellers ?? data?.stores?.length ?? 0;
+  }
+
+  function hasNewAsinDraft() {
+    return importMode === "asins" && Boolean(byId("asinTextInput")?.value.trim());
+  }
+
+  function selectedInputNeedsImport() {
+    return failedImportFileDraft !== null || importMode !== (isAsinImport() ? "asins" : "stores") || hasNewAsinDraft();
+  }
+
+  function usableExcelAsinProjection(projection) {
+    return projection?.version === 1 && ["uploaded_excel_asin_column", "uploaded_excel_direct_products"].includes(projection.source)
+      && projection.status === "ready" && projection.data?.inputMode === "asins"
+      && ["asin", "product_url"].includes(projection.data.audit?.sourceColumn) && importedItemCount(projection.data) > 0;
+  }
+
+  function renderSelectedInputSummary() {
+    const pending = selectedInputNeedsImport();
+    const summary = byId("selectedInputSummary");
+    if (byId("discardImportDraftButton")) byId("discardImportDraftButton").hidden = !pending;
+    if (byId("importMetrics")) byId("importMetrics").hidden = pending;
+    if (byId("importDataAudit")) byId("importDataAudit").hidden = pending;
+    if (pending && byId("storeManager")) byId("storeManager").hidden = true;
+    if (!summary) return;
+    summary.hidden = !pending;
+    if (!pending) return;
+    if (failedImportFileDraft && !hasNewAsinDraft()) {
+      summary.textContent = `新文件“${failedImportFileDraft.fileName}”尚未导入：${failedImportFileDraft.error}。请重新选择有效文件，或取消新输入后返回原任务；不会自动续跑旧任务。`;
+    } else if (importMode !== "asins") {
+      summary.textContent = "已选择店铺模式，请重新上传店铺 Excel；不会继续当前 ASIN 任务。";
+    } else if (hasNewAsinDraft()) {
+      summary.textContent = "所选输入：新粘贴的 ASIN / 商品链接。点击开始后先校验、归档旧任务，再创建独立 ASIN 批次。";
+    } else if (asinImportPreview?.status === "ready") {
+      const preview = asinImportPreview.data;
+      const asins = (preview.stores || []).flatMap(store => store.asins || []);
+      summary.textContent = `所选输入：${asinImportPreview.fileName} 的${preview.audit.sourceColumn === "product_url" ? "商品链接" : " ASIN 列"} · ${preview.audit.marketplace} · ${importedItemCount(preview)} 个唯一 ASIN。${asins.slice(0, 8).join("、")}${asins.length > 8 ? "…" : ""}。只采集这些 ASIN；点击开始后归档旧任务，建立独立批次。`;
+    } else if (asinImportPreview?.status === "loading") {
+      summary.textContent = "正在校验当前 Excel 的 ASIN 列；旧任务和结果保持原状。";
+    } else {
+      summary.textContent = asinImportPreview?.error || "当前记录没有原始 Excel 的 ASIN 列，请重新选择含 ASIN 列的 Excel，或粘贴 ASIN。不会从旧店铺结果推断范围或继续旧任务。";
+    }
+  }
+
+  async function prepareCurrentExcelAsins() {
+    if (importMode !== "asins" || isAsinImport() || hasNewAsinDraft()) return null;
+    const projection = storeList?.directAsinInput;
+    if (usableExcelAsinProjection(projection)) {
+      asinImportPreview = { status: "ready", data: structuredClone(projection.data), fileName: storeList.fileName || "当前 Excel" };
+      if (byId("asinMarketplaceSelect")) byId("asinMarketplaceSelect").value = projection.data.audit.marketplace;
+      renderSelectedInputSummary();
+      return asinImportPreview;
+    }
+    if (projection?.status === "unavailable") {
+      asinImportPreview = { status: "unavailable", error: `当前 Excel 的 ASIN 列不可用：${projection.error?.message || "未找到有效 ASIN 列"}。请修正并重新选择文件；不会使用店铺链接或旧结果补充范围。` };
+      renderSelectedInputSummary();
+      return asinImportPreview;
+    }
+    if (!selectedStoreFile) {
+      asinImportPreview = { status: "unavailable", error: "当前历史记录未保存原始 Excel 的 ASIN 列。请重新选择含 ASIN 列的 Excel，或粘贴 ASIN；不会续跑旧店铺任务。" };
+      renderSelectedInputSummary();
+      return asinImportPreview;
+    }
+    if (asinPreviewPromise) return asinPreviewPromise;
+    const file = selectedStoreFile;
+    const generation = ++asinPreviewGeneration;
+    const sourceGeneration = storeLoadGeneration;
+    asinImportPreview = { status: "loading" };
+    renderSelectedInputSummary();
+    const request = (async () => {
+      try {
+        const data = await apiRequest("/api/asin-list/parse", {
+          method: "POST", body: await file.arrayBuffer(),
+          headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "X-File-Name": encodeURIComponent(file.name), "X-Marketplace": byId("asinMarketplaceSelect")?.value || activeMarket.code },
+        });
+        if (generation !== asinPreviewGeneration || sourceGeneration !== storeLoadGeneration) return null;
+        if (data?.inputMode !== "asins" || !["asin", "product_url"].includes(data.audit?.sourceColumn) || !importedItemCount(data)) throw new Error("当前 Excel 没有有效的 ASIN 或商品链接。请重新选择对应 Excel。");
+        asinImportPreview = { status: "ready", data, fileName: file.name };
+      } catch (error) {
+        if (generation !== asinPreviewGeneration || sourceGeneration !== storeLoadGeneration) return null;
+        asinImportPreview = { status: "unavailable", error: `${error.message || "ASIN 列解析失败"}；旧任务未变更。` };
+      } finally {
+        if (generation === asinPreviewGeneration) {
+          asinPreviewPromise = null;
+          renderSelectedInputSummary();
+          updateStartAvailability();
+        }
+      }
+      return asinImportPreview;
+    })();
+    asinPreviewPromise = request;
+    return request;
+  }
+
+  function setImportMode(mode) {
+    importMode = mode === "asins" ? "asins" : "stores";
+    const asins = importMode === "asins";
+    byId("storeImportTab")?.setAttribute("aria-selected", String(!asins));
+    byId("asinImportTab")?.setAttribute("aria-selected", String(asins));
+    if (byId("storeImportHelp")) byId("storeImportHelp").hidden = asins;
+    if (byId("asinImportPanel")) byId("asinImportPanel").hidden = !asins;
+    setText("uploadedFilename", storeList && isAsinImport() === asins ? storeList.fileName : asins ? "重新选择含 ASIN 列的 Excel" : "选择店铺文件");
+    setText("uploadHelp", asins ? "优先使用当前 Excel 的 ASIN 列；也可重新上传含 ASIN 列的 XLSX" : "每行一个 Amazon 店铺链接 · 自动识别国家并切换站点");
+    if (asins && !isAsinImport()) void prepareCurrentExcelAsins();
+    if (!selectedInputNeedsImport() && storeList) renderStoreManager({ collapse: true });
+    renderSelectedInputSummary();
+    updateStartAvailability();
+  }
+
+  async function importTaskSource({ file = null, text = "", mode = importMode, marketplace = activeMarket.code, preparedData = null, preparedFileName = null } = {}) {
+    if (storeImportPending || taskReplacementPending) return false;
+    if (file && !file.name.toLowerCase().endsWith(".xlsx")) {
+      failedImportFileDraft = { fileName: file.name, mode, error: "仅支持 XLSX 文件" };
+      renderSelectedInputSummary(); updateStartAvailability();
+      showToast("实时解析仅支持 XLSX 文件。", "error", 4200);
+      return false;
+    }
+    const asins = mode === "asins";
+    if (!file && !preparedData && (!asins || !text.trim())) {
+      showToast("请填写至少一个 ASIN 或 Amazon 商品链接。", "error", 4200);
+      return false;
+    }
+    const fileName = file?.name || preparedFileName || "粘贴 ASIN 清单";
+    if (!confirmActiveTaskReplacement(`导入“${fileName}”会替换当前采集清单和页面结果。`, { uploading: true })) return false;
+    storeImportPending = true;
+    const priorInert = document.body.inert;
+    document.body.inert = true;
+    const generation = ++storeLoadGeneration;
+    storeParseController?.abort();
+    const controller = new AbortController();
+    storeParseController = controller;
+    updateStartAvailability();
+    renderAmazonCollection();
+    setImportStatus("loading", "正在解析新清单");
+    try {
+      const data = preparedData ? structuredClone(preparedData) : await apiRequest(asins ? "/api/asin-list/parse" : "/api/store-list/parse", {
+        method: "POST",
+        body: file ? await file.arrayBuffer() : JSON.stringify({ text, marketplace }),
+        headers: file ? {
+          "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "X-File-Name": encodeURIComponent(fileName), "X-Marketplace": marketplace,
+        } : { "Content-Type": "application/json" },
+        signal: controller.signal,
+      });
+      if (generation !== storeLoadGeneration || controller.signal.aborted) return false;
+      const parsedCount = importedItemCount(data);
+      if (!parsedCount || !Array.isArray(data.stores) || !data.stores.length) throw new Error(firstStoreIssueReason(data) || "新清单没有可导入的内容，旧任务已保留。");
+      if (asins && data.inputMode !== "asins") throw new Error("ASIN 解析响应无效，旧任务已保留。");
+      const detectedMarket = MARKET_CONFIGS[String(data.audit?.marketplace || "").trim().toUpperCase()];
+      if (!detectedMarket?.enabled) throw new Error("新清单的站点尚不支持，旧任务已保留。");
+      if (data.audit?.requiresSeparateBatches) throw new Error("清单包含不同国家的商品或店铺，请按国家分批导入，旧任务已保留。");
+      if (data.stores.some(store => store.marketplace && store.marketplace !== detectedMarket.code)) throw new Error("清单的站点校验不一致，旧任务已保留。");
+      setImportStatus("loading", "正在归档旧任务");
+      await archiveCurrentRunForUpload();
+      if (generation !== storeLoadGeneration) return false;
+      // Keep the prior market/currency through its final draft save and archive.
+      if (detectedMarket.code !== activeMarket.code) {
+        activeMarket = detectedMarket;
+        taskExchangeRate = activeMarket.defaultExchangeRate;
+      }
+      storeList = null;
+      resetTaskResultsForStoreChange();
+      asinPreviewGeneration += 1;
+      asinPreviewPromise = null;
+      asinImportPreview = null;
+      failedImportFileDraft = null;
+      if (asins && byId("asinTextInput")) byId("asinTextInput").value = "";
+      selectedStoreFile = file;
+      resetStoreAuditUi();
+      renderMarketUi();
+      applyStoreList(data, fileName);
+      setImportMode(asins ? "asins" : "stores");
+      if (byId("asinMarketplaceSelect")) byId("asinMarketplaceSelect").value = activeMarket.code;
+      showToast(`已导入 Amazon ${activeMarket.nameZh} ${parsedCount} 个${asins ? "ASIN" : "唯一店铺"}，点击开始后采集；旧任务可在任务记录中查看。`, "success", 5000);
+      return true;
+    } catch (error) {
+      if (generation !== storeLoadGeneration || controller.signal.aborted) return false;
+      if (file) failedImportFileDraft = { fileName: file.name, mode, error: error.message || "解析失败" };
+      renderSelectedInputSummary();
+      setImportStatus("error", "新清单尚未载入");
+      showToast(["MIXED_MARKETPLACES", "ASIN_MARKETPLACE_MISMATCH"].includes(error.code)
+        ? "清单包含多个国家，请按国家分批导入；旧任务已保留。"
+        : error.message || "导入未完成，旧任务记录已保留。", "error", 6200);
+      return false;
+    } finally {
+      storeImportPending = false;
+      taskReplacementPending = false;
+      document.body.inert = priorInert;
+      if (generation === storeLoadGeneration && byId("storeFileInput")) byId("storeFileInput").value = "";
+      updateStartAvailability();
+      renderAmazonCollection();
+      scheduleAmazonCollectionPoll(0);
+    }
+  }
+
   function bindFileImport() {
     const input = byId("storeFileInput");
-    const zone = byId("uploadZone");
-    zone?.addEventListener("click", () => {
-      input?.click();
+    byId("uploadZone")?.addEventListener("click", () => input?.click());
+    byId("storeImportTab")?.addEventListener("click", () => setImportMode("stores"));
+    byId("asinImportTab")?.addEventListener("click", () => setImportMode("asins"));
+    byId("discardImportDraftButton")?.addEventListener("click", () => {
+      if (storeImportPending || taskReplacementPending) return;
+      failedImportFileDraft = null; asinImportPreview = null; asinPreviewGeneration += 1; asinPreviewPromise = null;
+      if (byId("asinTextInput")) byId("asinTextInput").value = "";
+      setImportMode(isAsinImport() ? "asins" : "stores");
+    });
+    if (byId("asinMarketplaceSelect")) byId("asinMarketplaceSelect").value = activeMarket.code;
+    byId("asinTextInput")?.addEventListener("input", () => { renderSelectedInputSummary(); updateStartAvailability(); });
+    byId("asinMarketplaceSelect")?.addEventListener("change", () => {
+      if (!hasNewAsinDraft() && selectedInputNeedsImport()) { asinImportPreview = null; void prepareCurrentExcelAsins(); }
+      renderSelectedInputSummary(); updateStartAvailability();
     });
     input?.addEventListener("change", async () => {
       const file = input.files?.[0];
-      if (!file || storeImportPending || taskReplacementPending) return;
-      if (!file.name.toLowerCase().endsWith(".xlsx")) {
-        input.value = "";
-        showToast("首版实时解析仅支持 XLSX 文件。", "error", 4200);
-        return;
-      }
-      if (!confirmActiveTaskReplacement(`导入“${file.name}”会替换当前店铺清单和页面结果。`, { uploading: true })) {
-        input.value = "";
-        return;
-      }
-      storeImportPending = true;
-      const priorInert = document.body.inert;
-      // Freeze user edits while the final saved snapshot and archive are in flight.
-      // Internal draft commits below still read the existing form values.
-      document.body.inert = true;
-      const generation = ++storeLoadGeneration;
-      storeParseController?.abort();
-      const controller = new AbortController();
-      storeParseController = controller;
-      updateStartAvailability();
-      renderAmazonCollection();
-      setImportStatus("loading", "正在解析新文件");
-      try {
-        // Validate the replacement before touching the saved task. A cancelled
-        // picker or an unreadable/empty workbook must leave its checkpoint intact.
-        const buffer = await file.arrayBuffer();
-        const data = await apiRequest("/api/store-list/parse", {
-          method: "POST", body: buffer,
-          headers: {
-            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "X-File-Name": encodeURIComponent(file.name), "X-Marketplace": activeMarket.code,
-          }, signal: controller.signal,
-        });
-        if (generation !== storeLoadGeneration || controller.signal.aborted) return;
-        const parsedCount = data.audit?.uniqueSellers ?? data.stores?.length ?? 0;
-        if (!parsedCount || !Array.isArray(data.stores) || !data.stores.length) throw new Error(firstStoreIssueReason(data) || "新文件没有可导入的店铺，旧任务已保留。");
-        const detectedMarket = MARKET_CONFIGS[String(data.audit?.marketplace || "").trim().toUpperCase()];
-        if (!detectedMarket?.enabled) throw new Error("新文件的店铺站点尚不支持，旧任务已保留。");
-        if (data.audit?.requiresSeparateBatches) throw new Error("文件包含不同国家的店铺，请按国家分开上传，旧任务已保留。");
-        if (data.stores?.some(store => store.marketplace && store.marketplace !== detectedMarket.code)) {
-          throw new Error("文件的店铺站点校验不一致，旧任务已保留。");
-        }
-        setImportStatus("loading", "正在归档旧任务");
-        await archiveCurrentRunForUpload();
-        if (generation !== storeLoadGeneration) return;
-        // Keep the previous task's market and currency until its snapshot is archived.
-        if (detectedMarket.code !== activeMarket.code) {
-          activeMarket = detectedMarket;
-          taskExchangeRate = activeMarket.defaultExchangeRate;
-        }
-        storeList = null;
-        resetTaskResultsForStoreChange();
-        selectedStoreFile = file;
-        resetStoreAuditUi();
-        renderMarketUi();
-        applyStoreList(data, file.name);
-        showToast(`已按店铺链接识别为 Amazon ${activeMarket.nameZh}，解析 ${parsedCount} 个唯一店铺，可开始新任务；旧任务可在任务记录中查看。`, "success", 5000);
-      } catch (error) {
-        if (generation !== storeLoadGeneration || controller.signal.aborted) return;
-        setImportStatus("error", "新文件尚未载入");
-        showToast(error.code === "MIXED_MARKETPLACES" ? "文件包含多个国家的店铺，请按国家分开上传；旧任务已保留。" : error.message || "上传未完成，旧任务记录已保留。", "error", 6200);
-      } finally {
-        storeImportPending = false;
-        taskReplacementPending = false;
-        document.body.inert = priorInert;
-        if (generation === storeLoadGeneration) input.value = "";
-        updateStartAvailability();
-        renderAmazonCollection();
-        scheduleAmazonCollectionPoll(0);
-      }
+      if (!file) return;
+      await importTaskSource({ file, mode: importMode, marketplace: importMode === "asins" ? byId("asinMarketplaceSelect")?.value || activeMarket.code : activeMarket.code });
+      input.value = "";
     });
+    byId("importAsinsButton")?.addEventListener("click", () => importTaskSource({
+      text: byId("asinTextInput")?.value || "", mode: "asins", marketplace: byId("asinMarketplaceSelect")?.value || activeMarket.code,
+    }));
 
     byId("sellerSpriteRetryButton")?.addEventListener("click", () => {
       void checkSellerSpriteConnection();
@@ -1357,6 +1716,8 @@ import {
       throw new Error(`店铺表属于 ${audit.marketplace || "未知"} 站，与当前 ${activeMarket.code} 站不一致。`);
     }
     storeList = { ...data, audit: { ...audit }, sourceAudit: { ...audit }, stores, fileName, manuallyEdited: false };
+    renderMonthlySalesAdmission();
+    setImportMode(isAsinImport() ? "asins" : "stores");
     byId("uploadedFilename").textContent = fileName;
     renderStoreAuditUi(storeList.audit);
     renderStoreManager({ collapse: true });
@@ -1397,11 +1758,12 @@ import {
   function renderStoreAuditUi(audit = {}) {
     renderStoreImportWarnings();
     setMetric("rawRowsMetric", audit.rawRows);
-    setMetric("uniqueStoresMetric", audit.uniqueSellers ?? storeList?.stores?.length ?? 0);
+    setMetric("uniqueStoresMetric", importedItemCount());
+    setText("uniqueImportMetricLabel", isAsinImport() ? "唯一 ASIN" : "唯一卖家");
     setMetric("duplicateRowsMetric", audit.duplicates);
     setMetric("repairedRowsMetric", audit.repaired);
     setText("marketAuditValue", audit.marketplaceDomain || activeMarket.amazonDomain);
-    setText("keyAuditValue", "Marketplace + Seller ID");
+    setText("keyAuditValue", isAsinImport() ? "Marketplace + ASIN" : "Marketplace + Seller ID");
     const repairNumber = Number(audit.repaired);
     const repaired = audit.repaired === null || audit.repaired === undefined || audit.repaired === "" || !Number.isFinite(repairNumber)
       ? null
@@ -1441,16 +1803,28 @@ import {
     });
 
     byId("currentStoreList")?.addEventListener("click", (event) => {
+      const asinButton = event.target.closest("[data-remove-asin]");
+      if (asinButton && !asinButton.disabled && !analysisRunning && !isCollectionWriteLocked() && !hasActive1688Work()) {
+        const asin = asinButton.dataset.removeAsin;
+        if ((products.length || runState.mode !== "idle") && !window.confirm(`移除 ASIN ${asin} 会清空当前分析结果，是否继续？`)) return;
+        const stores = (storeList?.stores || []).map(store => ({
+          ...store,
+          asins: (store.asins || []).filter(value => value !== asin),
+          ...(store.productUrls ? { productUrls: Object.fromEntries(Object.entries(store.productUrls).filter(([sourceAsin]) => sourceAsin !== asin)) } : {}),
+        })).filter(store => store.asins.length);
+        applyStoreMutation(stores, `已从本次任务移除 ASIN ${asin}。`);
+        return;
+      }
       const button = event.target.closest("[data-remove-store]");
       if (!button || button.disabled || analysisRunning || hasActive1688Work()) return;
       removeCurrentStore(Number(button.dataset.storeIndex));
     });
 
     byId("clearStoreListButton")?.addEventListener("click", () => {
-      const count = storeList?.stores?.length || 0;
+      const count = importedItemCount();
       if (!count || analysisRunning || hasActive1688Work()) return;
-      const confirmed = window.confirm(`清空当前任务的 ${count} 个店铺及已有分析结果？\n源 XLSX 不会被修改。`);
-      if (confirmed) applyStoreMutation([], `已清空本次任务的 ${count} 个店铺；源 XLSX 未修改。`, { focusUpload: true });
+      const confirmed = window.confirm(`清空当前任务的 ${count} 个${isAsinImport() ? "ASIN" : "店铺"}及已有分析结果？\n源 XLSX 不会被修改。`);
+      if (confirmed) applyStoreMutation([], `已清空本次任务的 ${count} 个${isAsinImport() ? "ASIN" : "店铺"}；源文件未修改。`, { focusUpload: true });
     });
   }
 
@@ -1461,7 +1835,9 @@ import {
     const list = byId("currentStoreList");
     if (!manager || !toggle || !body || !list) return;
     const stores = Array.isArray(storeList?.stores) ? storeList.stores : [];
-    setText("currentStoreCount", stores.length);
+    setText("currentStoreCount", importedItemCount());
+    setText("currentImportListLabel", isAsinImport() ? "当前任务 ASIN" : "当前任务店铺");
+    list.setAttribute("aria-label", isAsinImport() ? "当前任务 ASIN" : "当前任务店铺");
     manager.hidden = stores.length === 0;
     if (!stores.length) {
       list.replaceChildren();
@@ -1473,6 +1849,17 @@ import {
     if (collapse) {
       body.hidden = true;
       toggle.setAttribute("aria-expanded", "false");
+    }
+    if (isAsinImport()) {
+      list.innerHTML = [...new Set(stores.flatMap(store => store.asins || []))].map(asin => `
+        <div class="current-store-item" role="listitem">
+          <i class="current-store-icon" data-lucide="package" aria-hidden="true"></i>
+          <div class="current-store-copy"><strong>${escapeHtml(asin)}</strong><span>Amazon ${escapeHtml(activeMarket.nameZh)} · 直接采集商品详情</span></div>
+          <button class="icon-button current-store-remove" type="button" data-remove-asin="${escapeHtml(asin)}" aria-label="移除 ASIN ${escapeHtml(asin)}"><i data-lucide="trash-2" aria-hidden="true"></i></button>
+        </div>`).join("");
+      syncStoreManagerControls();
+      initIcons();
+      return;
     }
     list.innerHTML = stores.map((store, index) => {
       const sellerId = String(store?.sellerId || "未提供").trim();
@@ -1526,14 +1913,16 @@ import {
     const audit = {
       ...storeList.audit,
       rawRows: rowCount,
-      uniqueSellers: stores.length,
+      uniqueSellers: isAsinImport() ? 0 : stores.length,
+      ...(isAsinImport() ? { uniqueAsins: new Set(stores.flatMap(store => store.asins || [])).size } : {}),
       duplicates,
       repaired: stores.length === 0 || sourceRepaired === 0 ? 0 : null,
       invalid: stores.length === 0 ? 0 : Number(sourceAudit.invalid || 0),
       resolved,
       unresolved: stores.length - resolved,
     };
-    storeList = { ...storeList, audit, stores, sourceAudit, manuallyEdited: true };
+    const remainingAsins = new Set(stores.flatMap(store => store.asins || []));
+    storeList = { ...storeList, audit, stores, sourceAudit, manuallyEdited: true, ...(isAsinImport() ? { rows: (storeList.rows || []).filter(row => remainingAsins.has(row.asin)) } : {}) };
     if (!stores.length) {
       selectedStoreFile = null;
       setText("uploadedFilename", "选择店铺文件");
@@ -1558,7 +1947,7 @@ import {
     const clear = byId("clearStoreListButton");
     if (toggle) toggle.disabled = disabled;
     if (clear) clear.disabled = disabled;
-    $$('[data-remove-store]').forEach((button) => { button.disabled = disabled; });
+    $$('[data-remove-store], [data-remove-asin]').forEach((button) => { button.disabled = disabled; });
   }
 
   async function loadRuntimeStatus() {
@@ -1720,6 +2109,7 @@ import {
 
   async function resume1688AfterVerification() {
     if (supplier1688SessionPromise || hasActive1688Work()) return false;
+    const technicalPause = technical1688Pause();
     const pending = Promise.resolve().then(async () => {
       try {
         const data = await apiRequest("/api/v1/queue/resume", {
@@ -1727,13 +2117,13 @@ import {
           body: JSON.stringify({ confirmed: true }), timeout: 15000,
         });
         apply1688SessionStatus(data?.auth, data?.queue, data?.imageSearchRecovery ?? null);
-        showToast("图片验证已确认，搜图队列将按固定间隔继续。", "success", 5200);
+        showToast(technicalPause ? "已确认继续原任务，搜图队列将按固定间隔继续。" : "图片验证已确认，搜图队列将按固定间隔继续。", "success", 5200);
         if (runState.supplier1688Pipeline?.owner === 'server') return await startServerSupplierPipeline();
         schedule1688StatusPolling();
         return true;
       } catch (error) {
-        await load1688SessionStatus();
-        showToast(error.message || "图片验证尚未完成，搜图继续暂停。", "info", 6200);
+        await load1688SessionStatus().catch(() => {});
+        showToast(error.message || (technicalPause ? "搜图进程尚未恢复，原任务继续暂停，请检查本地服务。" : "图片验证尚未完成，搜图继续暂停。"), "info", 6200);
         return false;
       }
     });
@@ -1756,6 +2146,10 @@ import {
         if (!ready) {
           showToast(authStatusMessage(data?.auth), "info", 5200);
           return false;
+        }
+        if (technical1688Pause()) {
+          showToast('1688 身份有效；搜图进程中断，断点已保留，请检查服务后点击「检查后继续」。', 'info', 6200);
+          return true;
         }
         if (supplier1688RiskTask?.id) {
           if (supplier1688RiskTaskScope === "system") {
@@ -1891,8 +2285,9 @@ import {
     supplier1688RiskTask = scopedRuntime.riskBlockedTask || scopedRuntime.systemRiskBlockedTask;
     supplier1688RiskTaskScope = scopedRuntime.riskBlockedTask ? "current" : scopedRuntime.systemRiskBlockedTask ? "system" : null;
     const imageBlocked = Boolean(supplier1688RiskTask?.id) || Boolean(supplier1688Queue?.ratePolicy?.pausedReason);
+    const technicalPause = technical1688Pause();
     supplier1688LoggedIn = data.ready === true;
-    supplier1688Status = supplier1688LoggedIn ? imageBlocked ? "image_verification_required" : "ready" : data.checking === true ? "checking" : reason;
+    supplier1688Status = supplier1688LoggedIn ? imageBlocked ? technicalPause ? "search_interrupted" : "image_verification_required" : "ready" : data.checking === true ? "checking" : reason;
     supplier1688WindowOpen = data.windowOpen === true || supplier1688RuntimeQueue?.waitingLogin === true
       || ["waiting_login", "waiting_image_verification"].includes(reason);
     if (supplier1688WindowOpen) schedule1688WindowStatusPoll();
@@ -1913,11 +2308,23 @@ import {
       verified_result: "本次图片结果已确认，正在保存验证状态",
     }[data.imageSearchPhase] : null;
     const windowErrorMessage = !supplier1688WindowOpen && data.lastWindowError?.message
-      ? `上次窗口处理未完成：${data.lastWindowError.message}` : null;
+      ? ({
+          EDGE_STARTUP_TIMEOUT: "Edge 启动连接超时，本次窗口已关闭；验证未完成",
+          EDGE_WINDOW_PROOF_TIMEOUT: "Edge 窗口检查超时，本次窗口已关闭；验证未完成",
+          EDGE_WINDOW_WRONG_DESKTOP: "Edge 未在当前可操作桌面中通过检查，本次窗口已关闭；验证未完成",
+          EDGE_WINDOW_CHECK_FAILED: "Edge 窗口检查程序执行失败，本次窗口已关闭；验证未完成",
+          EDGE_WINDOW_NOT_VISIBLE: "程序未确认可操作的 Edge 窗口，本次窗口已关闭；验证未完成",
+        }[data.lastWindowError.code] || (data.lastWindowError.code === "LOGIN_ONLINE_VERIFICATION_FAILED"
+        ? `1688 在线登录校验未确认${imageBlocked ? "；图片搜索队列保持暂停" : ""}，请重新检查验证状态`
+        : `上次窗口处理未完成：${data.lastWindowError.message}`))
+      : null;
     const ratePolicy = supplier1688Queue?.ratePolicy;
     const verifiedForResume = Boolean(ratePolicy?.manualVerificationCompletedAt && ratePolicy?.pausedReason);
     render1688SessionStatusMessage(
-      imageSearchPhaseMessage || (verifiedForResume ? "图片验证已完成，等待继续搜图" : null)
+      (technicalPause ? supplier1688LoggedIn
+        ? "搜图进程中断，已保留断点；请检查服务后点击「检查后继续」"
+        : "搜图进程中断，已保留断点；请先登录专用 Edge，再检查并继续" : null)
+      || imageSearchPhaseMessage || (verifiedForResume ? "图片验证已完成，等待继续搜图" : null)
       || windowErrorMessage || recoveryMessage || (supplier1688LoggedIn && imageBlocked
         ? supplier1688RiskTaskScope === "system" ? "系统队列待图片验证" : "图片搜索待专项验证"
         : data.message || authStatusMessage(data)),
@@ -1932,7 +2339,8 @@ import {
       restartButton.disabled = Boolean(supplier1688SessionPromise);
     }
     if (resumeButton) {
-      resumeButton.hidden = !verifiedForResume;
+      resumeButton.hidden = !verifiedForResume && !technicalPause;
+      resumeButton.textContent = technicalPause ? '检查后继续' : '验证完成，继续搜图';
       resumeButton.disabled = Boolean(supplier1688SessionPromise);
     }
     setText("supplier1688RateText", ratePolicy?.minGapMs
@@ -1940,11 +2348,11 @@ import {
       : "");
     if (loginButton) {
       const unavailable = reason === "service_unavailable";
-      const imageSearchVerification = Boolean(supplier1688RiskTask?.id);
+      const imageSearchVerification = !technicalPause && Boolean(supplier1688RiskTask?.id);
       const openLabel = imageSearchVerification
         ? supplier1688RiskTaskScope === "system" ? "处理 1688 系统队列验证" : "打开 1688 图片搜索验证"
         : unavailable ? "启动并打开 1688 专用 Edge" : "打开 1688 专用 Edge";
-      loginButton.hidden = verifiedForResume || (supplier1688LoggedIn && !imageSearchVerification) || data.checking === true || supplier1688WindowOpen || reason === "identity_mismatch";
+      loginButton.hidden = (technicalPause && supplier1688LoggedIn) || verifiedForResume || (supplier1688LoggedIn && !imageSearchVerification) || data.checking === true || supplier1688WindowOpen || reason === "identity_mismatch";
       loginButton.disabled = Boolean(supplier1688SessionPromise);
       loginButton.setAttribute("aria-label", openLabel);
       loginButton.title = openLabel;
@@ -1973,7 +2381,7 @@ import {
     const queueNote = riskBlocked
       ? ` · 图片阻塞 ${riskBlocked} 项${queued ? ` · 排队 ${queued}` : ""}`
       : queued ? ` · 排队 ${queued}` : "";
-    const systemRiskNote = supplier1688RiskTaskScope === "system" && !base.includes("系统队列")
+    const systemRiskNote = !technical1688Pause() && supplier1688RiskTaskScope === "system" && !base.includes("系统队列")
       ? " · 系统队列验证 1 项"
       : "";
     statusText.textContent = `${base}${queueNote}${systemRiskNote}${pendingResumeNote}`;
@@ -2038,6 +2446,9 @@ import {
     const market = MARKET_CONFIGS[String(snapshot.runState.marketplace || "").toUpperCase()];
     if (!market?.enabled) throw new Error("保存任务的站点当前不可用。");
 
+    const restoringDifferentRun = runState.id !== snapshot.runState.id;
+    const previousCollectionJob = amazonCollectionJob?.runId === snapshot.runState.id
+      ? amazonCollectionJob : currentAmazonCollectionJob();
     activeMarket = market;
     const legacyProfitDefaults = migrateLegacyProfitDefaults(snapshot.costParams, market.code);
     taskExchangeRate = finiteOrNull(snapshot.profitModel?.exchangeRate)
@@ -2051,7 +2462,8 @@ import {
     const collection = snapshot.amazonCollection || runState.amazonCollectionJob;
     amazonCollectionRevision = snapshot.amazonCollectionRevision ?? runState.amazonCollectionRevision ?? collection?.revision ?? null;
     if (collection?.owner === "server") {
-      const { items: _items, ...job } = collection;
+      const { items: _items, ...savedJob } = collection;
+      const job = withKnownAmazonWorkerState(savedJob, previousCollectionJob);
       runState.amazonCollectionJob = job;
       if (!amazonCollectionJob || amazonCollectionJob.runId === runState.id) amazonCollectionJob = job;
     }
@@ -2060,10 +2472,16 @@ import {
     const profitFormulaRequiresMigration = snapshot.profitModel?.formulaVersion !== PROFIT_FORMULA_VERSION
       || products.some((product) => product.profitInputs?.formulaVersion !== PROFIT_FORMULA_VERSION);
     activeRunCriteria = snapshot.resultCriteria && typeof snapshot.resultCriteria === "object"
-      ? snapshot.resultCriteria
+      ? { ...snapshot.resultCriteria }
       : { ...(runState.criteria || {}) };
+    try {
+      const savedDate = window.sessionStorage?.getItem(`scout:amazon-first-available-from:${runState.id}`);
+      if (savedDate !== null && savedDate !== undefined) activeRunCriteria.amazonFirstAvailableFrom = savedDate;
+    } catch (_) { /* Browser preferences are optional; the task snapshot remains usable. */ }
+    activeRunCriteria.amazonFirstAvailableFrom = normalizeISODateOnly(activeRunCriteria.amazonFirstAvailableFrom) || "";
+    syncAmazonListingDateControl();
     storeList = snapshot.storeList && typeof snapshot.storeList === "object" ? snapshot.storeList : null;
-    selectedStoreFile = null;
+    if (restoringDifferentRun) { selectedStoreFile = null; failedImportFileDraft = null; asinImportPreview = null; asinPreviewGeneration += 1; asinPreviewPromise = null; }
     activeProductId = null;
     currentVisibleProducts = [];
     analysisRunning = false;
@@ -2083,9 +2501,14 @@ import {
     renderMarketUi();
     applyStoredCriteriaToInputs(runState.criteria, snapshot.resultsCompleteOnly === true);
     if (storeList?.audit?.marketplace === activeMarket.code) {
-      setText("uploadedFilename", storeList.fileName || "历史店铺清单");
+      if (restoringDifferentRun) {
+        setImportMode(isAsinImport() ? "asins" : "stores");
+        if (byId("asinMarketplaceSelect")) byId("asinMarketplaceSelect").value = activeMarket.code;
+      }
+      setText("uploadedFilename", storeList.fileName || (isAsinImport() ? "历史 ASIN 清单" : "历史店铺清单"));
       renderStoreAuditUi(storeList.audit);
       renderStoreManager({ collapse: true });
+      renderSelectedInputSummary();
       setImportStatus(storeList.audit?.invalid ? "warning" : "success", storeList.audit?.invalid ? "有待处理项" : "已恢复");
     } else {
       storeList = null;
@@ -2120,6 +2543,8 @@ import {
         "profit-workbook-au-2026-weight-fba-rates-v6",
         "profit-workbook-au-2026-smallest-envelope-fba-v7",
         "profit-workbook-au-weight-only-fba-v9",
+        "profit-workbook-au-ca-envelope-fba-v10",
+        "profit-workbook-au-ca-envelope-capped-fba-v11",
       ].includes(previousFormulaVersion);
       // FBA-only upgrades invalidate approval only when the automatic fee actually changes below.
       const formulaChangeAffectsProduct = !previousVersionHasOnlyFbaMigration
@@ -2405,19 +2830,54 @@ import {
     if (byId("useSellerSpriteToggle")) byId("useSellerSpriteToggle").checked = useSellerSprite;
     if (byId("monthlySalesBand")) {
       const restoredMonthlySalesBand = criteria.monthlySalesBand;
-      // 亚马逊准则 2026-10-09：月销量 50 以下档位已移除（50 以下产品不再采集）。
-      byId("monthlySalesBand").value = ["all", "50_to_100", "100_plus"].includes(restoredMonthlySalesBand)
+      // Preserve explicit sales selections; ASIN "all" includes low and unknown sales.
+      byId("monthlySalesBand").value = ["all", "50_plus", "50_to_100", "100_plus"].includes(restoredMonthlySalesBand)
         ? restoredMonthlySalesBand
         : "all";
       activeRunCriteria.monthlySalesBand = byId("monthlySalesBand").value;
       if (runState.criteria && typeof runState.criteria === "object") runState.criteria.monthlySalesBand = byId("monthlySalesBand").value;
     }
     if (byId("minReviews")) byId("minReviews").value = criteria.minReviews ?? "";
+    if (byId("maxReviews")) byId("maxReviews").value = criteria.maxReviews ?? "";
     if (byId("minRating")) byId("minRating").value = criteria.minRating ?? "";
     if (byId("completeOnlyToggle")) byId("completeOnlyToggle").checked = completeOnly;
     if (byId("resultsCompleteToggle")) byId("resultsCompleteToggle").checked = completeOnly;
     if (byId("resultMinMargin")) byId("resultMinMargin").value = "";
+    renderMonthlySalesAdmission();
     updateStartAvailability();
+  }
+
+  function syncAmazonListingDateControl() {
+    const input = byId("amazonFirstAvailableFrom");
+    if (input) {
+      input.max = todayDateOnly();
+      input.value = activeRunCriteria.amazonFirstAvailableFrom || "";
+    }
+  }
+
+  function saveAmazonListingDatePreference() {
+    if (!runState.id) return;
+    try { window.sessionStorage?.setItem(`scout:amazon-first-available-from:${runState.id}`, activeRunCriteria.amazonFirstAvailableFrom || ""); }
+    catch (_) { /* Do not block filtering if browser preference storage is unavailable. */ }
+  }
+
+  function requestedAmazonListingDateFilter() {
+    const value = byId("amazonFirstAvailableFrom")?.value || "";
+    if (value && (!normalizeISODateOnly(value) || value > todayDateOnly())) {
+      showToast("请选择不晚于今天的有效上架起始日期。", "error", 4200);
+      return null;
+    }
+    return value;
+  }
+
+  function applyAmazonListingDateFilter() {
+    const value = requestedAmazonListingDateFilter();
+    if (value === null) return false;
+    activeRunCriteria = { ...activeRunCriteria, amazonFirstAvailableFrom: value };
+    saveAmazonListingDatePreference();
+    resultPage = 1;
+    renderResults();
+    return true;
   }
 
   function captureRunSnapshot() {
@@ -2692,6 +3152,11 @@ import {
       setAmazonConnectionState("checking", "正在访问 Amazon…");
       return;
     }
+    if (isAsinImport()) {
+      const returned = Number(runState.coverage?.detailReturned || 0);
+      setAmazonConnectionState(returned ? "live" : "idle", `ASIN 直接采集 · 已取得 ${returned} 个详情`, "已导入 ASIN，直接访问商品详情页；采集进度和访问验证状态见采集监查。无需枚举店铺。");
+      return;
+    }
     const savedCheck = amazonConnectionChecks?.[activeMarket.code];
     const taskObservedAt = runState.completedAt || runState.startedAt;
     const savedCheckTime = Date.parse(savedCheck?.checkedAt || "");
@@ -2944,6 +3409,9 @@ import {
     const uploading = storeImportPending || taskReplacementPending || amazonCollectionControlPending || supplierCollectionTransition;
     if (fileInput) fileInput.disabled = uploading || exportRunning || analysisVersionPendingIds.size > 0;
     if (uploadZone) uploadZone.disabled = fileInput?.disabled ?? uploading;
+    for (const id of ["storeImportTab", "asinImportTab", "importAsinsButton", "asinTextInput", "asinMarketplaceSelect"]) {
+      if (byId(id)) byId(id).disabled = fileInput?.disabled ?? uploading;
+    }
     if (marketplaceSelect) marketplaceSelect.disabled = uploading || collectionLocked;
     if (amazonRefreshButton) {
       const hasAmazonStore = (storeList?.stores || []).some((item) => /^[A-Z0-9]{8,20}$/.test(String(item?.sellerId || "").toUpperCase()));
@@ -2983,6 +3451,18 @@ import {
           : `<i data-lucide="${sellerSpriteStatus === "error" ? "refresh-cw" : "plug"}" aria-hidden="true"></i>${sellerSpriteStatus === "error" ? "重新连接 SellerSprite" : "连接 SellerSprite"}`;
     }
     if (!button) return;
+    if (!uploading && selectedInputNeedsImport()) {
+      const canPrepare = importMode === "asins" && (hasNewAsinDraft() || (!failedImportFileDraft && asinImportPreview?.status === "ready"));
+      button.disabled = !canPrepare || asinImportPreview?.status === "loading" || exportRunning || analysisVersionPendingIds.size > 0;
+      button.innerHTML = importMode === "asins" ? `开始新 ASIN 批次${asinImportPreview?.status === "ready" && !hasNewAsinDraft() ? ` · ${importedItemCount(asinImportPreview.data)} 个` : ""}` : "请先导入店铺清单";
+      const reason = failedImportFileDraft && !hasNewAsinDraft() ? `新文件“${failedImportFileDraft.fileName}”未通过校验，请重新选择或取消新输入。旧任务不会自动续跑。`
+        : asinImportPreview?.status === "loading" ? "正在校验当前 Excel 的 ASIN 列，旧任务未变更。"
+        : canPrepare ? "仅按所选 ASIN 输入创建新批次；开始前归档旧任务，不会续跑原店铺任务。"
+        : asinImportPreview?.error || "请重新选择当前 Excel 的 ASIN 列，或粘贴 ASIN；不会继续旧任务。";
+      setText("analysisRequirementText", reason); button.title = reason;
+      renderSelectedInputSummary();
+      return;
+    }
     if (uploading || runState.archivedAt) {
       button.disabled = true;
       button.innerHTML = uploading ? "正在载入新文件…" : "已归档，请上传新文件";
@@ -2997,7 +3477,7 @@ import {
       setText("analysisRequirementText", "关闭页面后本地后台仍会继续采集。可在采集监查中查看状态、暂停或继续。采集完成后可编辑和初审。");
       return;
     }
-    const storeCount = storeList?.audit?.uniqueSellers ?? storeList?.stores?.length ?? 0;
+    const storeCount = importedItemCount();
     const resolved = countResolvedStores();
     const marketMatches = storeList?.audit?.marketplace === activeMarket.code;
     const sellerSpriteBlocked = useSellerSprite && (sellerSpriteStatus !== "live" || !sourceSupported);
@@ -3005,7 +3485,7 @@ import {
     if (!analysisRunning) {
       button.innerHTML = runState.amazonDetailPause
         ? '<i data-lucide="play" aria-hidden="true"></i>继续 Amazon 详情'
-        : `<i data-lucide="play" aria-hidden="true"></i>开始分析 ${storeCount || "--"} 个店铺`;
+        : `<i data-lucide="play" aria-hidden="true"></i>${isAsinImport() ? "开始采集" : "开始分析"} ${storeCount || "--"} 个${isAsinImport() ? "ASIN" : "店铺"}`;
     }
     let requirement = "载入店铺清单并完成数据源检测后可开始。";
     if (amazonCheckPromise) requirement = "正在检查 Amazon 店铺访问，完成后即可开始分析。";
@@ -3015,13 +3495,13 @@ import {
     else if (useSellerSprite && sellerSpriteStatus === "idle") requirement = "已选择接入 SellerSprite，请先点击连接；关闭开关可改用 Amazon 官网分析。";
     else if (useSellerSprite && sellerSpriteStatus === "checking") requirement = "正在执行你刚才发起的一次 SellerSprite 连接。";
     else if (useSellerSprite && sellerSpriteStatus === "error") requirement = "SellerSprite 连接不可用；可重新连接或关闭接入开关。";
-    else if (!storeList) requirement = "请导入有效的 XLSX 店铺清单。";
+    else if (!storeList) requirement = "请导入店铺清单，或粘贴 / 上传 ASIN 清单。";
     else if (!marketMatches) requirement = `当前店铺表不属于 ${activeMarket.nameZh}，请重新导入。`;
     else if (!storeCount) requirement = firstStoreIssueReason(storeList) || "当前任务店铺清单为空，请重新导入 XLSX。";
     else if (!resolved) requirement = "店铺清单缺少有效的 Seller ID 或预填 ASIN。";
     else if (runState.amazonDetailPause) requirement = amazonDetailPauseMessage(runState.amazonDetailPause);
-    else if (useSellerSprite) requirement = `${resolved} 个店铺可访问；本次只完成 Amazon 与 SellerSprite 商品数据，1688 需在结果页确认筛选后单独启动。`;
-    else requirement = `${resolved} 个店铺可访问；本次只从 Amazon 官网读取详情，不会自动调用 1688。`;
+    else if (useSellerSprite) requirement = `${isAsinImport() ? `${storeCount} 个 ASIN 将直接查询` : `${resolved} 个店铺可访问`}；本次只完成 Amazon 与 SellerSprite 商品数据，1688 需在结果页确认筛选后单独启动。`;
+    else requirement = `${isAsinImport() ? `${storeCount} 个 ASIN 将直接访问商品详情` : `${resolved} 个店铺可访问`}；本次只从 Amazon 官网读取详情，不会自动调用 1688。`;
     setText("analysisRequirementText", requirement);
     button.title = requirement;
     const requirementElement = byId("analysisRequirementText");
@@ -3177,6 +3657,13 @@ import {
 
   function bindSetupFilters() {
     byId("useSellerSpriteToggle")?.addEventListener("change", updateStartAvailability);
+    syncAmazonListingDateControl();
+    byId("amazonFirstAvailableFrom")?.addEventListener("change", applyAmazonListingDateFilter);
+    byId("amazonFirstAvailableFrom")?.addEventListener("focus", (event) => { event.target.max = todayDateOnly(); });
+    byId("clearAmazonListingDateButton")?.addEventListener("click", () => {
+      if (byId("amazonFirstAvailableFrom")) byId("amazonFirstAvailableFrom").value = "";
+      applyAmazonListingDateFilter();
+    });
 
     byId("applyAmazonFiltersButton")?.addEventListener("click", () => {
       if (syncAmazonResultCriteria({ persist: true })) {
@@ -3187,7 +3674,9 @@ import {
     byId("clearFiltersButton")?.addEventListener("click", () => {
       if (byId("monthlySalesBand")) byId("monthlySalesBand").value = "all";
       if (byId("minReviews")) byId("minReviews").value = "";
+      if (byId("maxReviews")) byId("maxReviews").value = "";
       if (byId("minRating")) byId("minRating").value = "";
+      if (byId("amazonFirstAvailableFrom")) byId("amazonFirstAvailableFrom").value = "";
       syncAmazonResultCriteria({ persist: true });
       showToast("Amazon 筛选已恢复默认；候选 ASIN 均保留。", "info");
     });
@@ -3195,25 +3684,33 @@ import {
     byId("startAnalysisButton")?.addEventListener("click", runAnalysis);
   }
 
+  function optionalReviewInput(id) {
+    const input = byId(id);
+    if (input?.validity?.badInput) return NaN;
+    const value = String(input?.value ?? "").trim();
+    return value === "" ? null : Number(value);
+  }
+
   function getSetupCriteria() {
     return {
       useSellerSprite: byId("useSellerSpriteToggle")?.checked === true,
       monthlySalesBand: byId("monthlySalesBand")?.value || "all",
-      minReviews: numberOrNull(byId("minReviews")?.value),
+      minReviews: optionalReviewInput("minReviews"),
+      maxReviews: optionalReviewInput("maxReviews"),
       minRating: numberOrNull(byId("minRating")?.value),
     };
   }
 
   function validateSetupCriteria(criteria) {
-    const numericValues = [criteria.minReviews, criteria.minRating].filter((value) => value !== null);
+    try { normalizeReviewRange(criteria); } catch (error) { return error.message; }
+    const numericValues = [criteria.minRating].filter((value) => value !== null && value !== undefined);
     if (numericValues.some((value) => !Number.isFinite(value) || value < 0)) {
       return "筛选条件只能填写不小于 0 的数字。";
     }
-    if (!["all", "50_to_100", "100_plus"].includes(criteria.monthlySalesBand)) return "Amazon 月销量档位无效。";
+    if (!["all", "50_plus", "50_to_100", "100_plus"].includes(criteria.monthlySalesBand)) return "Amazon 月销量档位无效。";
     if (criteria.minRating !== null && criteria.minRating > 5) {
       return "最低评价星级不能超过 5。";
     }
-    if (criteria.minReviews !== null && !Number.isInteger(criteria.minReviews)) return "评价数量需要填写整数。";
     return null;
   }
 
@@ -3224,12 +3721,16 @@ import {
       showToast(validationError, "error", 4200);
       return false;
     }
+    const amazonFirstAvailableFrom = requestedAmazonListingDateFilter();
+    if (amazonFirstAvailableFrom === null) return false;
     const filters = {
       monthlySalesBand: criteria.monthlySalesBand,
       minReviews: criteria.minReviews,
+      maxReviews: criteria.maxReviews,
       minRating: criteria.minRating,
     };
-    activeRunCriteria = { ...activeRunCriteria, ...filters };
+    activeRunCriteria = { ...activeRunCriteria, ...filters, amazonFirstAvailableFrom };
+    saveAmazonListingDatePreference();
     if (runState.id && runState.mode !== "idle") runState.criteria = { ...(runState.criteria || {}), ...filters };
     resultPage = 1;
     renderResults();
@@ -3238,7 +3739,30 @@ import {
   }
 
   async function runAnalysis() {
-    if (storeImportPending || taskReplacementPending || runState.archivedAt) return;
+    if (storeImportPending || taskReplacementPending) return;
+    // The selected mode is the user's next-start intent. Resolve it before any
+    // existing job resume branch, including paused and verification-paused jobs.
+    if (selectedInputNeedsImport()) {
+      if (failedImportFileDraft && !hasNewAsinDraft()) { showToast(`新文件“${failedImportFileDraft.fileName}”尚未导入，请重选有效文件或取消新输入；旧任务未续跑。`, "error", 6200); return; }
+      if (importMode !== "asins") { showToast("请先重新上传店铺清单，不会继续当前 ASIN 任务。", "info", 5200); return; }
+      const intendedRunId = runState.id;
+      const text = byId("asinTextInput")?.value.trim() || "";
+      const preview = text ? null : await prepareCurrentExcelAsins();
+      if (importMode !== "asins" || runState.id !== intendedRunId || text !== (byId("asinTextInput")?.value.trim() || "")) return;
+      if (!text && preview?.status !== "ready") { showToast(preview?.error || "请重新选择含 ASIN 列的 Excel。旧任务已保留。", "error", 6200); return; }
+      const nextCriteria = getSetupCriteria();
+      const nextCriteriaError = validateSetupCriteria(nextCriteria);
+      if (nextCriteriaError) { showToast(nextCriteriaError, "error", 5200); return; }
+      const targetMarket = text ? byId("asinMarketplaceSelect")?.value || activeMarket.code : preview.data.audit.marketplace;
+      if (nextCriteria.useSellerSprite && (sellerSpriteStatus !== "live" || (Array.isArray(sellerSpriteCapabilities?.supportedMarketplaces) && !sellerSpriteCapabilities.supportedMarketplaces.includes(targetMarket)))) {
+        showToast("所选站点的 SellerSprite 尚不可用；请先连接或关闭接入开关。旧任务已保留。", "error", 6200); return;
+      }
+      const imported = await importTaskSource({ mode: "asins", text,
+        marketplace: text ? byId("asinMarketplaceSelect")?.value || activeMarket.code : preview.data.audit.marketplace,
+        preparedData: text ? null : preview.data, preparedFileName: preview?.fileName });
+      if (!imported) return;
+    }
+    if (runState.archivedAt) return;
     if (!amazonCollectionStatusKnown) {
       try { await loadAmazonCollectionStatus(); }
       catch { showToast("暂未确认后台任务状态，请稍后重试。已有采集任务会继续运行。", "info", 5000); return; }
@@ -3284,7 +3808,7 @@ import {
       return;
     }
     if (!storeList?.stores?.length) {
-      showProgressError("没有可分析的店铺", "请先导入有效的 XLSX 店铺清单。", { action: null, showDemo: true });
+      showProgressError("没有可分析的清单", "请先导入有效的店铺或 ASIN 清单。", { action: null, showDemo: true });
       return;
     }
     if (storeList.audit?.marketplace !== activeMarket.code) {
@@ -3317,16 +3841,15 @@ import {
     const { signal } = controller;
 
     try {
-      setStage(0, "店铺清单已校验，正在准备店铺访问会话", 12);
+      setStage(0, isAsinImport() ? "ASIN 清单已校验，正在准备商品详情采集" : "店铺清单已校验，正在准备店铺访问会话", 12);
       await delay(180);
       assertCurrentTaskRequest(controller);
-      setStage(1, criteria.useSellerSprite
-        ? "正在处理店铺批次 · Amazon 访问与 SellerSprite 商品分析"
-        : "正在处理店铺批次 · Amazon 官网商品分析", 20);
+      setStage(1, `${isAsinImport() ? "正在处理 ASIN 批次" : "正在处理店铺批次"} · ${criteria.useSellerSprite ? "Amazon 访问与 SellerSprite 商品分析" : "Amazon 官网商品分析"}`, 20);
       await delay(180);
       assertCurrentTaskRequest(controller);
 
       const resolvedStores = storeList.stores.filter(isStoreActionable);
+      runState.inputMode = isAsinImport() ? "asins" : "stores";
       runState.coverage.queryable = resolvedStores.length;
       runState.coverage.unresolved = storeList.stores.length - resolvedStores.length;
       renderRunCoverage();
@@ -3498,7 +4021,8 @@ import {
     amazonCollectionRevision = null;
     activeProductId = null;
     renderResults();
-    activeRunCriteria = criteria;
+    activeRunCriteria = { ...criteria };
+    syncAmazonListingDateControl();
     runState = {
       id: resumeRunId || (typeof window.crypto?.randomUUID === "function" ? window.crypto.randomUUID() : `run-${Date.now()}`),
       mode,
@@ -3926,10 +4450,12 @@ import {
             phase: "discover",
             marketplace: runState.marketplace,
             stores: chunk,
+            inputMode: isAsinImport() ? "asins" : "stores",
             useSellerSprite: false,
             filters: {
               monthlySalesBand: criteria.monthlySalesBand,
               minReviews: criteria.minReviews,
+              maxReviews: criteria.maxReviews,
               minRating: criteria.minRating,
             },
           }),
@@ -4044,11 +4570,13 @@ import {
               phase: "analyze",
               marketplace: runState.marketplace,
               stores: chunk,
+              inputMode: isAsinImport() ? "asins" : "stores",
               useSellerSprite: allowSellerSprite === true,
               detailAsins: pendingDetailAsins || undefined,
               filters: {
                 monthlySalesBand: criteria.monthlySalesBand,
                 minReviews: criteria.minReviews,
+                maxReviews: criteria.maxReviews,
                 minRating: criteria.minRating,
               },
             }),
@@ -4199,7 +4727,7 @@ import {
       detailReturned: products.filter((product) => product.detailStatus === "success").length,
       detailFailed: products.filter((product) => product.detailStatus !== "success").length,
       wideCandidates: products.length,
-      selectedCandidates: products.filter((product) => product.filterMatch !== false).length,
+      selectedCandidates: products.filter((product) => matchesProductCriteria(product, activeRunCriteria)).length,
       rateLimitWaits: 0,
     };
     await persistCurrentRunRequired(signal);
@@ -4219,6 +4747,24 @@ import {
     }
   }
 
+  function manualAmazonListingDateSnapshot(...candidates) {
+    const source = candidates.find(product => product?.manualAmazonFields?.amazonFirstAvailableDate === true
+      || product?.fieldSources?.amazonFirstAvailableDate === "manual");
+    if (!source) return null;
+    return {
+      amazonFirstAvailableDate: source.amazonFirstAvailableDate,
+      amazonFirstAvailableDateStatus: source.amazonFirstAvailableDateStatus,
+      amazonFirstAvailableDateEvidence: source.amazonFirstAvailableDateEvidence == null ? source.amazonFirstAvailableDateEvidence : structuredClone(source.amazonFirstAvailableDateEvidence),
+    };
+  }
+
+  function applyManualAmazonListingDate(product, manualDate) {
+    if (!manualDate) return;
+    Object.assign(product, manualDate);
+    product.manualAmazonFields = { ...(product.manualAmazonFields || {}), amazonFirstAvailableDate: true };
+    product.fieldSources = { ...(product.fieldSources || {}), amazonFirstAvailableDate: "manual" };
+  }
+
   function mergeAnalyzedCandidateProducts(items) {
     const byId = new Map(products.map((product) => [product.id, product]));
     (items || []).map(mapCandidateProduct).forEach((incoming) => {
@@ -4234,24 +4780,31 @@ import {
         finiteOrNull(existing.salePrice), finiteOrNull(existing.purchaseCost), finiteOrNull(getFulfillmentFee(existing)),
         finiteOrNull(existing.billingWeight), finiteOrNull(existing.targetCostCny), finiteOrNull(existing.margin),
       ];
+      const manualListingDate = manualAmazonListingDateSnapshot(incoming, existing);
       const preserveManualFulfillment = existing.fulfillmentModeSource === "manual"
         || existing.manualFbaFee === true
         || existing.manualFbmFee === true;
       const preserveManualCurrentPrice = hasManualAmazonPrice(existing);
       const preserveManualMonthlySales = existing.manualAmazonFields?.sales30 === true
         || existing.fieldSources?.sales30 === "manual";
-      const refreshExisting = existing.detailStatus !== "success" && incoming.detailStatus === "success";
-      const refreshFromSuccess = incoming.detailStatus === "success";
+      const refreshFromSuccess = incoming.detailStatus === "success" && !hasFailedAmazonDetailAttempt(incoming);
+      if (Number.isFinite(existing.currentPrice) && !existing.priceVerifiedAt) existing.priceVerifiedAt = existing.collectedAt || null;
+      const refreshExisting = existing.detailStatus !== "success" && refreshFromSuccess;
       const supplierWasMissingInputs = existing.supplierSearchStatus === "missing_inputs"
         && existing.supplierSearchErrorCode === "MISSING_INPUTS";
       const refreshFields = [
         "parentAsin", "parentResolved",
         "name", "englishName", "translatedTitleZh", "price30", "sales30", "sales30Evidence", "amazonSales30Evidence", "rating", "reviews", "imageUrl",
-        "productWeight", "fbaWeight", "productWeightEvidence", "packageWeightEvidence", "collectionQuality", "productDimensions", "fbaDimensions", "parameterSource", "fulfillment",
+        "productWeight", "fbaWeight", "productWeightEvidence", "packageWeightEvidence", "productInformation", "collectionQuality", "productDimensions", "fbaDimensions", "parameterSource", "fulfillment",
         "collectedAt", "dataSource", "filterMatch", "filterExclusionReasons",
+        "amazonFirstAvailableDate", "amazonFirstAvailableDateEvidence", "amazonFirstAvailableDateStatus",
       ];
       refreshFields.forEach((field) => {
         if (preserveManualMonthlySales && ["sales30", "sales30Evidence", "amazonSales30Evidence"].includes(field)) return;
+        if (refreshFromSuccess && ["productInformation", "collectionQuality", "amazonFirstAvailableDate", "amazonFirstAvailableDateEvidence", "amazonFirstAvailableDateStatus"].includes(field)) {
+          existing[field] = incoming[field];
+          return;
+        }
         const missing = existing[field] === null || existing[field] === undefined || existing[field] === "";
         const incomingAvailable = incoming[field] !== null && incoming[field] !== undefined && incoming[field] !== "";
         if ((refreshFromSuccess && incomingAvailable) || missing) existing[field] = incoming[field];
@@ -4266,6 +4819,7 @@ import {
         : { ...(incoming.fieldSources || {}), ...(existing.fieldSources || {}) };
       if (preserveManualCurrentPrice) existing.fieldSources.currentPrice = "manual";
       if (preserveManualMonthlySales) existing.fieldSources.sales30 = "manual";
+      applyManualAmazonListingDate(existing, manualListingDate);
       mergeAmazonPriceState(existing, incoming, { analysisSourceMode: runState.analysisSourceMode });
       existing.sourceAsins = [...new Set([...(existing.sourceAsins || []), ...(incoming.sourceAsins || [])])];
       existing.sourceStores = mergeSourceStores(existing.sourceStores, incoming.sourceStores);
@@ -4305,29 +4859,40 @@ import {
   }
 
   function mergeCandidateRecords(left, right) {
+    const manualListingDate = manualAmazonListingDateSnapshot(right, left);
     const fields = [
       "title", "translatedTitle", "sellerId", "sellerName", "averagePrice30", "currentPrice", "sales30", "sales60",
       "salesAmount30", "sales30UpdatedAt", "sales30Evidence", "amazonSales30Evidence", "parentSales30", "parentSalesAmount30", "fbaFee", "fbaFeeSource", "primePrice", "deliveryPrice",
       "firstFbaAt", "listingAvailableAt", "rating", "reviewCount", "hasAPlus", "productWeightKg", "fbaPackageWeightKg",
-      "productDimensionsCm", "fbaPackageDimensionsCm", "productWeightEvidence", "packageWeightEvidence", "collectionQuality", "fulfillment", "imageUrl",
+      "productDimensionsCm", "fbaPackageDimensionsCm", "productWeightEvidence", "packageWeightEvidence", "productInformation", "collectionQuality", "fulfillment", "imageUrl",
       "sourceMarketplace", "providerMarketplace", "providerMode", "detailParserVersion",
+      "amazonFirstAvailableDate", "amazonFirstAvailableDateEvidence", "amazonFirstAvailableDateStatus",
     ];
     const score = (item) => fields.filter((field) => item[field] !== null && item[field] !== undefined && item[field] !== "").length;
     const primary = score(right) > score(left) ? right : left;
     const secondary = primary === left ? right : left;
     const merged = { ...primary };
     fields.forEach((field) => {
+      if (right.detailStatus === "success" && !hasFailedAmazonDetailAttempt(right)
+        && ["productInformation", "collectionQuality", "amazonFirstAvailableDate", "amazonFirstAvailableDateEvidence", "amazonFirstAvailableDateStatus"].includes(field)) {
+        merged[field] = right[field] ?? null;
+        return;
+      }
       const rightAvailable = right[field] !== null && right[field] !== undefined && right[field] !== "";
       if (rightAvailable) merged[field] = right[field];
       else if (merged[field] === null || merged[field] === undefined || merged[field] === "") merged[field] = secondary[field];
     });
     merged.fieldSources = { ...(left.fieldSources || {}), ...(right.fieldSources || {}) };
     if (hasManualAmazonPrice(left)) merged.fieldSources.currentPrice = "manual";
+    applyManualAmazonListingDate(merged, manualListingDate);
     if (Object.prototype.hasOwnProperty.call(right, "detailStatus")) {
       // Keep successful detail/price provenance together across partial batches.
-      for (const field of ["detailStatus", "detailErrorCode", "detailError", "detailRetryable", "detailParserVersion", "currentPrice", "priceEvidence", "currentPriceStatus", "priceRevalidation"]) {
+      for (const field of ["detailStatus", "detailErrorCode", "detailError", "detailRetryable", "detailParserVersion", "currentPrice", "priceEvidence", "currentPriceStatus", "priceRevalidation", "collectionLastAttempt", "lastCollectionError"]) {
         merged[field] = left[field];
       }
+      merged.priceVerifiedAt = left.priceVerifiedAt || left.collectedAt || null;
+      merged.lastKnownAmazonPrice = left.lastKnownAmazonPrice;
+      merged.priceRefresh = left.priceRefresh;
       mergeAmazonDetailAudit(merged, right);
       mergeAmazonPriceState(merged, right, { analysisSourceMode: runState.analysisSourceMode });
     }
@@ -4369,6 +4934,7 @@ import {
     const providerMode = String(item.providerMode || runState.providerMode || "").toLowerCase() || null;
     const analysisSourceMode = item.analysisSourceMode || runState.analysisSourceMode || (providerMarketplace ? "amazon_sellsprite" : "amazon_only");
     const sourceContext = { marketplace, sourceMarketplace, providerMarketplace, providerMode, analysisSourceMode };
+    const manualWeight = usesItemWeightOnly(item) ? resolveManualWeightOverride(item) : null;
     return {
       id: `${marketplace}:${sourceAsin || `${sellerId || "seller"}-${index}`}`,
       marketplace,
@@ -4394,6 +4960,10 @@ import {
       currentPrice: candidateCurrentPrice(item),
       priceEvidence: item.priceEvidence ?? null,
       pageContextEvidence: item.pageContextEvidence || null,
+      priceReadAttempt: item.priceReadAttempt || null,
+      priceVerifiedAt: item.priceVerifiedAt || (Number.isFinite(item.currentPrice) ? item.collectedAt : null),
+      priceRefresh: item.priceRefresh || null,
+      lastKnownAmazonPrice: item.lastKnownAmazonPrice || null,
       currentPriceStatus: item.currentPriceStatus || (item.detailStatus === "success"
         ? candidateCurrentPrice(item) === null ? "unavailable" : "verified" : null),
       sales30: finiteOrNull(item.sales30 ?? item.units30 ?? item.amzUnit),
@@ -4416,12 +4986,16 @@ import {
       primePrice: finiteOrNull(item.primePrice),
       deliveryPrice: finiteOrNull(item.deliveryPrice),
       fbmFee: null,
-      billingWeight: finiteOrNull(item.fbaPackageWeightKg ?? item.packageWeightKg ?? item.productWeightKg ?? item.weightKg),
-      productWeight: finiteOrNull(item.productWeightKg ?? item.weightKg),
+      billingWeight: usesItemWeightOnly(item) ? automaticProfitWeightKg(item) : finiteOrNull(item.fbaPackageWeightKg ?? item.packageWeightKg ?? item.productWeightKg ?? item.weightKg),
+      productWeight: usesItemWeightOnly(item) ? automaticProductWeightKg(item) : finiteOrNull(item.productWeightKg ?? item.weightKg),
       fbaWeight: finiteOrNull(item.fbaPackageWeightKg ?? item.packageWeightKg),
       productWeightEvidence: item.productWeightEvidence ? structuredClone(item.productWeightEvidence) : null,
       packageWeightEvidence: item.packageWeightEvidence ? structuredClone(item.packageWeightEvidence) : null,
       collectionQuality: item.collectionQuality ? structuredClone(item.collectionQuality) : null,
+      productInformation: item.productInformation ? structuredClone(item.productInformation) : null,
+      weightSelection: item.weightSelection ? structuredClone(item.weightSelection) : null,
+      collectionLastAttempt: item.collectionLastAttempt ? structuredClone(item.collectionLastAttempt) : null,
+      lastCollectionError: item.lastCollectionError ? structuredClone(item.lastCollectionError) : null,
       productDimensions: formatDimensions(item.productDimensionsCm ?? item.dimensionsCm),
       fbaDimensions: formatDimensions(item.fbaPackageDimensionsCm ?? item.packageDimensionsCm),
       parameterSource: item.fbaPackageDimensionsCm || item.packageDimensionsCm
@@ -4429,9 +5003,13 @@ import {
         : item.productDimensionsCm || item.dimensionsCm ? "商品参数回退" : "参数缺失",
       firstFba: item.firstFbaAt || item.firstFba || null,
       listingAvailableAt: item.listingAvailableAt || null,
+      amazonFirstAvailableDate: normalizeISODateOnly(item.amazonFirstAvailableDate),
+      amazonFirstAvailableDateEvidence: item.amazonFirstAvailableDateEvidence ? structuredClone(item.amazonFirstAvailableDateEvidence) : null,
+      amazonFirstAvailableDateStatus: item.amazonFirstAvailableDateStatus || "unresolved",
       salesTrendStatus: item.salesTrendStatus || null,
       salesTrendMonths: Array.isArray(item.salesTrendMonths) ? item.salesTrendMonths : [],
       fieldSources: item.fieldSources && typeof item.fieldSources === "object" ? item.fieldSources : {},
+      manualAmazonFields: item.manualAmazonFields && typeof item.manualAmazonFields === "object" ? { ...item.manualAmazonFields } : {},
       detailStatus: String(item.detailStatus || item.providerStatus || (item.providerError ? "failed" : "success")),
       detailErrorCode: String(item.detailErrorCode || item.providerError?.code || item.error?.code || "").trim() || null,
       detailError: String(item.detailError || item.providerError?.message || item.error?.message || "").trim() || null,
@@ -4468,6 +5046,7 @@ import {
       manualFbaFee: false,
       manualFbmFee: false,
       manualPurchaseCost: false,
+      ...(manualWeight ? { billingWeight: manualWeight.weightKg, manualBillingWeight: true, weightSource: manualWeight.source } : {}),
       rematchCount: 0,
       supplierSource: null,
       targetCostCny: null,
@@ -4493,6 +5072,11 @@ import {
       product.billingWeight = manualWeight.weightKg;
       product.weightSource = manualWeight.source;
       product.manualProfitInputs = true;
+      return;
+    }
+    if (usesItemWeightOnly(product)) {
+      product.billingWeight = automaticProfitWeightKg(product);
+      product.weightSource = profitWeightSourceLabel(product);
       return;
     }
     const hasValidProductWeight = Number.isFinite(product.productWeight) && product.productWeight > 0;
@@ -4545,17 +5129,12 @@ import {
     if (!Number.isFinite(product.rating)) missing.push("竞品评价星级");
     if (!Number.isFinite(product.reviews)) missing.push("竞品评价数量");
     if (!product.imageUrl) missing.push("商品主图");
-    const hasCollectedWeight = Number.isFinite(product.fbaWeight) || Number.isFinite(product.productWeight);
-    const hasValidWeight = (Number.isFinite(product.fbaWeight) && product.fbaWeight > 0) || (Number.isFinite(product.productWeight) && product.productWeight > 0);
-    if (!hasCollectedWeight) missing.push("重量");
-    else if (!hasValidWeight) missing.push("重量（值无效）");
+    if (!hasAnyProductShippingSpecification(product)) missing.push("商品重量、包裹重量及尺寸均缺失");
     if (!amazonOnly) {
       if (!Number.isFinite(product.sales30)) missing.push("竞品 30 天销量");
       if (!Number.isFinite(product.sales60)) missing.push("竞品 60 天销量");
       if (typeof product.hasAPlus !== "boolean") missing.push("竞品 A+ 状态");
-      if (!product.listingAvailableAt) missing.push("竞品上架时间");
       if (!product.firstFba) missing.push("首次 FBA 有货时间");
-      if (!parseDimensionsCm(product.fbaDimensions) && !parseDimensionsCm(product.productDimensions)) missing.push("长宽高");
       if (!normalizeFulfillmentMode(product.fulfillmentMode || product.fulfillment)) missing.push("履约方式");
     }
     return missing;
@@ -4570,7 +5149,8 @@ import {
     if (!Number.isFinite(getFulfillmentFee(product)) || getFulfillmentFee(product) < 0) {
       missing.push(fulfillmentFeeMissingLabel(product.fulfillmentMode));
     }
-    if (!Number.isFinite(profitInputs.actualWeightKg) || profitInputs.actualWeightKg <= 0) missing.push("计费重量");
+    if ((!Number.isFinite(profitInputs.actualWeightKg) || profitInputs.actualWeightKg <= 0)
+      && !(String(product.marketplace || activeMarket.code).toUpperCase() === "CA" && canadaDimensionalWeightKg(resolveProductDimensionsCm(product)) !== null)) missing.push("计费重量");
     if (!Number.isFinite(profitInputs.airFreightRateCnyPerKg) || profitInputs.airFreightRateCnyPerKg < 0) missing.push("空运单价");
     product.amazonMissing = [...new Set(amazonMissing)];
     product.missing = [...new Set(missing)];
@@ -4617,11 +5197,17 @@ import {
   }
 
   function amazonPriceStatusLabel(product) {
+    if (product?.priceRefresh?.status === "pending") {
+      const verifiedAt = product.priceVerifiedAt;
+      const time = verifiedAt && Number.isFinite(Date.parse(verifiedAt))
+        ? new Date(verifiedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "";
+      return product.priceRefresh.retained
+        ? `上次核验报价 · 本次待复核${time ? `（北京时间 ${time}）` : ""}`
+        : "本次未能读取报价，待复核";
+    }
     if (product?.currentPriceStatus === "unavailable") {
       const reason = product.collectionQuality?.fields?.price?.reason || product.pageContextEvidence?.priceUnavailableReason;
-      // 加购提示/配送地区未确认均为采集会话问题，看门狗会自动重访补价，
-      // 不再展示误导性说明；补价完成后此处自然显示真实售价。
-      if (reason === "price_requires_cart" || reason === "delivery_region_unconfirmed") return "";
+      if (reason === "price_requires_cart" || reason === "delivery_region_unconfirmed") return "本次未能读取报价，待复核";
       if (reason === "unavailable") return "本次页面显示缺货，无有效售价";
       if (reason === "page_not_provided") return "页面无精选报价（需查看全部购买选项），无公开售价";
       return "本次页面未识别到售价";
@@ -4631,6 +5217,152 @@ import {
       refresh_failed: "核价暂未成功",
       manual: "人工确认售价",
     }[product?.currentPriceStatus] || "";
+  }
+
+  function amazonCollectionFailure(product) {
+    const attempt = product?.collectionLastAttempt;
+    const retained = product?.lastCollectionError;
+    const failed = ["failed", "error", "cancelled"].includes(String(product?.detailStatus || "").toLowerCase())
+      || attempt?.status === "failed" || Boolean(retained);
+    if (!failed) return null;
+    const code = String(retained?.code || (attempt?.status === "failed" && attempt.code) || product.detailErrorCode || "").toUpperCase();
+    const message = String(retained?.message || (attempt?.status === "failed" && attempt.message) || product.detailError || "").trim();
+    const labels = {
+      AMAZON_PRODUCT_ASIN_MISMATCH: Number(product.detailParserVersion) < 11
+        ? "旧版 ASIN 校验未通过，待按新规则重新采集" : "上次采集记录的页面 ASIN 与输入不一致",
+      AMAZON_ACCESS_CHALLENGE: message === "Amazon browser page requires access verification."
+        ? "采集浏览器加载等待超时（旧版归类为访问验证），请人工核对" : "Amazon 要求验证码或访问验证，需人工处理",
+      AMAZON_HTTP_429: "Amazon 限制访问频率",
+      AMAZON_HTTP_404: "商品页面不存在或已移除",
+      AMAZON_PRODUCT_INVALID: "页面未返回可用商品详情",
+      AMAZON_DETAIL_NOT_RETURNED: "本次访问未返回该商品的详情",
+      AMAZON_LOGIN_REQUIRED: "Amazon 登录已失效，需人工处理",
+      AMAZON_AUTH_REQUIRED: "Amazon 登录已失效，需人工处理",
+    };
+    const reason = labels[code] || (/TIMEOUT|TIMED_OUT/.test(code) ? "页面访问超时，未完成读取"
+      : /CONNECTION|ECONN|NETWORK|REQUEST_FAILED|NAVIGATION_FAILED/.test(code) ? "网络或页面连接中断"
+        : /HTTP_5\d\d/.test(code) ? "Amazon 服务暂时未能响应"
+          : message || "采集失败，未记录具体原因");
+    return { code, message, reason, requiresAction: /CHALLENGE|CAPTCHA|LOGIN|AUTH_REQUIRED/.test(code) };
+  }
+
+  function hasUnavailableAmazonSpecifications(product) {
+    const info = product?.productInformation;
+    const inspection = info?.inspection;
+    const specifications = inspection?.specifications;
+    return info?.status === "incomplete" && (info.reason || inspection?.reason) === "inspection_timeout"
+      && specifications?.pending === true && specifications.disabled === true && specifications.visible === false;
+  }
+
+  function amazonInformationIssue(product, field = "weight") {
+    const info = product?.productInformation;
+    if (!info) return "尚未完成商品信息区检查";
+    if (info.inspection?.errorCode || info.inspection?.errorMessage) {
+      const code = String(info.inspection.errorCode || "").toUpperCase();
+      const message = String(info.inspection.errorMessage || "").trim();
+      return /TIMEOUT|TIMED_OUT/.test(code) ? "浏览器检查超时，尚未完整读取商品信息"
+        : /CONNECTION|ECONN|NETWORK|REQUEST_FAILED|NAVIGATION_FAILED|CLOSED|CONNECT_FAILED/.test(code) ? "浏览器连接或页面导航失败，商品信息检查未完成"
+          : message ? `浏览器检查失败：${message}` : "浏览器检查失败，商品信息尚未完整读取";
+    }
+    if (hasUnavailableAmazonSpecifications(product)) {
+      return field === "weight" ? "完整规格入口当前不可用，Item Weight 待核验" : "完整规格入口当前不可用，上架日期待核验";
+    }
+    const reason = info.reason || info.inspection?.reason;
+    if (Number(product.detailParserVersion) < 11) {
+      if (reason === "asin_mismatch") return "旧版 ASIN 校验未通过，待按新规则重新采集";
+      if (field === "weight" && ["conflicting_values", "weight_value_conflict"].includes(reason)) {
+        return "旧版重量核验未完成，待按 Item Weight 重新采集";
+      }
+    }
+    return {
+      conflicting_values: field === "weight" ? "重量值冲突，尚未确认有效重量" : "商品信息值冲突，尚未完成核验",
+      weight_value_conflict: "重量值冲突，尚未确认有效重量",
+      inspection_timeout: "商品信息区检查超时，尚未完整读取",
+      asin_mismatch: "商品信息区 ASIN 不一致",
+      no_information_root: "未找到商品信息区",
+      no_information_rows: "商品信息区尚未加载出内容",
+      unparsed_weight: "发现重量字段，但数值或单位未通过核验",
+    }[reason] || (info.status !== "complete" ? "商品信息区尚未完整读取" : "重量数值或来源尚未通过核验");
+  }
+
+  function amazonFieldIssue(product, field) {
+    if (field === "price" && product?.priceRefresh?.status === "pending") {
+      const code = product.priceRefresh.browser?.code;
+      return amazonPriceStatusLabel(product) + (code
+        ? /TIMEOUT|TIMED_OUT/.test(code) ? "；浏览器核价超时" : `；浏览器核价未完成（${code}）` : "");
+    }
+    const quality = product?.collectionQuality?.fields?.[field];
+    if (quality?.status === "verified") return null;
+    const reason = quality?.reason;
+    if (field === "weight") {
+      if (isAmazonWeightUnavailable(product)) return "已完整检查，页面未提供重量";
+      if (/product_information_|page_not_provided/.test(reason || "") || !quality) return amazonInformationIssue(product);
+    }
+    const labels = {
+      page_not_provided: "本次页面未提供", not_collected: "尚未读取",
+      price_requires_cart: "当前页面未展示可核验报价", delivery_region_unconfirmed: "当前配送会话未展示可核验报价",
+      unavailable: "页面显示缺货，无有效售价", request_failed: "本次页面访问失败",
+      price_revalidation_pending: "售价需要重新核验", obsolete_price_parser: "旧版价格记录需要重新核验",
+      price_evidence_missing: "缺少售价来源证据", price_evidence_incomplete: "售价来源证据不完整",
+      price_not_positive: "售价数值无效", price_status_conflict: "售价数值与页面状态冲突",
+      price_asin_mismatch: "售价来源 ASIN 不一致", price_currency_mismatch: "售价币种与站点不一致",
+      price_evidence_value_mismatch: "售价与来源证据不一致", untrusted_price_source: "售价来源未通过核验",
+      weight_source_missing: "缺少重量来源证据", weight_not_positive: "重量数值无效",
+      manual_value_not_collected: "人工填写值，尚未由 Amazon 页面核验",
+      invalid_title: "页面标题无效", invalid_image_url: "商品图片地址无效",
+    };
+    if (labels[reason]) return labels[reason];
+    if (quality?.status === "unavailable") return "本次页面未提供";
+    if (quality?.status === "invalid") return `返回值未通过核验${reason ? `（${reason}）` : ""}`;
+    return quality ? `尚未完成字段核验${reason ? `（${reason}）` : ""}` : null;
+  }
+
+  function amazonProductCollectionNote(product) {
+    if (product?.analysisSourceMode !== "amazon_only") return null;
+    const failure = amazonCollectionFailure(product);
+    const issues = failure ? [failure.reason] : [["price", "售价"], ["weight", "重量"], ["title", "标题"], ["image", "主图"]]
+      .filter(([field]) => product.collectionQuality?.fields?.[field] && product.collectionQuality.fields[field].status !== "verified")
+      .map(([field, label]) => `${label}：${amazonFieldIssue(product, field)}`);
+    if (!failure && !issues.length && product.amazonFirstAvailableDateStatus === "unresolved"
+      && (product.productInformation?.status === "incomplete" || product.collectionRecovery?.status && product.collectionRecovery.status !== "resolved")) {
+      issues.push(`上架日期：${amazonInformationIssue(product, "date")}`);
+    }
+    if (!issues.length) return null;
+    const job = currentAmazonCollectionJob();
+    const asin = String(product.sourceAsin || product.asin || "").toUpperCase();
+    const task = job?.tasks?.[asin];
+    const recovery = product.collectionRecovery;
+    const attempts = Math.max(0, Number(recovery?.attempts) || 0);
+    const maxAttempts = Math.max(0, Number(recovery?.maxAttempts) || 0);
+    const exhausted = recovery?.status === "exhausted";
+    const pending = ["scheduled", "waiting"].includes(recovery?.status) || task?.status === "pending";
+    let followup = "";
+    if (failure?.requiresAction || job?.status === "needs_attention") followup = "等待人工处理，已停止自动请求";
+    else if (job?.causeCode === "SUPPLIER_MATCHING") followup = "1688 匹配占用中，补查暂存";
+    else if (job?.status === "paused" || job?.causeCode === "USER_PAUSED") followup = "已暂停，保留当前结果";
+    else if (exhausted) followup = `自动补查已达上限${attempts ? `（已补查 ${attempts}${maxAttempts ? ` / ${maxAttempts}` : ""} 次）` : ""}`;
+    else if (pending && job?.enabled !== false && (recovery?.status === "waiting" || ["queued", "running", "cooldown"].includes(job?.status))) {
+      const next = recovery?.nextRetryAt || task?.nextRetryAt;
+      followup = next && Number.isFinite(Date.parse(next))
+        ? `待自动补查 · ${new Date(next).toLocaleString("zh-CN", { hour12: false })}`
+        : recovery?.status === "waiting" ? "等待下次巡检安排补查" : attempts || task?.attempts ? "已排队重新查找" : "已排队采集";
+      if (attempts && maxAttempts) followup += `（补查 ${attempts} / ${maxAttempts}）`;
+    } else if (recovery?.status === "blocked") followup = "已停止自动补查，需处理原因后再查";
+    else if (job?.status === "completed" || ["failed", "partial"].includes(task?.status)) followup = "本轮已结束";
+    const prefix = failure ? "Amazon 采集失败" : "Amazon 字段核验";
+    const detail = [issues.join("；"), followup].filter(Boolean).join("；");
+    return { text: `${prefix}：${detail}`, code: failure?.code || product.productInformation?.inspection?.errorCode || "",
+      rawMessage: failure?.message || product.productInformation?.inspection?.errorMessage || "",
+      tone: failure || exhausted ? "error" : "warning" };
+  }
+
+  function amazonProductCollectionNoteHtml(product) {
+    const note = amazonProductCollectionNote(product);
+    if (!note) return "";
+    const evidence = [note.code, note.rawMessage].filter(Boolean).join(" · ");
+    const action = note.code === "AMAZON_ACCESS_CHALLENGE" && currentAmazonCollectionJob()?.causeCode === "AMAZON_ACCESS_CHALLENGE"
+      ? '<button type="button" class="secondary-button" data-amazon-access>人工处理访问问题</button>' : "";
+    return `<div class="amazon-collection-note is-${note.tone}" role="note"${evidence ? ` title="${escapeHtml(evidence)}"` : ""}>${escapeHtml(note.text)}${note.code ? `<span class="amazon-collection-code">${escapeHtml(note.code)}</span>` : ""}${action}</div>`;
   }
 
   function calculateOurSalePrice(product) {
@@ -4819,12 +5551,12 @@ import {
             const staleRunId = amazonCollectionJob?.runId;
             if (error?.code !== 'COLLECTION_BUSY' || !staleRunId || staleRunId === requestedRunId) throw error;
             try {
-              await apiRequest('/api/amazon/collection/control', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ runId: staleRunId, action: 'pause' }), timeout: 60000,
-              });
+              await requestTaskControl('amazon', { runId: staleRunId, action: 'pause' }, { timeout: 60000, before: amazonCollectionJob });
               pausedStaleTask = true;
-            } catch { /* The start retry below surfaces any real failure. */ }
+            } catch (error) {
+              if (error.code === 'CONTROL_OUTCOME_UNKNOWN') throw error;
+              // The start retry below surfaces a definite business rejection.
+            }
             await delay(1500);
             await loadAmazonCollectionStatus().catch(() => {});
             if (runState.id !== requestedRunId) return false;
@@ -4837,22 +5569,19 @@ import {
           showToast('已清空之前的后台采集任务（断点已保留），当前任务已设为新的后台任务。', 'info', 5200);
         }
       }
-      const job = await apiRequest('/api/amazon/collection/control', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId: requestedRunId, action: 'pause_for_supplier' }), timeout: 30000,
-      });
+      const job = await requestTaskControl('amazon', { runId: requestedRunId, action: 'pause_for_supplier' });
       if (runState.id !== requestedRunId) return false;
       applyAmazonCollectionJob(job);
-      await refreshAmazonCollectionSnapshot();
+      if (!await refreshAfterTaskControl('采集让出')) return false;
       const saved = currentAmazonCollectionJob();
-      if (runState.id !== requestedRunId || job.workerActive === true
+      if (runState.id !== requestedRunId || job.workerActive !== false
         || !['paused', 'completed', 'needs_attention'].includes(saved?.status)
         || Number(amazonCollectionRevision) !== Number(job.revision)) {
         throw createRunError('COLLECTION_NOT_SETTLED', '后台采集尚未稳定暂停，请稍后重试匹配。');
       }
       return true;
     } catch (error) {
-      showToast(`尚未开始图片匹配：${error.message}`, 'error', 6000);
+      showToast(error.code === 'CONTROL_OUTCOME_UNKNOWN' ? error.message : `尚未开始图片匹配：${error.message}`, error.code === 'CONTROL_OUTCOME_UNKNOWN' ? 'info' : 'error', 6500);
       return false;
     } finally {
       amazonCollectionControlPending = false;
@@ -4872,13 +5601,10 @@ import {
       await amazonCollectionSnapshotPromise;
       await persistenceSaveQueue;
       if (runState.id !== requestedRunId) return;
-      const job = await apiRequest('/api/amazon/collection/control', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ runId: requestedRunId, action: 'resume_after_supplier' }), timeout: 30000,
-      });
+      const job = await requestTaskControl('amazon', { runId: requestedRunId, action: 'resume_after_supplier' });
       if (runState.id === requestedRunId) applyAmazonCollectionJob(job);
     } catch (error) {
-      showToast(`供应商匹配进度已保留，Amazon 将在临时暂停到期后继续：${error.message}`, 'info', 6000);
+      showToast(error.code === 'CONTROL_OUTCOME_UNKNOWN' ? error.message : `供应商匹配进度已保留，Amazon 采集恢复待确认：${error.message}`, 'info', 6500);
     } finally {
       supplierCollectionTransition = false;
       scheduleAmazonCollectionPoll();
@@ -4888,7 +5614,9 @@ import {
   async function startFiltered1688Matching() {
     if (storeImportPending || taskReplacementPending || runState.archivedAt) return false;
     if (supplier1688Queue?.ratePolicy?.pausedReason || supplier1688RiskTask?.id) {
-      showToast(supplier1688Queue?.ratePolicy?.pausedReason === "RATE_LIMITED"
+      showToast(technical1688Pause()
+        ? '搜图进程中断，断点已保留，请检查服务后点击「检查后继续」。'
+        : supplier1688Queue?.ratePolicy?.pausedReason === "RATE_LIMITED"
         ? "搜图正在限流冷却，等待结束后会继续，当前进度已保留。"
         : "搜图队列已暂停，请先完成图片验证，再点击「验证完成，继续搜图」。", "info", 6200);
       return false;
@@ -4911,17 +5639,14 @@ import {
         // revision, historical results or per-product retry/task records.
         try {
           if (selectedProducts.length) {
-            supplierPipelineState = await apiRequest('/api/1688/pipeline/control', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ runId: selectionRunId, action: 'append', productIds: [...new Set(selectedProducts.map(product => product.id))] }),
-              timeout: 30000,
-            });
+            supplierPipelineState = await requestTaskControl('supplier', { runId: selectionRunId, action: 'append', productIds: [...new Set(selectedProducts.map(product => product.id))] });
+            applySupplierPipelineState(supplierPipelineState, selectionRunId);
           }
           if (runState.id !== selectionRunId) return false;
-          await refreshAmazonCollectionSnapshot();
+          if (!await refreshAfterTaskControl('续配范围保存')) return false;
           if (runState.id !== selectionRunId) return false;
         } catch (error) {
-          showToast(`续配范围尚未保存：${error.message}`, 'error', 6200);
+          showToast(error.code === 'CONTROL_OUTCOME_UNKNOWN' ? error.message : `续配范围尚未保存：${error.message}`, error.code === 'CONTROL_OUTCOME_UNKNOWN' ? 'info' : 'error', 6500);
           return false;
         }
         const remaining = getPending1688ResumeProducts().length;
@@ -4953,7 +5678,9 @@ import {
         criteria: {
           monthlySalesBand: activeRunCriteria.monthlySalesBand || "all",
           minReviews: activeRunCriteria.minReviews ?? null,
+          maxReviews: activeRunCriteria.maxReviews ?? null,
           minRating: activeRunCriteria.minRating ?? null,
+          amazonFirstAvailableFrom: activeRunCriteria.amazonFirstAvailableFrom || null,
         },
         productIds: selectedProducts.map((product) => product.id),
         selectedCount: selectedProducts.length,
@@ -5013,7 +5740,8 @@ import {
   }
 
   function isPending1688ResumeCandidate(product) {
-    if (!hasQualifyingMonthlySales(product)) return false;
+    const salesCriteria = runState.supplier1688Pipeline?.criteria || activeRunCriteria;
+    if (isMonthlySalesFilterRequired(currentTaskInputMode(), salesCriteria.monthlySalesBand) && !hasQualifyingMonthlySales(product, salesCriteria)) return false;
     if (runState.supplier1688Pipeline?.owner === "server"
       && ["complete", "failed", "skipped"].includes(runState.supplier1688Pipeline.tasks?.[product.id]?.status)) return false;
     if (isAnalysisReadOnly(product)) return false;
@@ -5275,7 +6003,9 @@ import {
     if (!supplier1688LoggedIn || !queue || queue.waitingLogin) return;
     const ratePolicy = queue.ratePolicy;
     if (Number(queue.riskBlocked || 0) > 0 || ratePolicy?.pausedReason) {
-      setText("supplier1688StatusText", ratePolicy?.pausedReason === "RATE_LIMITED"
+      setText("supplier1688StatusText", technical1688Pause(ratePolicy?.pausedReason)
+        ? `搜图进程中断 · 检查服务后点击「检查后继续」 · 待补 ${remaining} 个`
+        : ratePolicy?.pausedReason === "RATE_LIMITED"
         ? `搜图限流冷却中 · 待补 ${remaining} 个`
         : ratePolicy?.manualVerificationCompletedAt
         ? `图片验证已完成 · 请点击「验证完成，继续搜图」 · 待补 ${remaining} 个`
@@ -5958,15 +6688,18 @@ import {
     const coverage = runState.coverage;
     container.hidden = !coverage || runState.mode === "mock";
     if (container.hidden) return;
-    setText("coverageRequested", coverage.requested);
-    setText("coverageQueried", coverage.queried);
+    setText("coverageRequestedLabel", isAsinImport() ? "输入 ASIN" : "输入店铺");
+    setText("coverageQueriedLabel", isAsinImport() ? "详情成功" : "访问成功");
+    setText("coverageFailedLabel", isAsinImport() ? "详情待补" : "访问失败");
+    setText("coverageRequested", isAsinImport() ? importedItemCount() : coverage.requested);
+    setText("coverageQueried", isAsinImport() ? coverage.detailReturned ?? 0 : coverage.queried);
     setText("coverageUnresolved", coverage.discoveredAsins);
-    setText("coverageFailed", coverage.visitFailed);
+    setText("coverageFailed", isAsinImport() ? coverage.detailFailed ?? 0 : coverage.visitFailed);
     setText("coverageParents", coverage.detailReturned ?? coverage.parentCandidates);
     setText("coverageProducts", coverage.products);
     setText("coverageProvider", analysisSourceLabel(runState));
     container.classList.toggle("has-issues", Boolean(coverage.unresolved || coverage.waitingStores || coverage.visitFailed || coverage.failed));
-    renderStoreVisitAudit(amazonStoreVisitsForDisplay(runState.storeVisits || []));
+    renderStoreVisitAudit(isAsinImport() ? [] : amazonStoreVisitsForDisplay(runState.storeVisits || []));
   }
 
   function amazonStoreVisitsForDisplay(visits) {
@@ -6316,7 +7049,17 @@ import {
       initIcons();
     }, true);
     productTableBody?.addEventListener("click", (event) => {
-      if (event.target.closest("a.product-title-link")) return;
+      if (event.target.closest("[data-amazon-access]")) {
+        event.preventDefault();
+        byId("collectionAccessPanel")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        byId("collectionAccessPanel")?.focus({ preventScroll: true });
+        return;
+      }
+      const amazonLink = event.target.closest("a.product-title-link");
+      if (amazonLink) {
+        event.preventDefault();
+        return openAmazonLinkInEdge(amazonLink);
+      }
       const button = event.target.closest("[data-open-product]");
       const row = event.target.closest("tr[data-product-id]");
       const productId = button?.dataset.openProduct || row?.dataset.productId;
@@ -6370,6 +7113,27 @@ import {
     });
   }
 
+  async function openAmazonLinkInEdge(link) {
+    if (link.dataset.openingEdge === "true") return;
+    const url = link.getAttribute("data-amazon-url");
+    if (!url) return;
+    link.dataset.openingEdge = "true";
+    try {
+      await apiRequest("/api/amazon/open-in-edge", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }), timeout: 10000,
+      });
+    } catch (error) {
+      if (error.status === 404 && ["NOT_FOUND", "HTTP_404"].includes(error.code)) {
+        showToast("本地服务与页面版本不一致，尚未加载 Edge 打开接口。请通过项目启动器安全重启服务后刷新页面。", "error", 7000);
+      } else {
+        showToast(`无法在 Edge 打开 Amazon：${error.message}`, "error", 5500);
+      }
+    } finally {
+      delete link.dataset.openingEdge;
+    }
+  }
+
   function setExportMenuOpen(open, { focusFirst = false, restoreFocus = false } = {}) {
     const menu = byId("exportMenu");
     const list = byId("exportMenuList");
@@ -6383,10 +7147,16 @@ import {
     if (!nextOpen && restoreFocus) trigger.focus();
   }
 
-  function syncExportMenuCounts() {
-    setText("exportAllCandidateCount", products.filter(hasQualifyingMonthlySales).length);
-    setText("exportApprovedProductCount", products.filter((product) => product.reviewStatus === "approved" && hasQualifyingMonthlySales(product)).length);
-    setText("analysisReviewedExportCount", products.filter((product) => product.reviewStatus === "approved" && hasQualifyingMonthlySales(product)).length);
+  function getExportProducts(scope = "all", candidates = getFilteredProducts()) {
+    return scope === "all" ? candidates : candidates.filter(product => product.reviewStatus === "approved");
+  }
+
+  function syncExportMenuCounts(candidates = getFilteredProducts()) {
+    const approved = getExportProducts("approved", candidates);
+    setText("exportAllCandidateCount", candidates.length);
+    setText("exportApprovedProductCount", approved.length);
+    setText("analysisReviewedExportCount", approved.length);
+    setExportActionsDisabled(exportRunning, candidates);
   }
 
   function resetResultFilters() {
@@ -6400,14 +7170,52 @@ import {
   }
 
   function productWeightKgForDisplay(product) {
+    if (usesItemWeightOnly(product)) return resolveManualWeightOverride(product)?.weightKg ?? automaticProfitWeightKg(product);
     return [product?.productWeight, product?.fbaWeight]
       .map(finiteOrNull)
       .find((value) => value !== null && value > 0) ?? null;
   }
 
-  function productFilterExclusionReasons(product, criteria = {}) {
+  function productFilterExclusionReasons(product, criteria = {}, today) {
     const reasons = productStoreCriteria(product, criteria).map((rule) => singleStoreFilterExclusionReasons(product, rule));
-    return reasons.some((list) => list.length === 0) ? [] : [...new Set(reasons.flat())];
+    const combined = reasons.some((list) => list.length === 0) ? [] : [...new Set(reasons.flat())];
+    if (criteria.amazonFirstAvailableFrom) {
+      const date = amazonListingDateValue(product);
+      if (!matchesAmazonListingDate(date, criteria.amazonFirstAvailableFrom, today ?? todayDateOnly())) {
+        combined.push(date ? "AMAZON_LISTING_DATE_OUTSIDE_RANGE" : "AMAZON_LISTING_DATE_UNKNOWN");
+      }
+    }
+    return combined;
+  }
+
+  function amazonListingDateValue(product) {
+    return product?.amazonFirstAvailableDateStatus === "found" ? normalizeISODateOnly(product.amazonFirstAvailableDate) : null;
+  }
+
+  function amazonListingDateLabel(product) {
+    const value = amazonListingDateValue(product);
+    if (value) return value;
+    if (product?.amazonFirstAvailableDateStatus === "not_provided") return "Amazon 未提供上架日期";
+    if (amazonCollectionFailure(product)) return "上架日期待核验 · 详情采集失败";
+    if (product?.amazonFirstAvailableDateEvidence) return "上架日期待核验 · 日期证据尚未确认";
+    if (product?.productInformation?.inspection?.errorCode) return "上架日期待核验 · 浏览器检查失败";
+    if (hasUnavailableAmazonSpecifications(product)) return "上架日期待核验 · 完整规格入口当前不可用";
+    if (product?.productInformation?.inspection?.reason === "inspection_timeout") return "上架日期待核验 · 商品信息区检查超时";
+    if (product?.productInformation?.status === "incomplete") return "上架日期待核验 · 商品信息区尚未完整读取";
+    return "上架日期待核验";
+  }
+
+  function renderAmazonListingDateCoverage() {
+    let found = 0, notProvided = 0;
+    for (const product of products) {
+      if (amazonListingDateValue(product)) found++;
+      else if (product.amazonFirstAvailableDateStatus === "not_provided") notProvided++;
+    }
+    const unknown = products.length - found;
+    const start = activeRunCriteria.amazonFirstAvailableFrom;
+    setText("amazonListingDateCoverage", `Amazon 上架日期：已取得 ${formatInteger(found)} / ${formatInteger(products.length)} · 未知 ${formatInteger(unknown)}（页面未提供 ${formatInteger(notProvided)}，待核验 ${formatInteger(unknown - notProvided)}）。${start ? `当前范围 ${start} 至 ${todayDateOnly()}，包含两端，未知日期不纳入。` : "未启用日期筛选，未知日期正常参与分析，不影响利润计算。"}`);
+    const input = byId("amazonFirstAvailableFrom");
+    if (input) input.max = todayDateOnly();
   }
 
   function productStoreCriteria(product, criteria = {}) {
@@ -6418,12 +7226,16 @@ import {
         || (Number.isInteger(source.storeIndex) && source.storeIndex === index)
         || (source.rowNumbers || []).some((row) => (store.rowNumbers || []).includes(row))));
     if (!stores.length) return [{ ...criteria }];
-    return stores.map((store) => ({
-      ...criteria,
-      ...Object.fromEntries(Object.entries(store.criteria || {}).filter(([, value]) => value !== null && value !== undefined)),
-      sourceRows: store.rowNumbers || [],
-      importBlocked: store.importBlocked === true,
-    }));
+    return stores.map((store) => {
+      const reviewRange = intersectReviewRanges(criteria, store.criteria || {});
+      return {
+        ...criteria,
+        ...Object.fromEntries(Object.entries(store.criteria || {}).filter(([, value]) => value !== null && value !== undefined)),
+        ...reviewRange,
+        sourceRows: store.rowNumbers || [],
+        importBlocked: store.importBlocked === true || reviewRange.importBlocked === true,
+      };
+    });
   }
 
   function singleStoreFilterExclusionReasons(product, criteria = {}) {
@@ -6431,24 +7243,26 @@ import {
     if (criteria.importBlocked) reasons.push("STORE_IMPORT_RULE_CONFLICT");
     const enabled = (value) => value !== null && value !== undefined && value !== "";
     const detailPending = String(product?.detailStatus || "").toLowerCase() === "pending";
-    const monthlySalesBand = criteria.monthlySalesBand || "all";
-    const effectiveMonthlySales = monthlySalesValue(product, criteria);
-    if (effectiveMonthlySales === null) {
-      reasons.push("MONTHLY_SALES_EVIDENCE_MISSING");
-    } else if (effectiveMonthlySales < 50) {
-      reasons.push("MONTHLY_SALES_BELOW_50");
-    } else {
-      if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
-      if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
+    if (isMonthlySalesFilterRequired(currentTaskInputMode(), criteria.monthlySalesBand)) {
+      const monthlySalesBand = criteria.monthlySalesBand || "all";
+      const effectiveMonthlySales = monthlySalesValue(product, criteria);
+      if (effectiveMonthlySales === null) {
+        reasons.push("MONTHLY_SALES_EVIDENCE_MISSING");
+      } else if (effectiveMonthlySales < 50) {
+        reasons.push("MONTHLY_SALES_BELOW_50");
+      } else {
+        if (monthlySalesBand === "50_to_100" && effectiveMonthlySales >= 100) reasons.push("MONTHLY_SALES_OUTSIDE_50_TO_100");
+        if (monthlySalesBand === "100_plus" && effectiveMonthlySales < 100) reasons.push("MONTHLY_SALES_BELOW_100");
+      }
     }
-    if (enabled(criteria.minReviews) && (Number.isFinite(product.reviews) ? product.reviews < criteria.minReviews : !detailPending)) reasons.push("REVIEWS_BELOW_MINIMUM");
+    reasons.push(...reviewRangeExclusionReasons(product.reviews, criteria));
     if (enabled(criteria.minRating) && (Number.isFinite(product.rating) ? product.rating < criteria.minRating : !detailPending)) reasons.push("RATING_BELOW_MINIMUM");
     if (enabled(criteria.minProfitMargin) && Number.isFinite(product.margin) && product.margin < criteria.minProfitMargin) reasons.push("PROFIT_BELOW_STORE_MINIMUM");
     return reasons;
   }
 
-  function matchesProductCriteria(product, criteria = {}) {
-    return productFilterExclusionReasons(product, criteria).length === 0;
+  function matchesProductCriteria(product, criteria = {}, today) {
+    return productFilterExclusionReasons(product, criteria, today).length === 0;
   }
 
   function weightBandMatches(product, band) {
@@ -6469,10 +7283,11 @@ import {
     const resultMinMargin = numberOrNull(byId("resultMinMargin")?.value);
     const resultWeightBand = byId("resultWeightBand")?.value || "";
     const completeOnly = completeOnlyOverride ?? (byId("resultsCompleteToggle")?.checked ?? false);
+    const today = todayDateOnly();
     let filtered = products.filter((product) => {
       const haystack = [product.asin, product.name, product.englishName, product.storeName, product.sellerId].join(" ").toLowerCase();
       if (query && !haystack.includes(query)) return false;
-      if (!matchesProductCriteria(product, activeRunCriteria)) return false;
+      if (!matchesProductCriteria(product, activeRunCriteria, today)) return false;
       if (completeOnly && !product.complete) return false;
       if (!weightBandMatches(product, resultWeightBand)) return false;
       const margin = recommendationMargin(product);
@@ -6583,7 +7398,12 @@ import {
       MONTHLY_SALES_OUTSIDE_50_TO_100: "Amazon 月销量不在 50–<100",
       MONTHLY_SALES_BELOW_100: "Amazon 月销量低于 100",
       RATING_BELOW_MINIMUM: "评价星级低于筛选值或缺失",
-      REVIEWS_BELOW_MINIMUM: "评价数量低于筛选值或缺失",
+      REVIEWS_BELOW_MINIMUM: "评价数量低于最小值",
+      REVIEWS_ABOVE_MAXIMUM: "评价数量高于最大值",
+      REVIEWS_MISSING: "评价数量待核验",
+      REVIEWS_UNVERIFIED: "评价数量待核验",
+      AMAZON_LISTING_DATE_UNKNOWN: "Amazon 上架日期未知",
+      AMAZON_LISTING_DATE_OUTSIDE_RANGE: "Amazon 上架日期不在所选起始日期至今天的范围",
     };
     const counts = new Map();
     products.forEach((product) => {
@@ -6650,7 +7470,8 @@ import {
       return;
     }
     if (pipeline?.owner === 'server' && pipeline.status === 'needs_attention') {
-      summary.textContent = pipeline.message || '匹配已保留断点，需先处理 1688 验证，再继续原批次。';
+      summary.textContent = pipeline.message || (technical1688Pause(pipeline.lastReason) || technical1688Pause()
+        ? '搜图进程中断，已保留断点；检查本地服务后可继续原批次。' : '匹配已保留断点，需先处理 1688 验证，再继续原批次。');
       return;
     }
     if (pending.length) {
@@ -6677,6 +7498,7 @@ import {
   }
 
   function renderAsinCoverageSummary(salesCoverage = summarizeMonthlySalesCoverage(products, activeRunCriteria)) {
+    renderMonthlySalesAdmission();
     setText("sellerSpriteSalesCount", `当前任务月销量 ${formatInteger(salesCoverage.bySource.sellerSprite)} 个 ASIN`);
     const salesCount = byId("sellerSpriteSalesCount");
     if (salesCount) salesCount.title = "当前查看任务中，按同一 ASIN、同一站点及有效近月销量证据核验的 SellerSprite 数据数量；连接成功不等于已取得销量。";
@@ -6686,9 +7508,12 @@ import {
     const coverage = runState.coverage || {};
     const breakdown = amazonCoverageBreakdown(coverage);
     const displayCoverage = { ...coverage, ...breakdown };
-    const storeTotal = coverageCount(coverage.reportedTotalAsins);
+    setText("sourceAsinTotalLabel", isAsinImport() ? "导入 ASIN 合计" : "Amazon 报告合计（估算）");
+    setText("retainedAsinLabel", isAsinImport() ? "已纳入唯一 ASIN" : "已枚举唯一 ASIN");
+    setText("pendingAsinLabel", isAsinImport() ? "尚未纳入 ASIN" : "待继续枚举（估算）");
+    const storeTotal = isAsinImport() ? importedItemCount() : coverageCount(coverage.reportedTotalAsins);
     const retained = coverageCount(coverage.discoveredAsins) ?? products.length;
-    const notIncluded = breakdown.pendingEnumerationAsins;
+    const notIncluded = isAsinImport() ? Math.max(0, storeTotal - retained) : breakdown.pendingEnumerationAsins;
     setText("storeAsinCount", storeTotal === null ? "未确认" : formatInteger(storeTotal));
     setText("retainedAsinCount", formatInteger(retained));
     setText("notIncludedAsinCount", notIncluded === null ? "未确认" : formatInteger(notIncluded));
@@ -6696,7 +7521,7 @@ import {
     const reasonList = byId("notIncludedReasonList");
     if (reasonList) {
       reasonList.innerHTML = [
-        ...coverageOmissionReasons(displayCoverage, notIncluded),
+        ...(isAsinImport() ? [notIncluded ? `${notIncluded} 个导入 ASIN 尚未纳入后台详情采集。` : "全部导入 ASIN 已纳入任务；无需枚举店铺。"] : coverageOmissionReasons(displayCoverage, notIncluded)),
         ...currentFilterExclusionReasons(),
       ]
         .map((reason) => `<li>${escapeHtml(reason)}</li>`)
@@ -6720,14 +7545,15 @@ import {
     body.innerHTML = pageProducts.map(renderProductRow).join("");
     byId("visibleCount").textContent = String(currentVisibleProducts.length);
     const salesCoverage = summarizeMonthlySalesCoverage(products, activeRunCriteria);
-    const candidateCount = salesCoverage.qualified;
+    const candidateCount = currentTaskInputMode() === "asins" ? products.length : salesCoverage.qualified;
     setText("totalCandidateCount", candidateCount);
     setText("sourceAsinCount", products.length);
     byId("navCandidateCount").textContent = String(candidateCount);
     renderAsinCoverageSummary(salesCoverage);
     renderSupplier1688Stage();
-    syncExportMenuCounts();
-    renderAnalysisHandoffSummary();
+    renderAmazonListingDateCoverage();
+    syncExportMenuCounts(currentVisibleProducts);
+    renderAnalysisHandoffSummary(currentVisibleProducts);
     const pagination = byId("resultsPagination");
     if (pagination) pagination.hidden = currentVisibleProducts.length <= RESULTS_PAGE_SIZE;
     setText(
@@ -6774,7 +7600,9 @@ import {
       hiddenIncomplete
         ? "这些商品已有大致数据，可手工补齐成本并初审；导出文件会明确标记完整度和缺失字段。"
         : hiddenByCriteria
-          ? "月销量、评价数量或星级未达当前条件（仅保留 Amazon 明确显示 50+ 或更高月购买量标识的商品）；具体原因见上方覆盖说明，ASIN 不会被删除。"
+          ? currentTaskInputMode() === "asins"
+            ? "部分商品不符合主动选择的筛选条件；月销量选择“全部商品”时不会排除低销量或未知商品。具体原因见上方覆盖说明，ASIN 不会被删除。"
+            : "月销量、评价数量、星级或上架日期未达当前条件；仅将有效月销量至少 50 且符合所选档位的商品纳入候选。具体原因见上方覆盖说明，ASIN 不会被删除。"
         : "调整筛选条件后重新查看。",
     );
     if (emptyAction) {
@@ -6812,15 +7640,19 @@ import {
   function candidateFbaSummaryHtml(product) {
     ensureFulfillmentState(product);
     const productWeightKg = productWeightKgForDisplay(product);
-    const weightLabel = finiteOrNull(product.productWeight) > 0 ? "商品重量" : "FBA 包装重量";
+    const weightLabel = usesItemWeightOnly(product) ? resolveManualWeightOverride(product) ? "人工重量" : /包裹重量/.test(profitWeightSourceLabel(product)) ? "包裹重量" : "Item Weight"
+      : finiteOrNull(product.productWeight) > 0 ? "商品重量" : "FBA 包装重量";
     const fbaFee = finiteOrNull(product.fbaFee);
     const values = [];
     if (productWeightKg !== null && productWeightKg > 0) {
       values.push(`<span><b>${weightLabel}</b>${formatWeightKg(productWeightKg)} kg · ${escapeHtml(productWeightBandLabel(productWeightKg))}</span>`);
     }
     if (productWeightKg === null && isAmazonWeightUnavailable(product)) values.push("<span>页面未提供重量 · 可初审</span>");
+    else if (productWeightKg === null) values.push("<span>商品及包裹重量待采集</span>");
+    if (product.profitCalculation?.weightAssumption) values.push("<span>利润按最低档暂估 · 实际重量未知</span>");
     if (product.fulfillmentMode === "FBA" && fbaFee !== null) {
-      const feeLabel = product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee ? "FBA 最低档估算" : "FBA 配送费";
+      const feeLabel = !product.manualFbaFee && product.fbaEstimate?.overweightCapped ? "FBA 封顶估算"
+        : product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee ? "FBA 最低档估算" : "FBA 配送费";
       values.push(`<span class="candidate-fba-cost"><b>${feeLabel}</b>${currencyPairHtml(fbaFee, product.marketplace, { compact: true })}</span>`);
     }
     return values.length ? `<div class="candidate-logistics is-calculated">${values.join("")}</div>` : "";
@@ -6850,10 +7682,13 @@ import {
     const marketCode = String(product.sourceMarketplace || product.marketplace || "").trim().toUpperCase();
     const domain = MARKET_CONFIGS[marketCode]?.amazonDomain
       || Object.values(MARKET_CONFIGS).find((market) => market.amazonDomain === String(product.amazonDomain || "").trim().toLowerCase())?.amazonDomain;
-    if (domain && product.canonicalUrl) {
+    const importedUrl = (storeList?.stores || []).find(source =>
+      (!source.marketplace || source.marketplace === marketCode) && source.asins?.includes(asin)
+      && source.productUrls?.[asin])?.productUrls?.[asin];
+    for (const candidate of domain ? [importedUrl, product.canonicalUrl].filter(Boolean) : []) {
       try {
-        const url = new URL(product.canonicalUrl);
-        const urlAsin = url.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})(?:\/|$)/i)?.[1]?.toUpperCase();
+        const url = new URL(candidate);
+        const urlAsin = url.pathname.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:\/|$)/i)?.[1]?.toUpperCase();
         if (url.protocol === 'https:' && !url.username && !url.password && !url.port
           && url.hostname.replace(/^www\./, '') === domain.replace(/^www\./, '') && urlAsin === asin) return url.href;
       } catch { /* Invalid saved URLs fall back to the canonical same-market ASIN link. */ }
@@ -6880,7 +7715,7 @@ import {
     const displayedMargin = recommendationMargin(product);
     const margin = displayedMargin === null
       ? `<span class="margin-value">待计算</span><small>缺少：${escapeHtml(profitCalculationMissingReasons(product).join('、') || '有效计算参数')}；补齐后自动计算</small>`
-      : `<span class="margin-value ${marginClass(displayedMargin)}">${formatPercent(displayedMargin)}</span>${currencyPairHtml(calculation?.profit, product.marketplace, { suffix: " / 件", compact: true })}${calculation?.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : isLowConfidenceSupplierEstimate(product) ? "<small>初步利润 · 1688 低置信度参考</small>" : "<small>初步经营利润估算</small>"}`;
+      : `<span class="margin-value ${marginClass(displayedMargin)}">${formatPercent(displayedMargin)}</span>${currencyPairHtml(calculation?.profit, product.marketplace, { suffix: " / 件", compact: true })}${calculation?.dimensionalWeightEstimateKg ? "<small>体积重暂估 · 实际重量未知</small>" : calculation?.weightAssumption ? "<small>最低档暂估 · 实际重量未知</small>" : ""}${calculation?.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : isLowConfidenceSupplierEstimate(product) ? "<small>初步利润 · 1688 低置信度参考</small>" : "<small>初步经营利润估算</small>"}`;
     const targetCost = Number.isFinite(product.targetCostCny)
       ? `${cnyCurrencyPairHtml(product.targetCostCny, product.marketplace, { compact: true })}${Number.isFinite(product.thresholdCostCny) ? `<small>盈利线</small>${cnyCurrencyPairHtml(product.thresholdCostCny, product.marketplace, { label: "≤ ", compact: true, secondary: true })}` : ""}`
       : "";
@@ -6895,7 +7730,7 @@ import {
     const visual = renderCandidateProductVisual(product);
     const amazonUrl = amazonProductUrl(product);
     const productTitle = amazonUrl
-      ? `<a class="product-title-link" href="${escapeHtml(amazonUrl)}" target="_blank" rel="noopener noreferrer" title="在新标签页打开亚马逊商品：${escapeHtml(product.name)}">${escapeHtml(product.name)}</a>`
+      ? `<a class="product-title-link" href="microsoft-edge:${escapeHtml(amazonUrl)}" data-amazon-url="${escapeHtml(amazonUrl)}" rel="noopener noreferrer" title="在 Microsoft Edge 打开亚马逊商品：${escapeHtml(product.name)}">${escapeHtml(product.name)}</a>`
       : escapeHtml(product.name);
 
     return `
@@ -6907,11 +7742,13 @@ import {
               <div><strong>${productTitle}</strong><span class="recommendation-tag is-${recommendation.type}">${recommendation.label}</span></div>
               ${sourceAsin ? `<span class="asin-label">源 ASIN ${escapeHtml(sourceAsin)}${product.parentAsin ? ` · 父 ASIN ${escapeHtml(product.parentAsin)}` : ""}</span>` : ""}
               ${storeIdentity ? `<small class="store-label">${escapeHtml(storeIdentity)}</small>` : ""}
+              <small class="amazon-listing-date${amazonListingDateValue(product) ? "" : " is-unknown"}">${amazonListingDateValue(product) ? "Amazon 上架：" : ""}${escapeHtml(amazonListingDateLabel(product))}${amazonListingDateValue(product) ? "" : " · 不影响利润计算"}</small>
               ${candidateFbaSummaryHtml(product)}
+              ${amazonProductCollectionNoteHtml(product)}
             </div>
           </div>
         </td>
-        <td class="numeric-cell price-cell">${currencyPairHtml(product.currentPrice, product.marketplace)}${!Number.isFinite(product.currentPrice) && amazonPriceStatusLabel(product) ? `<small>${amazonPriceStatusLabel(product)}</small>` : ""}${currencyPairHtml(product.salePrice, product.marketplace, { label: "我们的售价 ", secondary: true })}</td>
+        <td class="numeric-cell price-cell">${currencyPairHtml(product.currentPrice, product.marketplace)}${amazonPriceStatusLabel(product) ? `<small>${escapeHtml(amazonPriceStatusLabel(product))}</small>` : ""}${currencyPairHtml(product.salePrice, product.marketplace, { label: "我们的售价 ", secondary: true })}</td>
         <td class="numeric-cell">${targetCost}</td>
         <td class="numeric-cell"><strong>${purchase}</strong>${purchaseNote ? `<small>${purchaseNote}</small>` : ""}</td>
         <td class="numeric-cell">${margin}</td>
@@ -7474,13 +8311,13 @@ import {
     const approveButton = byId("manualCostApproveButton");
     if (approveButton) {
       const product = products.find(item => item.id === manualCostDraft?.productId);
-      const reason = preliminaryReviewBlockingReason(product, manualCostDraft?.profitInputs?.actualWeightKg);
+      const reason = preliminaryReviewBlockingReason(product, manualCostDraft?.profitInputs?.actualWeightKg, manualCostDraft?.activeMode);
       approveButton.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || product.supplierSearchStatus === "searching" || Boolean(reason);
       approveButton.title = reason || "保存并初审；完整利润可后续计算";
     }
   }
 
-  function validateManualProfitInputs(profitInputs, product = null) {
+  function validateManualProfitInputs(profitInputs, product = null, mode = product?.fulfillmentMode) {
     const rawWeight = String(byId("manualActualWeightKg")?.value ?? "").trim();
     if (rawWeight && (numberOrNull(rawWeight) === null || numberOrNull(rawWeight) <= 0)) {
       return { id: "manualActualWeightKg", message: "实际重量必须是大于 0 的有效数字。" };
@@ -7499,8 +8336,11 @@ import {
         return { id, message: `${label}必须是 0-100% 的有效数字。` };
       }
     }
-    if (!(profitInputs?.actualWeightKg === null && isAmazonWeightUnavailable(product)) && (!Number.isFinite(profitInputs?.actualWeightKg) || profitInputs.actualWeightKg <= 0)) {
-      return { id: "manualActualWeightKg", message: "请填写真实重量，或完成详情采集以确认页面未提供重量。" };
+    const weightAssumption = applyMissingWeightProfitAssumption({ ...profitInputs, fulfillmentMode: mode }, product?.marketplace || activeMarket.code, product);
+    const missingMass = profitInputs?.actualWeightKg == null || profitInputs.actualWeightKg === "";
+    if (!(missingMass && normalizeFulfillmentMode(mode) === "FBA") && !weightAssumption.weightAssumption
+      && !weightAssumption.dimensionalWeightEstimateKg && (!Number.isFinite(profitInputs?.actualWeightKg) || profitInputs.actualWeightKg <= 0)) {
+      return { id: "manualActualWeightKg", message: "请填写有效实际重量；缺少计算依据时可保存草稿，利润保持待计算。" };
     }
     if (!Number.isFinite(profitInputs?.airFreightRateCnyPerKg) || profitInputs.airFreightRateCnyPerKg < 0) {
       return { id: "manualAirFreightRate", message: "空运单价必须是大于或等于 0 的有效数字。" };
@@ -7560,7 +8400,7 @@ import {
       setManualCostError("1688单件采购价、标题件数和履约费必须是有效数字。");
       return;
     }
-    const inputError = validateManualProfitInputs(manualCostDraft.profitInputs, product);
+    const inputError = validateManualProfitInputs(manualCostDraft.profitInputs, product, mode);
     if (inputError) {
       setManualCostError(inputError.message);
       return;
@@ -7578,7 +8418,7 @@ import {
       unitsPerCarton: manualCostDraft.profitInputs.unitsPerCarton,
       resolvedProfitInputs: manualCostDraft.profitInputs,
       marketplace: product.marketplace,
-    });
+    }, product);
     setManualSummary("manualVolumetricWeightKg", Number.isFinite(calculation?.airFreight?.volumetricWeightKg) ? `${formatNumber(calculation.airFreight.volumetricWeightKg)} kg` : "");
     setManualSummary("manualChargeableWeightKg", Number.isFinite(calculation?.airFreight?.chargeableWeightKg) ? `${formatNumber(calculation.airFreight.chargeableWeightKg)} kg` : "");
     setManualSummary("manualAirFreightCny", calculation ? cnyCurrencyPairHtml(calculation.airFreight.airFreightCny, product.marketplace, { compact: true }) : "", { html: true });
@@ -7588,13 +8428,13 @@ import {
       const reason = !Number.isFinite(salePrice) || salePrice <= 0
         ? "销售价格缺失，暂时无法预览利润；成本仍可保存。"
         : !Number.isFinite(manualCostDraft.profitInputs.actualWeightKg) || manualCostDraft.profitInputs.actualWeightKg <= 0
-          ? "重量缺失：FBA 可按最低档估算；头程及完整利润待补，仍可保存并初审。"
+          ? "重量缺失：FBA 可按最低档暂估；请补齐其他利润参数。"
           : "当前利润参数不完整，暂时无法预览。";
       setManualCostError(reason);
       return;
     }
     setManualCostError();
-    setText("manualCostProfitMargin", formatPercent(calculation.margin));
+    setText("manualCostProfitMargin", `${formatPercent(calculation.margin)}${calculation.weightAssumption ? " · 最低档暂估" : ""}`);
     const profitValue = byId("manualCostProfitValue");
     const salePriceCny = convertCurrencyToCny(calculation.salePrice, product.marketplace);
     const totalCostCny = convertCurrencyToCny(calculation.totalCost, product.marketplace);
@@ -7612,7 +8452,7 @@ import {
     }
     const approveButton = byId("manualCostApproveButton");
     if (approveButton) {
-      const reason = preliminaryReviewBlockingReason(product, manualCostDraft.profitInputs.actualWeightKg);
+      const reason = preliminaryReviewBlockingReason(product, manualCostDraft.profitInputs.actualWeightKg, manualCostDraft.activeMode);
       approveButton.disabled = product.supplierSearchStatus === "searching" || Boolean(reason);
       approveButton.title = reason || "保存当前成本并初审通过";
     }
@@ -7620,11 +8460,13 @@ import {
     if (confidence) {
       const productWeightFormula = calculation.airFreight.source === "product_weight";
       const fallback = !productWeightFormula && calculation.airFreight.source !== "carton";
-      confidence.dataset.confidence = fallback ? "low" : "standard";
+      confidence.dataset.confidence = calculation.weightAssumption || fallback ? "low" : "standard";
       const title = confidence.querySelector("strong");
       const description = confidence.querySelector("span");
-      if (title) title.textContent = productWeightFormula ? "澳洲表格公式" : fallback ? "低置信度" : "外箱公式已启用";
-      if (description) description.textContent = productWeightFormula
+      if (title) title.textContent = calculation.weightAssumption ? "最低档暂估 · 实际重量待核验" : productWeightFormula ? "澳洲表格公式" : fallback ? "低置信度" : "外箱公式已启用";
+      if (description) description.textContent = calculation.weightAssumption
+        ? `实际重量未知；国内运费按最低信封档假设重量 ${formatNumber(calculation.assumedWeightKg * 1_000)}g 暂估，头程计费重 ${formatNumber(calculation.airFreight.chargeableWeightKg)}kg（${calculation.airFreight.source === "carton" ? "外箱重量 ÷ 装箱数" : calculation.airFreight.source === "minimum_envelope_assumption" ? "最低档假设" : "假设重量与体积重取高"}）。取得真实 Item Weight 后自动重算。`
+        : productWeightFormula
         ? `商品重量 ${formatNumber(calculation.airFreight.actualWeightKg * 1_000)}g × ${formatCny(calculation.airFreight.airFreightRateCnyPerGram)}/g；再按汇率换算为 AUD。`
         : fallback
           ? "当前按 SellerSprite 单件实际重与体积重取高值估算。"
@@ -7647,7 +8489,8 @@ import {
         type: "info",
       };
     }
-    if (product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee) return { message: `${prefix}；页面未提供重量，FBA 配送费暂按最低档估算；头程及完整利润待补齐重量后计算。`, type: "info" };
+    if (product.profitCalculation?.dimensionalWeightEstimateKg) return { message: `${prefix}；实重未知，当前按加拿大体积重估算利润，取得实重后重新比较 FBA 费用。`, type: "info" };
+    if (product.profitCalculation?.weightAssumption || (product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee)) return { message: `${prefix}；实际重量${isAmazonWeightUnavailable(product) ? "页面未提供" : "待核验"}，利润按最低档估算；真实重量保持未知，取得 Item Weight 后自动重算。`, type: "info" };
     if (!product.profitCalculation || product.profitCalculation.purchaseCostAssumedZero) return { message: `${prefix}；利润参数可后续补充，当前尚无完整利润。`, type: "info" };
     if (isLowConfidenceSupplierEstimate(product)) {
       return {
@@ -7731,15 +8574,10 @@ import {
       return;
     }
     const resolvedInputs = manualCostDraft.profitInputs;
-    const inputError = validateManualProfitInputs(resolvedInputs, product);
+    const inputError = validateManualProfitInputs(resolvedInputs, product, manualCostDraft.activeMode);
     if (inputError) {
       setManualCostError(inputError.message);
       byId(inputError.id)?.focus();
-      return;
-    }
-    if (!(resolvedInputs.actualWeightKg === null && isAmazonWeightUnavailable(product)) && (!Number.isFinite(resolvedInputs.actualWeightKg) || resolvedInputs.actualWeightKg <= 0)) {
-      setManualCostError("实际重量必须是大于 0 的有效数字。");
-      byId("manualActualWeightKg")?.focus();
       return;
     }
     if (!Number.isFinite(resolvedInputs.airFreightRateCnyPerKg) || resolvedInputs.airFreightRateCnyPerKg < 0) {
@@ -7791,7 +8629,7 @@ import {
     const sales30Changed = finiteOrNull(product.sales30) !== numberOrNull(amazon.sales30);
     if (approve) {
       const reviewProduct = sales30Changed ? { ...product, sales30Evidence: null, amazonSales30Evidence: null } : product;
-      const reason = preliminaryReviewBlockingReason(reviewProduct, resolvedInputs.actualWeightKg);
+      const reason = preliminaryReviewBlockingReason(reviewProduct, resolvedInputs.actualWeightKg, manualCostDraft.activeMode);
       if (reason) { setManualCostError(reason); return; }
     }
     const baseline = manualCostDraft.baseline;
@@ -8007,6 +8845,21 @@ import {
     if (content) content.scrollTop = 0;
   }
 
+  function renderProductInformation(product) {
+    const target = byId("amazonProductInformation");
+    if (!target) return;
+    const info = product.productInformation;
+    const asin = String(product.sourceAsin || product.asin || "").trim().toUpperCase();
+    const matches = info?.version === 1 && info.asin === asin;
+    const sections = matches && Array.isArray(info.sections) ? info.sections : [];
+    const count = sections.reduce((sum, section) => sum + (Array.isArray(section.rows) ? section.rows.length : 0), 0);
+    target.hidden = product.analysisSourceMode !== "amazon_only" && !matches;
+    const state = matches && info.status === "complete" ? `已完整读取 ${count} 项` : count ? `已读取 ${count} 项，信息区尚未完整` : "尚未完整读取，不能确认页面是否缺少重量";
+    target.innerHTML = `<summary>Product information · ${escapeHtml(state)}</summary>` + sections.map(section =>
+      `<h4>${escapeHtml(section.heading || "商品信息")}</h4><dl class="metric-list">${(section.rows || []).map(row =>
+        `<div><dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd></div>`).join("")}</dl>`).join("");
+  }
+
   function populateDrawer(product) {
     ensureFulfillmentState(product);
     const purchasePricing = ensureProductPurchasePricing(product);
@@ -8061,10 +8914,13 @@ import {
     const parameterSource = product.parameterSource && !/(?:缺失|未获取)/.test(product.parameterSource)
       ? product.parameterSource
       : null;
+    const displayedProductWeight = usesItemWeightOnly(product) ? productWeightKgForDisplay(product) : finiteOrNull(product.productWeight);
     const metrics = [
       ["源 ASIN", sourceAsin || null],
       ["父 ASIN", product.parentAsin || null],
       [product.analysisSourceMode === "amazon_only" ? "Amazon 官网详情" : "SellerSprite 详情", detailSucceeded ? (product.manualAmazonOverride ? "成功 · 含人工覆盖" : "成功") : null],
+      ["Amazon 采集说明", amazonOnly ? amazonProductCollectionNote(product)?.text || null : null],
+      ["Amazon 失败代码", amazonOnly ? amazonProductCollectionNote(product)?.code || null : null],
       ["SellerSprite 查竞品", !amazonOnly && product.competitorLookupStatus === "success" ? "成功" : null],
       ["竞品当前售价", moneyMetric(product.currentPrice)],
       ["售价核验状态", amazonPriceStatusLabel(product) || null],
@@ -8079,13 +8935,21 @@ import {
       ["评分与评价", ratingAndReviews || null],
       ["A+ 页面", typeof product.hasAPlus === "boolean" ? (product.hasAPlus ? "有" : "无") : null],
       ["首次 FBA 有货", product.firstFba || null],
+      ["Amazon 上架日期", amazonListingDateLabel(product)],
+      ["上架日期说明", amazonListingDateValue(product) ? null : "日期仅用于展示和已启用的日期筛选，不影响利润计算及正常分析"],
       ["SellerSprite 上架日期", !amazonOnly ? product.listingAvailableAt || null : null],
       ["商品参数", product.productDimensions || null],
       ["FBA 包装参数", product.fbaDimensions || null],
-      ["商品重量", Number.isFinite(product.productWeight) ? `${formatWeightKg(product.productWeight)} kg · ${productWeightBandLabel(product.productWeight)}` : isFba && product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? "页面未提供 · 可初审，完整利润待补" : null],
-      [isAu ? "FBA 配送费（澳洲重量档）" : "FBA 配送费（按商品重量）", fbaFeeMetric],
+      ["页面商品重量（Item Weight）", automaticProductWeightKg(product) !== null ? `${formatWeightKg(automaticProductWeightKg(product))} kg` : null],
+      ["页面包裹重量", automaticPackageWeightKg(product) !== null ? `${formatWeightKg(automaticPackageWeightKg(product))} kg` : null],
+      ["利润计算重量", displayedProductWeight !== null ? `${formatWeightKg(displayedProductWeight)} kg · ${productWeightBandLabel(displayedProductWeight)} · ${profitWeightSourceLabel(product)}` : isFba && product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? `${isAmazonWeightUnavailable(product) ? "页面未提供" : "Item Weight 待核验"} · 利润按最低档暂估` : amazonOnly ? amazonFieldIssue(product, "weight") : null],
+      ["商品尺寸（cm）", resolveProductDimensionsCm(product)?.map(value => formatNumber(value)).join(" × ") || null],
+      ["加拿大体积重", product.marketplace === "CA" && product.fbaEstimate?.dimensionalWeightKg ? `${formatWeightKg(product.fbaEstimate.dimensionalWeightKg)} kg（长×宽×高 cm ÷ 5021.69）` : null],
+      ["FBA 费用采用依据", product.fbaEstimate?.selectionPolicy === "highest_available_fba_fee" ? `${product.manualFbaFee ? "人工费用覆盖；自动比较参考：" : ""}${product.fbaEstimate.weightSource} · ${formatWeightKg(product.fbaEstimate.calculationWeightKg)} kg · 已有信息取最高 FBA 费用` : null],
+      [isAu ? "FBA 配送费（澳洲重量档）" : "FBA 配送费（按所选重量）", fbaFeeMetric],
+      ["FBA 封顶估费重量", !product.manualFbaFee && product.fbaEstimate?.overweightCapped ? `${product.fbaEstimate.feeWeightG} g · 国内运费与空运头程按实际重量` : null],
       ...(!isAu ? [
-        ["FBA 计费输入", Number.isFinite(product.billingWeight) ? `${product.billingWeight.toFixed(2)} kg${product.weightSource && !/(?:缺失|未获取)/.test(product.weightSource) ? ` · ${product.weightSource}` : ""}` : product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? "页面未提供重量 · FBA 配送费按最低档估算" : null],
+        ["FBA 计费输入", Number.isFinite(product.billingWeight) ? `${product.billingWeight.toFixed(2)} kg${product.weightSource && !/(?:缺失|未获取)/.test(product.weightSource) ? ` · ${product.weightSource}` : ""}` : product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? "实际重量未知 · FBA 配送费按最低档估算" : null],
         ["FBA 计费重", Number.isFinite(product.fbaEstimate?.billableWeightLb) ? `${product.fbaEstimate.billableWeightLb.toFixed(2)} lb` : null],
       ] : []),
       ["FBA 包装重量", Number.isFinite(product.fbaWeight) ? `${formatWeightKg(product.fbaWeight)} kg · ${productWeightBandLabel(product.fbaWeight)}` : null],
@@ -8116,6 +8980,7 @@ import {
       return `<div><dt>${term}</dt><dd>${renderedValue}</dd></div>`;
     }).join("");
 
+    renderProductInformation(product);
     const sourceNote = byId("sellerSpriteSourceNote");
     if (sourceNote) {
       const mode = product.dataMode === "mock" ? "mock" : isProxyAnalysis(product) || product.supplierSource ? "mixed" : "live";
@@ -8448,13 +9313,13 @@ import {
     syncProfitEditorSaveButton(product);
     setCurrencyConversionOutput("editSalePriceCny", values.salePrice, product.marketplace);
     setCurrencyConversionOutput("editFbaFeeCny", values.fulfillmentFee, product.marketplace);
-    const calculation = isAnalysisReadOnly(product) ? calculateProfit(product) : calculateProfit(values);
+    const calculation = isAnalysisReadOnly(product) ? calculateProfit(product) : calculateProfit(values, product);
     syncDrawerApprovalButton(product, values, calculation);
     const profitResult = byId("drawerProfitMargin")?.closest(".profit-result");
     if (!calculation) {
       const estimate = estimateFbaForEditor(product, values.billingWeight, values.salePrice);
       byId("costBreakdown").innerHTML = estimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee
-        ? '<div class="fba-calculation-note"><strong>页面未提供重量 · 可初审</strong><p>FBA 配送费暂按最低档 ' + escapeHtml(formatCurrencyWithCnyText(estimate.fee, product.marketplace)) + ' 估算。头程及完整利润待补齐重量后计算。</p></div>'
+        ? '<div class="fba-calculation-note"><strong>实际重量未知 · 可初审</strong><p>FBA 配送费暂按最低档 ' + escapeHtml(formatCurrencyWithCnyText(estimate.fee, product.marketplace)) + ' 估算。补齐售价等其余参数后，利润按最低档假设重量暂估。</p></div>'
         : '<div class="fba-calculation-note">利润参数尚未齐全，可先完成候选初审。</div>';
       if (profitResult) profitResult.hidden = true;
       return;
@@ -8490,12 +9355,16 @@ import {
       : includedSupplierPrices.length
         ? `（${includedSupplierPrices.map(formatCny).join(" + ")}）÷ ${includedSupplierPrices.length} 家 = ${formatCny(values.purchaseUnitCostCny)}/件；${formatCny(values.purchaseUnitCostCny)} × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`
         : `${formatCny(values.purchaseUnitCostCny)}/件 × ${values.pieceCount} 件 = ${formatCny(calculation.purchaseCostCny)}`;
-    const fulfillmentFormula = isAu && estimate && !isManualFba
+    const fulfillmentFormula = estimate?.assumption === "missing_weight_minimum_fba_estimate" && !isManualFba
+      ? `最低信封档暂估 · ${estimate.tierLabel} · ${estimate.priceBandLabel || "美国 SOP 参考"} = ${formatCurrency(calculation.fulfillment, product.marketplace)} ${market.currency}${estimate.rateModel === "us_sop_nominal_proxy" ? "（美国 SOP 名义参考费，非本站官方费率）" : ""}`
+      : isAu && estimate && !isManualFba
       ? `${estimate.priceBandLabel} · ${estimate.tierLabel}${estimate.dimensionsAssumption ? "（尺寸待核验）" : ""} · ${estimate.billableWeightG}g（${estimate.weightBand}）= ${formatCurrency(calculation.fulfillment, product.marketplace)} AUD；${formatCurrency(calculation.fulfillment, product.marketplace)} AUD × 汇率 ${formatNumber(exchangeRate)} = ${formatCny(fulfillmentCny)}`
       : market.code === "CA" && estimate && !isManualFba
-        ? `（${formatCurrency(estimate.baseFee, product.marketplace)} − ${formatCurrency(estimate.discount, product.marketplace)}）×1.035 = ${formatCurrency(calculation.fulfillment, product.marketplace)} CAD（显示值；计算保留完整精度）`
+        ? `${estimate.weightSource || "实重"} · ${formatWeightKg(estimate.calculationWeightKg ?? estimate.actualWeightKg)} kg；（${formatCurrency(estimate.baseFee, product.marketplace)} − ${formatCurrency(estimate.discount, product.marketplace)}）×1.035 = ${formatCurrency(calculation.fulfillment, product.marketplace)} CAD（显示值；计算保留完整精度）`
       : `${formatCurrency(calculation.fulfillment, product.marketplace)} ${MARKET_CONFIGS[product.marketplace]?.currency || activeMarket.currency} × 汇率 ${formatNumber(exchangeRate)} = ${formatCny(fulfillmentCny)}`;
-    const airFreightFormula = calculation.airFreight.source === "product_weight"
+    const airFreightFormula = calculation.weightAssumption
+      ? `实际重量未知，最低档假设 ${formatNumber(calculation.assumedWeightKg * 1_000)} g；头程计费重 ${formatNumber(calculation.airFreight.chargeableWeightKg)} kg（${calculation.airFreight.source === "carton" ? "外箱重量 ÷ 装箱数" : calculation.airFreight.source === "minimum_envelope_assumption" ? "最低档假设" : "假设重量与体积重取高"}）× ${formatCny(calculation.rates.airFreightRateCnyPerKg)}/kg = ${formatCny(calculation.airFreight.airFreightCny)}；取得商品或包裹重量后重算`
+      : calculation.airFreight.source === "product_weight"
       ? `${formatNumber(calculation.airFreight.actualWeightKg * 1_000)} g × ${formatCny(calculation.airFreight.airFreightRateCnyPerGram)}/g = ${formatCny(calculation.airFreight.airFreightCny)}；${formatCny(calculation.airFreight.airFreightCny)} ÷ 汇率 ${formatNumber(exchangeRate)} = ${formatCurrency(calculation.parts.freight, product.marketplace)} ${MARKET_CONFIGS[product.marketplace]?.currency || activeMarket.currency}`
       : calculation.airFreight.source === "carton"
         ? `${formatNumber(calculation.airFreight.cartonWeightKg)} kg ÷ ${formatNumber(calculation.airFreight.unitsPerCarton)} 件 × ${formatCny(calculation.rates.airFreightRateCnyPerKg)}/kg`
@@ -8514,11 +9383,11 @@ import {
     const costRows = [
       { label: supplierCostLabel, formula: supplierFormula, amountCny: calculation.purchaseCostCny },
       { label: "采购税费", formula: `${formatCny(calculation.purchaseCostCny)} × ${formatNumber(calculation.rates.purchaseTaxRate)}% = ${formatCny(calculation.purchaseTaxCny)}`, amountCny: calculation.purchaseTaxCny },
-      { label: "国内运费 / 件", formula: `${formatNumber(calculation.domesticFreightWeightKg)} kg × ${formatCny(calculation.rates.domesticFreightRateCnyPerKg)}/kg = ${formatCny(calculation.domesticFreightCny)}；参考范围 ${formatCny(calculation.domesticFreightMinCny)}-${formatCny(calculation.domesticFreightMaxCny)}`, amountCny: calculation.domesticFreightCny },
+      { label: calculation.dimensionalWeightEstimateKg ? "国内运费 / 件（体积重暂估）" : calculation.weightAssumption ? "国内运费 / 件（最低档暂估）" : "国内运费 / 件", formula: `${calculation.weightAssumption ? "假设重量 " : ""}${formatNumber(calculation.domesticFreightWeightKg)} kg × ${formatCny(calculation.rates.domesticFreightRateCnyPerKg)}/kg = ${formatCny(calculation.domesticFreightCny)}；参考范围 ${formatCny(calculation.domesticFreightMinCny)}-${formatCny(calculation.domesticFreightMaxCny)}`, amountCny: calculation.domesticFreightCny },
       { label: "落地采购成本", formula: `${formatCny(calculation.purchaseCostCny)} + ${formatCny(calculation.purchaseTaxCny)} + ${formatCny(calculation.domesticFreightCny)} = ${formatCny(calculation.landedPurchaseCny)}`, amountCny: calculation.landedPurchaseCny, className: "is-subtotal" },
       { label: "Amazon 佣金", formula: percentageFormula(calculation.rates.commissionRate, commissionCny), amountCny: commissionCny },
       { label: isFbm ? "FBM 履约费（人工输入）" : `FBA 配送费（${isManualFba ? "人工输入" : automaticFbaLabel}）`, formula: fulfillmentFormula, amountCny: fulfillmentCny },
-      { label: calculation.airFreight.source === "product_weight" ? "空运头程（商品重量公式）" : `空运头程（${calculation.airFreight.source === "carton" ? "外箱公式" : "单件参数回退"}）`, formula: calculation.airFreight.source === "product_weight" ? airFreightFormula : `${airFreightFormula} = ${formatCny(calculation.airFreight.airFreightCny)}`, amountCny: calculation.airFreight.airFreightCny },
+      { label: calculation.weightAssumption ? "空运头程（最低档暂估）" : calculation.airFreight.source === "product_weight" ? `空运头程（${/包裹重量/.test(profitWeightSourceLabel(product)) ? "包裹重量" : "商品重量"}公式）` : `空运头程（${calculation.airFreight.source === "carton" ? "外箱公式" : "单件参数回退"}）`, formula: calculation.weightAssumption || calculation.airFreight.source === "product_weight" ? airFreightFormula : `${airFreightFormula} = ${formatCny(calculation.airFreight.airFreightCny)}`, amountCny: calculation.airFreight.airFreightCny },
       { label: "汇损预留", formula: percentageFormula(calculation.rates.fxLossRate, fxLossCny), amountCny: fxLossCny },
       { label: "Marketing", formula: percentageFormula(calculation.rates.marketingRate, marketingCny), amountCny: marketingCny },
       { label: "管理费", formula: percentageFormula(calculation.rates.managementRate, managementCny), amountCny: managementCny },
@@ -8537,19 +9406,22 @@ import {
       byId("costBreakdown").insertAdjacentHTML("afterbegin", `
         <div class="fba-calculation-note">
           <span><b>${market.code === "CA" ? "加拿大档位" : "美国档位"}</b>${escapeHtml(estimate.tierLabel)}</span>
-          <span><b>计费重量</b>${market.code === "CA" ? `${estimate.billableWeightG} g` : Number.isFinite(estimate.billableWeightLb) ? `${estimate.billableWeightLb.toFixed(2)} lb` : "--"}</span>
+          <span><b>计费重量</b>${estimate.assumption === "missing_weight_minimum_fba_estimate" ? "最低档假设 · 实际重量未知" : market.code === "CA" ? `${estimate.billableWeightG} g` : Number.isFinite(estimate.billableWeightLb) ? `${estimate.billableWeightLb.toFixed(2)} lb` : "--"}</span>
           <span><b>参数置信度</b>${escapeHtml(estimate.confidence)}</span>
           <small>仅按${escapeHtml(estimate.weightSource)} · ${escapeHtml(fbaPolicyDetail(MARKET_CONFIGS[product.marketplace] || activeMarket))}${isManualFba ? ` · 自动值 ${escapeHtml(formatCurrencyWithCnyText(estimate.fee, product.marketplace))}` : ""}</small>
         </div>`);
     }
     byId("drawerProfitMargin").textContent = formatPercent(calculation.margin);
     byId("drawerProfitMargin").className = marginClass(calculation.margin);
-    byId("drawerProfitValue").innerHTML = `${cnyCurrencyPairHtml(profitCny, product.marketplace, { suffix: " / 件", compact: true })}${calculation.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : ""}<small class="profit-formula">经营利润率 =（${escapeHtml(formatCny(salePriceCny))} - ${escapeHtml(formatCny(totalCostCny))}）÷ ${escapeHtml(formatCny(salePriceCny))} × 100% = ${escapeHtml(formatPercent(calculation.margin))}</small>`;
+    byId("drawerProfitValue").innerHTML = `${cnyCurrencyPairHtml(profitCny, product.marketplace, { suffix: " / 件", compact: true })}${calculation.dimensionalWeightEstimateKg ? "<small>体积重暂估 · 实际重量未知</small>" : calculation.weightAssumption ? "<small>最低档暂估 · 实际重量未知</small>" : ""}${calculation.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : ""}<small class="profit-formula">经营利润率 =（${escapeHtml(formatCny(salePriceCny))} - ${escapeHtml(formatCny(totalCostCny))}）÷ ${escapeHtml(formatCny(salePriceCny))} × 100% = ${escapeHtml(formatPercent(calculation.margin))}</small>`;
   }
 
-  function preliminaryReviewBlockingReason(product, weightKg = fbaEstimationWeightKg(product)) {
-    if (product?.dataMode !== "mock" && !hasQualifyingMonthlySales(product)) return "需取得当前商品同站点的有效月销量（至少 50），才可初审；未知销量不能视为不达标。";
-    if (!(Number.isFinite(weightKg) && weightKg > 0) && !isAmazonWeightUnavailable(product)) return "重量尚未核验；请完成商品详情采集。页面确认未提供重量后可按最低 FBA 配送费估算并初审。";
+  function preliminaryReviewBlockingReason(product, weightKg = fbaEstimationWeightKg(product), mode = product?.fulfillmentMode) {
+    if (isMonthlySalesFilterRequired(currentTaskInputMode(), activeRunCriteria.monthlySalesBand) && product?.dataMode !== "mock" && !hasQualifyingMonthlySales(product)) return "需取得当前商品同站点的有效月销量（至少 50），才可初审；未知销量不能视为不达标。";
+    const assumption = applyMissingWeightProfitAssumption({ actualWeightKg: weightKg, fulfillmentMode: mode }, product?.marketplace || activeMarket.code, product);
+    // Initial review remains separate from a complete profit estimate.
+    if (weightKg == null && normalizeFulfillmentMode(mode) === "FBA" && !hasInvalidProductWeight(product)) return "";
+    if (!(Number.isFinite(weightKg) && weightKg > 0) && !assumption.weightAssumption && !assumption.dimensionalWeightEstimateKg) return "重量尚未核验；请完成商品详情采集或填写真实重量。";
     return "";
   }
 
@@ -8562,7 +9434,7 @@ import {
     }
     if (values.pieceCount === null) return "标题件数必须是 1-10000 的整数。";
     // Saving a draft is independent of eligibility for initial review and complete profit.
-    return preliminaryReview ? preliminaryReviewBlockingReason(product, values.billingWeight) : "";
+    return preliminaryReview ? preliminaryReviewBlockingReason(product, values.billingWeight, values.fulfillmentMode) : "";
   }
 
   function syncDrawerApprovalButton(product, values, calculation) {
@@ -8843,6 +9715,7 @@ import {
   }
 
   function fbaEstimationWeightKg(product) {
+    if (usesItemWeightOnly(product)) return resolveManualWeightOverride(product)?.weightKg ?? automaticProfitWeightKg(product);
     const candidate = product?.manualProfitInputs
       ? product.billingWeight
       : product?.productWeight ?? product?.billingWeight;
@@ -8888,6 +9761,7 @@ import {
     if (product.fulfillmentMode === "FBM") return product.manualFbmFee ? "人工输入" : "未填写";
     if (product.fulfillmentMode === "FBA") {
       if (product.manualFbaFee) return "人工输入";
+      if (product.fbaEstimate?.overweightCapped) return `FBA 超重封顶估算 · ${product.fbaEstimate.priceBandLabel}`;
       const market = MARKET_CONFIGS[product.marketplace] || activeMarket;
       if (market.code === "AU" && product.fbaEstimate) return `澳洲标准信封 · ${product.fbaEstimate.priceBandLabel}`;
       if (market.code === "CA" && product.fbaEstimate) return `加拿大旺季信封 · ${product.fbaEstimate.priceBandLabel} · 含3.5%附加费`;
@@ -8906,8 +9780,9 @@ import {
     if (product.fulfillmentMode === "FBM") return "FBM 履约费 · 人工输入";
     if (product.fulfillmentMode === "FBA") {
       if (product.manualFbaFee) return "FBA 配送费 · 人工输入";
+      if (product.fbaEstimate?.overweightCapped) return "FBA 超重封顶估算 · 头程按实际重量";
       const market = MARKET_CONFIGS[product.marketplace] || activeMarket;
-      if (isAssumedFba(product) && market.code !== "AU") return "按 FBA 假设估算 · 商品重量";
+      if (isAssumedFba(product) && market.code !== "AU") return `按 FBA 假设估算 · ${/包裹重量/.test(profitWeightSourceLabel(product)) ? "包裹重量" : "商品重量"}`;
       return fbaPolicyShortLabel(market);
     }
     return "履约方式待补";
@@ -8918,6 +9793,7 @@ import {
     if (product.fulfillmentMode === "FBM") return "FBM 履约费为人工输入，不套用美国 FBA 费率档位";
     if (product.fulfillmentMode === "FBA") {
       if (product.manualFbaFee) return "FBA 配送费为产品人工输入值";
+      if (product.fbaEstimate?.overweightCapped) return `FBA 配送费按 ${product.fbaEstimate.weightCapG} g 最高档封顶估算；商品实际重量 ${product.fbaEstimate.actualWeightKg} kg 保留，国内运费与空运头程仍按实际重量计算。此估费不代表实际配送费或信封尺寸合规。`;
       if (isAssumedFba(product)) return `Amazon / SellerSprite 未返回履约方式；${fbaPolicyDetail(MARKET_CONFIGS[product.marketplace] || activeMarket)}`;
       return fbaPolicyDetail(MARKET_CONFIGS[product.marketplace] || activeMarket);
     }
@@ -8930,13 +9806,8 @@ import {
     const existing = product.profitInputs && typeof product.profitInputs === "object" ? product.profitInputs : {};
     const packageDimensions = parseDimensionsCm(product.fbaDimensions);
     const productDimensions = parseDimensionsCm(product.productDimensions);
-    const existingDimensions = Array.isArray(existing.dimensionsCm) && existing.dimensionsCm.length >= 3
-      ? existing.dimensionsCm.slice(0, 3).map(finiteOrNull)
-      : null;
-    const dimensionsCm = existingDimensions?.every((value) => value !== null && value > 0)
-      ? existingDimensions
-      : packageDimensions || productDimensions;
-    const automaticWeight = [product.productWeight, product.billingWeight]
+    const dimensionsCm = resolveProductDimensionsCm(product);
+    const automaticWeight = usesItemWeightOnly(product) ? automaticProfitWeightKg(product) : [product.productWeight, product.billingWeight]
       .map(finiteOrNull)
       .find((value) => value !== null && value > 0) ?? null;
     const formulaChanged = existing.formulaVersion !== PROFIT_FORMULA_VERSION;
@@ -8948,11 +9819,15 @@ import {
       "profit-workbook-au-2026-smallest-envelope-fba-v7",
       "profit-workbook-au-weight-only-fba-v8",
       "profit-workbook-au-weight-only-fba-v9",
+      "profit-workbook-au-ca-envelope-fba-v10",
+      "profit-workbook-au-ca-envelope-capped-fba-v11",
     ].includes(existing.formulaVersion);
     const previousVersionHasOnlyFbaMigration = [
       "profit-workbook-au-2026-weight-fba-rates-v6",
       "profit-workbook-au-2026-smallest-envelope-fba-v7",
       "profit-workbook-au-weight-only-fba-v9",
+      "profit-workbook-au-ca-envelope-fba-v10",
+      "profit-workbook-au-ca-envelope-capped-fba-v11",
     ].includes(existing.formulaVersion);
     const marketplace = String(product.marketplace || activeMarket.code).toUpperCase();
     const rateKeys = ["exchangeRate", "commissionRate", "fxLossRate", "marketingRate", "managementRate", "returnsRate", "purchaseTaxRate", "domesticFreightRateCnyPerKg", "airFreightRateCnyPerKg", "volumetricDivisor"];
@@ -8993,17 +9868,23 @@ import {
     const manualWeight = resolveManualWeightOverride(product);
     resolved.actualWeightKg = manualWeight
       ? manualWeight.weightKg
-      : automaticWeight ?? existingWeightKg;
+      : usesItemWeightOnly(product) ? automaticWeight : automaticWeight ?? existingWeightKg;
+    if (resolved.actualWeightKg === null && hasInvalidProductWeight({ actualWeightKg: existing.actualWeightKg })) resolved.actualWeightKg = existing.actualWeightKg;
     resolved.dimensionsCm = dimensionsCm;
     resolved.dimensionSource = existing.dimensionSource || (packageDimensions ? "SellerSprite FBA 包装参数" : productDimensions ? "SellerSprite 商品参数回退" : "参数缺失");
     resolved.weightSource = manualWeight
       ? manualWeight.source
       : automaticWeight !== null
         ? product.weightSource || "商品重量"
-        : existing.weightSource || "商品重量缺失";
+        : usesItemWeightOnly(product) ? "Item Weight 尚未采集" : existing.weightSource || "商品重量缺失";
     resolved.cartonWeightKg = finiteOrNull(existing.cartonWeightKg);
     resolved.unitsPerCarton = finiteOrNull(existing.unitsPerCarton);
     resolved.updatedAt ||= product.collectedAt || new Date().toISOString();
+    const weightPolicy = applyMissingWeightProfitAssumption({ ...resolved, fulfillmentMode: product.fulfillmentMode }, marketplace, product);
+    for (const key of ["assumedWeightKg", "weightAssumption", "weightAssumptionMarket"]) {
+      if (weightPolicy[key] !== undefined) resolved[key] = weightPolicy[key];
+      else delete resolved[key];
+    }
     product.profitInputs = resolved;
     return resolved;
   }
@@ -9041,12 +9922,14 @@ import {
     const reasons = [];
     if (!Number.isFinite(product.salePrice) || product.salePrice <= 0) reasons.push('售价');
     if (product.purchaseCost != null && product.purchaseCost !== '' && (!Number.isFinite(product.purchaseCost) || product.purchaseCost < 0)) reasons.push('有效采购成本');
-    const weight = finiteOrNull((product.manualProfitInputs ? inputs.actualWeightKg ?? product.billingWeight : null)
+    const weight = usesItemWeightOnly(product) ? resolveManualWeightOverride(product)?.weightKg ?? automaticProfitWeightKg(product)
+      : finiteOrNull((product.manualProfitInputs ? inputs.actualWeightKg ?? product.billingWeight : null)
       ?? product.actualWeightKg
       ?? (inputs.airFreightActualWeightOnly ? product.productWeight : product.billingWeight)
       ?? inputs.actualWeightKg ?? product.billingWeight);
-    if (weight === null || weight <= 0) reasons.push('商品重量');
     const mode = normalizeFulfillmentMode(product.fulfillmentMode);
+    const weightAssumption = applyMissingWeightProfitAssumption({ actualWeightKg: weight, fulfillmentMode: mode }, product.marketplace || activeMarket.code, product);
+    if ((weight === null || weight <= 0) && !weightAssumption.weightAssumption && !weightAssumption.dimensionalWeightEstimateKg) reasons.push('商品重量或包裹重量');
     if (!mode) reasons.push('履约方式');
     const fee = product.fulfillmentFee ?? (mode === 'FBM' ? product.fbmFee : mode === 'FBA' ? product.fbaFee : null);
     if (!Number.isFinite(fee) || fee < 0) reasons.push(mode === 'FBA' ? 'FBA 配送费' : '配送费');
@@ -9054,23 +9937,22 @@ import {
     return reasons;
   }
 
-  function calculateProfit(subject = {}) {
+  function calculateProfit(subject = {}, weightSourceProduct = subject) {
     if (isAnalysisReadOnly(subject) && subject.profitCalculation) return subject.profitCalculation;
     const inputs = subject.profitInputs && typeof subject.profitInputs === "object"
       ? ensureProductProfitInputs(subject)
       : { ...getDefaultProfitInputs(subject.marketplace || activeMarket.code), ...(subject.resolvedProfitInputs || {}) };
     const mode = normalizeFulfillmentMode(subject.fulfillmentMode);
     const selectedFulfillmentFee = subject.fulfillmentFee ?? (mode === "FBM" ? subject.fbmFee : mode === "FBA" ? subject.fbaFee : null);
-    const dimensionsCm = Array.isArray(subject.dimensionsCm)
-      ? subject.dimensionsCm
-      : inputs.dimensionsCm || parseDimensionsCm(subject.fbaDimensions) || parseDimensionsCm(subject.productDimensions);
-    const actualWeightKg = finiteOrNull((subject.manualProfitInputs ? inputs.actualWeightKg ?? subject.billingWeight : null)
+    const dimensionsCm = resolveProductDimensionsCm(subject);
+    const actualWeightKg = usesItemWeightOnly(subject) ? resolveManualWeightOverride(subject)?.weightKg ?? automaticProfitWeightKg(subject)
+      : finiteOrNull((subject.manualProfitInputs ? inputs.actualWeightKg ?? subject.billingWeight : null)
       ?? subject.actualWeightKg
       ?? (inputs.airFreightActualWeightOnly ? subject.productWeight : subject.billingWeight)
       ?? inputs.actualWeightKg
       ?? subject.billingWeight);
     const purchaseCostAssumedZero = subject.purchaseCost == null || subject.purchaseCost === '';
-    const calculation = calculateProductProfit({
+    const calculation = calculateProductProfit(applyMissingWeightProfitAssumption({
       ...inputs,
       salePrice: subject.salePrice,
       purchaseCostCny: purchaseCostAssumedZero ? 0 : subject.purchaseCost,
@@ -9080,7 +9962,7 @@ import {
       dimensionsCm,
       cartonWeightKg: subject.cartonWeightKg ?? inputs.cartonWeightKg,
       unitsPerCarton: subject.unitsPerCarton ?? inputs.unitsPerCarton,
-    });
+    }, subject.marketplace || activeMarket.code, weightSourceProduct));
     return calculation ? { ...calculation, purchaseCostAssumedZero } : null;
   }
 
@@ -9097,7 +9979,7 @@ import {
     if (product.fulfillmentMode !== "FBA") return;
     const market = MARKET_CONFIGS[String(product.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     if (product.manualFbaFee) {
-      if (market.code === "AU" || market.code === "CA") product.fbaEstimate = estimateWeightOnlyFbaFee(product);
+      product.fbaEstimate = estimateWeightOnlyFbaFee(product);
       return;
     }
     const estimate = estimateWeightOnlyFbaFee(product);
@@ -9116,6 +9998,7 @@ import {
 
   function estimateFbaForEditor(product, weightKg, salePrice = product.salePrice) {
     if (normalizeFulfillmentMode(product.fulfillmentMode) === "FBM") return null;
+    if (weightKg === null && hasInvalidProductWeight(product)) return null;
     const sameWeight = product.billingWeight === weightKg || (Number.isFinite(product.billingWeight) && Number.isFinite(weightKg) && Math.abs(product.billingWeight - weightKg) < 0.0001);
     return estimateWeightOnlyFbaFee({
       ...product,
@@ -9123,24 +10006,21 @@ import {
       billingWeight: weightKg,
       salePrice,
       weightSource: sameWeight ? product.weightSource : "产品手工覆盖",
+      profitInputs: { ...product.profitInputs, actualWeightKg: weightKg,
+        weightSource: sameWeight ? product.profitInputs?.weightSource : "product_manual" },
     });
   }
 
   function estimateWeightOnlyFbaFee(product) {
     const market = MARKET_CONFIGS[String(product?.marketplace || activeMarket.code).toUpperCase()] || activeMarket;
     const weightKg = fbaEstimationWeightKg(product);
-    const dimensionsCm = product.profitInputs?.dimensionsCm || product.dimensionsCm
-      || parseDimensionsCm(product.fbaDimensions) || parseDimensionsCm(product.productDimensions);
-    if (weightKg === null) return isAmazonWeightUnavailable(product)
-      ? estimateMinimumFbaFee({ marketplace: market.code, salePrice: product.salePrice, dimensionsCm }) : null;
-    const weightSource = product.weightSource || "商品重量";
+    const dimensionsCm = resolveProductDimensionsCm(product);
     if (market.code === "AU" || market.code === "CA") {
-      const estimate = market.code === "AU"
-        ? estimateAu2026FbaFeeByProductWeight({ actualWeightKg: weightKg, itemPriceAud: product.salePrice,
-            envelopeSizePolicy: AU_FBA_ENVELOPE_SIZE_POLICY, dimensionsCm })
-        : estimateCa2026FbaFeeByProductWeight({ actualWeightKg: weightKg, itemPriceCad: product.salePrice });
-      return estimate ? { ...estimate, weightSource } : null;
+      return estimateFbaByAvailableSpecifications(product, { marketplace: market.code, actualWeightKg: weightKg, dimensionsCm });
     }
+    if (weightKg === null) return hasInvalidProductWeight(product) ? null
+      : estimateMinimumFbaFee({ marketplace: product?.marketplace || activeMarket.code, salePrice: product.salePrice, dimensionsCm });
+    const weightSource = product.weightSource || "商品重量";
     const estimate = estimateUs2023FbaFeeByProductWeight({
       actualWeightKg: weightKg,
       standardSizePolicy: FBA_WEIGHT_STANDARD_SIZE_POLICY,
@@ -9156,11 +10036,7 @@ import {
   }
 
   function parseDimensionsCm(value) {
-    if (!value || value === "未知") return null;
-    const matches = String(value).match(/\d+(?:\.\d+)?/g);
-    if (!matches || matches.length < 3) return null;
-    const dimensions = matches.slice(0, 3).map(Number);
-    return dimensions.every((number) => Number.isFinite(number) && number > 0) ? dimensions : null;
+    return parseProductDimensionsCm(value);
   }
 
   function buildDemoSuppliers(product) {
@@ -9311,8 +10187,8 @@ import {
         <div class="history-time"><strong>${escapeHtml(dateLabel)}</strong><span>${escapeHtml(timeLabel)}</span></div>
         <div class="history-main">
           <span class="status-label" data-state="${escapeHtml(statusState)}">${escapeHtml(statusLabel)}</span>
-          <h2>${escapeHtml(market.nameZh)}竞品店铺 · ${summary.productCount} 个候选</h2>
-          <p>${summary.storeCount} 个店铺 · ${summary.completeCount} 个数据完整 · ${summary.approvedCount} 个初审通过 · <b title="${escapeHtml(callTitle)}">SellerSprite ${summary.sellerSpriteCalls} 次</b></p>
+          <h2>${escapeHtml(market.nameZh)}${summary.inputMode === "asins" ? " ASIN 批次" : "竞品店铺"} · ${summary.productCount} 个候选</h2>
+          <p>${summary.inputMode === "asins" ? `${summary.importedAsinCount ?? summary.productCount} 个导入 ASIN` : `${summary.storeCount} 个店铺`} · ${summary.completeCount} 个数据完整 · ${summary.approvedCount} 个初审通过 · <b title="${escapeHtml(callTitle)}">SellerSprite ${summary.sellerSpriteCalls} 次</b></p>
         </div>
         <div class="history-actions">
           <button class="history-action" type="button"${canOpen ? ` data-history-run-id="${escapeHtml(summary.id)}"` : " disabled"} aria-label="${canOpen ? `查看该任务的 ${summary.productCount} 个候选商品` : "任务快照尚未完成"}" title="${canOpen ? "查看结果" : "任务快照尚未完成"}"><i data-lucide="arrow-up-right" aria-hidden="true"></i><span>查看结果</span></button>
@@ -9329,10 +10205,21 @@ import {
     return [batchId, productId].filter(Boolean).join(":");
   }
 
-  function setExportActionsDisabled(disabled) {
-    [byId("exportAllCandidatesButton"), byId("exportApprovedProductsButton"), byId("exportAnalysisHandoffButton")]
-      .filter(Boolean)
-      .forEach((button) => { button.disabled = Boolean(disabled || isCollectionWriteLocked()); });
+  function setExportActionsDisabled(disabled, candidates) {
+    const locked = Boolean(disabled || isCollectionWriteLocked());
+    if (locked) {
+      for (const id of ["exportAllCandidatesButton", "exportApprovedProductsButton", "exportAnalysisHandoffButton"]) {
+        const button = byId(id);
+        if (button) button.disabled = true;
+      }
+      return;
+    }
+    candidates ??= getFilteredProducts();
+    const approved = getExportProducts("approved", candidates);
+    for (const [id, rows] of [["exportAllCandidatesButton", candidates], ["exportApprovedProductsButton", approved], ["exportAnalysisHandoffButton", approved]]) {
+      const button = byId(id);
+      if (button) button.disabled = locked || rows.length === 0;
+    }
   }
 
   async function requestSpreadsheetExport(payload) {
@@ -9466,14 +10353,14 @@ import {
       return copy;
     });
     const coverage = buildCurrentAnalysisCoverage();
-    return { runState: { ...runState, analysisCoverage: coverage }, products: prepared, criteria };
+    return { runState: { ...runState, inputMode: currentTaskInputMode(), analysisCoverage: coverage }, products: prepared, criteria };
   }
 
   function buildCurrentAnalysisCoverage() {
     const sourceTimes = [runState.startedAt, ...products.map((product) => product.collectedAt), ...(runState.storeVisits || []).flatMap((visit) => [visit.collectedAt, visit.coverageEvidence?.collectedAt, ...(visit.pageAudit || []).map((page) => page.collectedAt)])]
       .map((value) => Date.parse(value || "")).filter(Number.isFinite);
     const snapshotAt = sourceTimes.length ? new Date(sourceTimes.reduce((latest, time) => Math.max(latest, time), 0)).toISOString() : null;
-    const coverage = summarizeAnalysisCoverage({ stores: storeList?.stores || [], storeVisits: runState.storeVisits || [], products, marketplace: runState.marketplace, createdAt: snapshotAt });
+    const coverage = summarizeAnalysisCoverage({ stores: storeList?.stores || [], storeVisits: runState.storeVisits || [], products, inputMode: currentTaskInputMode(), marketplace: runState.marketplace, createdAt: snapshotAt });
     runState.analysisCoverage = coverage;
     return coverage;
   }
@@ -9489,17 +10376,19 @@ import {
     return notes;
   }
 
-  function renderAnalysisHandoffSummary() {
+  function renderAnalysisHandoffSummary(candidates = getFilteredProducts()) {
     if (!byId("analysisStageSummary")) return;
     const coverage = buildCurrentAnalysisCoverage();
     const counts = coverage.counts;
     setText("analysisCoverageStatus", coverage.status === "not_started" ? "尚未采集" : coverage.status === "visible_scope_complete" ? "可见范围已采集" : "部分完成");
-    setText("analysisCoverageDetail", `店铺 ${counts.visited_stores}/${counts.requested_stores} · 已访问 ${counts.pages_visited} 页 · 详情成功 ${coverage.detail_counts.success}/${products.length}${counts.known_missing_asins ? ` · 逐店待枚举约 ${counts.known_missing_asins} 个` : ""}。Amazon 可见结果和全部变体范围不同，当前不声明全店全部采集完成。`);
+    setText("analysisCoverageDetail", isAsinImport()
+      ? `导入 ${importedItemCount()} 个 ASIN · 已纳入 ${products.length} 个 · 详情成功 ${coverage.detail_counts.success}/${products.length}。按导入清单采集，未枚举店铺或自动扩展商品范围。`
+      : `店铺 ${counts.visited_stores}/${counts.requested_stores} · 已访问 ${counts.pages_visited} 页 · 详情成功 ${coverage.detail_counts.success}/${products.length}${counts.known_missing_asins ? ` · 逐店待枚举约 ${counts.known_missing_asins} 个` : ""}。Amazon 可见结果和全部变体范围不同，当前不声明全店全部采集完成。`);
     const button = byId("exportAnalysisHandoffButton");
     if (button) {
-      const reviewed = products.filter((product) => product.reviewStatus === "approved" && hasQualifyingMonthlySales(product));
+      const reviewed = getExportProducts("approved", candidates);
       const updating = reviewed.some((product) => product.supplierSearchStatus === "searching");
-      const disabledReason = isCollectionWriteLocked() ? "后台采集完成后可编辑、初审和导出。" : exportRunning ? "导出正在保存，请等待完成。" : analysisVersionPendingIds.size ? "新的分析版本正在保存，请等待完成。" : !runState.id ? "请先导入店铺并开始分析任务。" : runState.mode === "mock" ? "演示数据仅用于体验，不能导出采购交接资料。" : !reviewed.length ? "请先人工初审通过需要导出的商品。" : updating ? "已初审商品的报价正在更新，结束后即可导出。" : "";
+      const disabledReason = isCollectionWriteLocked() ? "后台采集完成后可编辑、初审和导出。" : exportRunning ? "导出正在保存，请等待完成。" : analysisVersionPendingIds.size ? "新的分析版本正在保存，请等待完成。" : !runState.id ? "请先导入店铺或 ASIN 并开始分析任务。" : runState.mode === "mock" ? "演示数据仅用于体验，不能导出采购交接资料。" : !reviewed.length ? "请先人工初审通过需要导出的商品。" : updating ? "已初审商品的报价正在更新，结束后即可导出。" : "";
       button.disabled = Boolean(disabledReason);
       button.title = disabledReason || "可选：仅将您已人工初审的商品保存为Excel及JSON；资料缺项保留并标记草稿。";
       setText("analysisExportAvailability", disabledReason || "可选协同仅使用已人工初审范围，资料缺项会保留并标记草稿。");
@@ -9521,8 +10410,8 @@ import {
     }
     const exportRunId = runState.id;
     const market = MARKET_CONFIGS[runState.marketplace];
-    const exportRows = products.filter((product) => product.reviewStatus === "approved" && hasQualifyingMonthlySales(product));
-    if (!exportRows.length) { showToast("暂无具备 Amazon 50+ 月购买量证据且已初审通过的商品。", "info", 4800); return; }
+    const exportRows = getExportProducts("approved");
+    if (!exportRows.length) { showToast(isMonthlySalesFilterRequired(currentTaskInputMode(), activeRunCriteria.monthlySalesBand) ? "暂无具备有效月销量至少 50 且已初审通过的商品。" : "暂无已初审通过的商品。", "info", 4800); return; }
     if (!market || exportRows.some((product) => product.marketplace !== market.code)) { showToast("已初审商品存在站点不一致，未导出。", "error", 4800); return; }
     if (exportRows.some((product) => product.supplierSearchStatus === "searching")) { showToast("已初审商品的报价正在更新，结束后即可导出。", "info", 4800); return; }
     // Freeze the user's manual selection once; workbook and JSON share this same snapshot.
@@ -9573,9 +10462,7 @@ import {
       return;
     }
     const exportScope = scope === "all" ? "all" : "approved";
-    const exportRows = exportScope === "all"
-      ? products.filter(hasQualifyingMonthlySales)
-      : products.filter((product) => product.reviewStatus === "approved" && hasQualifyingMonthlySales(product));
+    const exportRows = getExportProducts(exportScope);
     if (!exportRows.length) {
       showToast(
         exportScope === "all" ? "当前任务暂无候选产品。" : "暂无已初审通过的产品，请先完成产品初审。",
@@ -9589,7 +10476,7 @@ import {
       showToast("检测到跨站商品，已阻止导出。请重新运行当前站点任务。", "error", 5200);
       return;
     }
-    const exportLabel = exportScope === "all" ? "全部候选产品" : "已初审产品";
+    const exportLabel = exportScope === "all" ? "当前筛选候选产品" : "当前筛选已初审产品";
     exportRunning = true;
     setExportActionsDisabled(true);
     showToast(`正在生成 ${exportRows.length} 个商品的 Excel，并保存到 ${EXPORT_DIRECTORY_LABEL}…`, "info", 15 * 60_000);
@@ -9706,10 +10593,11 @@ import {
     if (!product.firstFba) add("首次 FBA 有货", sellerSpriteReason);
     if (!product.listingAvailableAt) add("SellerSprite 上架日期", sellerSpriteReason);
 
-    const hasProductWeight = hasNumber(product.productWeight) && product.productWeight > 0;
+    const effectiveWeight = usesItemWeightOnly(product) ? productWeightKgForDisplay(product) : null;
+    const hasProductWeight = usesItemWeightOnly(product) ? effectiveWeight > 0 : hasNumber(product.productWeight) && product.productWeight > 0;
     const hasFbaWeight = hasNumber(product.fbaWeight) && product.fbaWeight > 0;
-    const hasBillingWeight = hasNumber(product.billingWeight) && product.billingWeight > 0;
-    if (!hasProductWeight && !hasFbaWeight && !hasBillingWeight) add("商品重量", amazonReason, { blocking: true });
+    const hasBillingWeight = usesItemWeightOnly(product) ? effectiveWeight > 0 : hasNumber(product.billingWeight) && product.billingWeight > 0;
+    if (usesItemWeightOnly(product) ? !hasProductWeight : !hasProductWeight && !hasFbaWeight && !hasBillingWeight) add("商品重量", amazonReason, { blocking: !hasAnyProductShippingSpecification(product) });
     if (!product.productDimensions) add("商品参数", amazonReason);
     if (!product.fbaDimensions) add("FBA 包装参数", product.fbaEstimate ? (isAu ? "未获取；按用户指定标准信封暂估，尺寸待核验" : "未获取，已用商品重量代理") : sellerSpriteReason);
     if (!hasFbaWeight && product.fulfillmentMode === "FBA") {
@@ -9721,11 +10609,11 @@ import {
     }
     const fulfillmentMode = normalizeFulfillmentMode(product.fulfillmentMode);
     if (!fulfillmentMode) add("履约方式", "Amazon / SellerSprite 未返回且未人工选择", { blocking: true });
-    if (fulfillmentMode === "FBA" && !hasNumber(product.fbaFee)) add("FBA 配送费", isAu ? "请补齐售价、重量，或核实是否超出标准信封范围（≤475g、≤33×23×2.5cm）" : product.marketplace === "CA" ? "请补齐售价、重量，或核实是否超出加拿大旺季信封500g上限" : "无法根据有效商品重量套用 FBA SOP", { blocking: true });
+    if (fulfillmentMode === "FBA" && !hasNumber(product.fbaFee)) add("FBA 配送费", isAu ? "请补齐售价和重量，或核实尺寸是否超出标准信封范围（≤33×23×2.5cm）；超重已按最高重量档估费" : product.marketplace === "CA" ? "请补齐售价和重量；超过500g已按加拿大旺季信封最高重量档估费" : "无法根据有效商品重量套用 FBA SOP", { blocking: true });
     if (fulfillmentMode === "FBM" && !hasNumber(product.fbmFee)) add("FBM 履约费", "未人工填写", { blocking: true });
 
     const profitInputs = product.profitInputs && typeof product.profitInputs === "object" ? product.profitInputs : {};
-    if (!hasNumber(profitInputs.actualWeightKg) && !hasBillingWeight) add("利润实际重", "未获取", { blocking: true });
+    if (usesItemWeightOnly(product) ? !hasBillingWeight : !hasNumber(profitInputs.actualWeightKg) && !hasBillingWeight) add("利润实际重", "未获取", { blocking: true });
     if (profitInputs.airFreightActualWeightOnly !== true) {
       if (!hasNumber(profitInputs.cartonWeightKg) || profitInputs.cartonWeightKg <= 0) add("外箱重量", "未填写，头程将使用单件参数回退");
       if (!hasNumber(profitInputs.unitsPerCarton) || profitInputs.unitsPerCarton <= 0) add("装箱数", "未填写，头程将使用单件参数回退");
@@ -9735,57 +10623,57 @@ import {
     return [...missing.values()];
   }
 
+  function spreadsheetListingDate(product) {
+    const date = product.amazonFirstAvailableDateStatus === "found"
+      ? normalizeISODateOnly(product.amazonFirstAvailableDate) : null;
+    if (!date) return "";
+    // Excel stores calendar dates as numbers, independent of the user's timezone.
+    const parsed = new Date(`${date}T00:00:00.000Z`);
+    const serial = (parsed.getTime() - Date.UTC(1899, 11, 30)) / 86400000;
+    return serial > 0 ? serial - (date < "1900-03-01" ? 1 : 0) : "";
+  }
+
   function createSpreadsheetExportPayload(rows, exportMarket, worksheetName = "运营确认表") {
     const headers = [
-      "任务 ID", "商品 ID", "竞品图片", "源 ASIN", "父 ASIN", "商品名称", "英文标题", "Amazon 标题识别件数", "生效采购件数",
-      `竞品当前售价 (${exportMarket.currency})`, "竞品当前售价 (CNY)", `我们的售价 (${exportMarket.currency})`, "我们的售价 (CNY)",
-      "评分", "评价数", "竞品 30 天销量", "竞品 60 天销量",
-      "商品重量 (kg)", "FBA 包装重量 (kg)", "FBA 计费输入 (kg)",
-      "整套采购成本 (CNY)", "采购税率 (%)", "采购税费 (CNY)", "国内运费费率 (CNY/kg)", "国内运费计费重量 (kg)", "国内运费参考下限 (CNY)", "国内运费参考上限 (CNY)", "国内运费/件 (CNY)", "落地采购成本 (CNY)",
-      "履约方式", `FBA 配送费 (${exportMarket.currency})`, "FBA 配送费 (CNY)", `FBM 履约费 (${exportMarket.currency})`, "FBM 履约费 (CNY)", `计入履约费 (${exportMarket.currency})`, "计入履约费 (CNY)",
-      "利润实际重 (kg)", "体积重 (kg)", "空运计费重 (kg)", "外箱重量 (kg)", "装箱数", "空运单价 (CNY/kg)", "单件空运头程 (CNY)",
+      "商品 ID", "竞品图片", "源 ASIN", "商品名称", "生效采购件数",
+      `竞品当前售价 (${exportMarket.currency})`, "竞品当前售价 (CNY)",
+      `我们的售价 (${exportMarket.currency})`, "我们的售价 (CNY)",
+      "评分", "评价数", "竞品 30 天销量", "利润计算重量 (kg)", "商品上架时间",
+      "整套采购成本 (CNY)", "采购税率 (%)", "采购税费 (CNY)", "落地采购成本 (CNY)",
+      "履约方式", `FBA 配送费 (${exportMarket.currency})`, "FBA 配送费 (CNY)",
+      "空运单价 (CNY/kg)", "单件空运头程 (CNY)",
       "Amazon 佣金率 (%)", "汇损率 (%)", "营销费率 (%)", "管理费率 (%)", "退货预留率 (%)",
-      `预估总成本 (${exportMarket.currency})`, "预估总成本 (CNY)", `预估单件利润 (${exportMarket.currency})`, "预估单件利润 (CNY)", "预估经营利润率 (%)", "利润分析必需数据完整", "利润分析必需缺失字段",
-      "数据采集时间",
+      `预估总成本 (${exportMarket.currency})`, "预估总成本 (CNY)",
+      `预估单件利润 (${exportMarket.currency})`, "预估单件利润 (CNY)",
+      "预估经营利润率 (%)", "数据采集时间", "重量来源",
     ];
     const dataRows = rows.map((product) => {
       const purchasePricing = ensureProductPurchasePricing(product);
       const calculation = calculateProfit(product);
       const profitInputs = ensureProductProfitInputs(product);
       ensureFulfillmentState(product);
-      const isFbm = product.fulfillmentMode === "FBM";
       const isFba = product.fulfillmentMode === "FBA";
-      const activeFee = getFulfillmentFee(product);
       return [
-        exportTaskIdForProduct(product), product.id || "", "",
-        product.sourceAsin || product.asin, product.parentAsin || "",
-        product.name, product.englishName, product.detectedPieceCount ?? 1, purchasePricing.pieceCount,
-        product.currentPrice, convertCurrencyToCny(product.currentPrice, exportMarket) ?? "",
-        product.salePrice, convertCurrencyToCny(product.salePrice, exportMarket) ?? "",
-        product.rating, product.reviews, product.sales30 ?? "", product.sales60 ?? "",
-        product.productWeight ?? "", product.fbaWeight ?? "", product.billingWeight ?? "",
+        product.id || "", "", product.sourceAsin || product.asin || "", product.name || product.englishName || "", purchasePricing.pieceCount,
+        product.currentPrice ?? "", convertCurrencyToCny(product.currentPrice, exportMarket) ?? "",
+        product.salePrice ?? "", convertCurrencyToCny(product.salePrice, exportMarket) ?? "",
+        product.rating ?? "", product.reviews ?? "", product.sales30 ?? "", resolveManualWeightOverride(product)?.weightKg ?? (usesItemWeightOnly(product) ? automaticProfitWeightKg(product) : product.productWeight) ?? "", spreadsheetListingDate(product),
         product.purchaseCost ?? "", profitInputs.purchaseTaxRate,
-        calculation ? roundMoney(calculation.purchaseTaxCny) : "", profitInputs.domesticFreightRateCnyPerKg,
-        calculation?.domesticFreightWeightKg ?? "", calculation ? roundMoney(calculation.domesticFreightMinCny) : "",
-        calculation ? roundMoney(calculation.domesticFreightMaxCny) : "", calculation ? roundMoney(calculation.domesticFreightCny) : "",
-        calculation ? roundMoney(calculation.landedPurchaseCny) : "",
+        calculation ? roundMoney(calculation.purchaseTaxCny) : "", calculation ? roundMoney(calculation.landedPurchaseCny) : "",
         product.fulfillmentMode || "未获取",
         isFba ? product.fbaFee ?? "" : "", isFba ? convertCurrencyToCny(product.fbaFee, exportMarket) ?? "" : "",
-        isFbm ? product.fbmFee ?? "" : "", isFbm ? convertCurrencyToCny(product.fbmFee, exportMarket) ?? "" : "",
-        activeFee ?? "", convertCurrencyToCny(activeFee, exportMarket) ?? "",
-        profitInputs.actualWeightKg ?? "", calculation?.airFreight?.volumetricWeightKg ?? "", calculation?.airFreight?.chargeableWeightKg ?? "",
-        profitInputs.cartonWeightKg ?? "", profitInputs.unitsPerCarton ?? "", profitInputs.airFreightRateCnyPerKg,
-        calculation?.airFreight?.airFreightCny ?? "", profitInputs.commissionRate, profitInputs.fxLossRate, profitInputs.marketingRate,
-        profitInputs.managementRate, profitInputs.returnsRate,
+        profitInputs.airFreightRateCnyPerKg, calculation?.airFreight?.airFreightCny ?? "",
+        profitInputs.commissionRate, profitInputs.fxLossRate, profitInputs.marketingRate, profitInputs.managementRate, profitInputs.returnsRate,
         calculation ? roundMoney(calculation.totalCost) : "", calculation ? convertCurrencyToCny(calculation.totalCost, exportMarket) : "",
-        calculation ? roundMoney(calculation.profit) : "", calculation ? convertCurrencyToCny(calculation.profit, exportMarket) : "", calculation ? roundMoney(calculation.margin) : "",
-        product.complete ? "是" : "否", product.missing.join("、"),
-        product.collectedAt,
+        calculation ? roundMoney(calculation.profit) : "", calculation ? convertCurrencyToCny(calculation.profit, exportMarket) : "",
+        calculation ? roundMoney(calculation.margin) : "", product.collectedAt || "", profitWeightSourceLabel(product),
       ];
     });
     return {
       worksheetName,
+      layout: "reviewed-products-v1",
       headers,
+      columnFormats: headers.map(header => header === "商品上架时间" ? "yyyy-mm-dd" : "General"),
       rows: dataRows,
       imageColumnIndex: headers.indexOf("竞品图片"),
       images: rows.map((product) => ({

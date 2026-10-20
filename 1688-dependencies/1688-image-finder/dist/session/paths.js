@@ -1,31 +1,14 @@
 import os from 'node:os';
 import path from 'node:path';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import crypto from 'node:crypto';
-const FIXED_WINDOWS_HOME = 'D:\\deliverables\\1688-image-finder\\data\\1688-session';
+import { localDirectory } from '../util/local-path.js';
 export function root() {
-    if (process.platform !== 'win32') {
-        return process.env.BB1688_HOME ?? path.join(os.homedir(), '.1688');
-    }
     const configured = process.env.BB1688_HOME?.trim();
-    if (!configured) {
-        throw new Error('BB1688_HOME is required on Windows and must be an absolute path on the D: drive.');
+    if (process.platform === 'win32' && !configured) {
+        throw new Error('BB1688_HOME is required on Windows and must name a dedicated local directory.');
     }
-    if (/^[\\/]{2}/.test(configured)) {
-        throw new Error('BB1688_HOME must not be a UNC or device path.');
-    }
-    if (!path.win32.isAbsolute(configured)) {
-        throw new Error('BB1688_HOME must be an absolute Windows path.');
-    }
-    const resolved = path.win32.resolve(configured);
-    assertWindowsDDrive(resolved, 'BB1688_HOME');
-    if (process.env.NODE_ENV !== 'test'
-        && resolved.toLowerCase() !== path.win32.resolve(FIXED_WINDOWS_HOME).toLowerCase()) {
-        throw new Error(`BB1688_HOME must be the dedicated session path: ${FIXED_WINDOWS_HOME}`);
-    }
-    assertNoReparseAncestors(resolved, 'BB1688_HOME');
-    return resolved;
+    return localDirectory(configured || path.join(os.homedir(), '.1688'), 'BB1688_HOME');
 }
 function runtimePath(...parts) {
     const base = root();
@@ -37,55 +20,12 @@ function runtimePath(...parts) {
         throw new Error('Runtime path escapes BB1688_HOME.');
     }
     if (process.platform === 'win32') {
-        assertWindowsDDrive(candidate, 'Runtime path');
         assertNoReparseAncestors(candidate, 'Runtime path');
     }
     return candidate;
 }
-function assertWindowsDDrive(candidate, label) {
-    const drive = path.win32.parse(candidate).root.toUpperCase();
-    if (drive !== 'D:\\') {
-        throw new Error(`${label} must resolve to the D: drive.`);
-    }
-}
 function assertNoReparseAncestors(candidate, label) {
-    const resolved = path.win32.resolve(candidate);
-    const parsed = path.win32.parse(resolved);
-    let current = parsed.root;
-    const segments = resolved
-        .slice(parsed.root.length)
-        .split(path.win32.sep)
-        .filter(Boolean);
-    assertExistingPathIsDirect(current, label);
-    for (const segment of segments) {
-        current = path.win32.join(current, segment);
-        const stat = lstatIfExists(current);
-        if (!stat)
-            break;
-        assertExistingPathIsDirect(current, label, stat);
-    }
-}
-function lstatIfExists(candidate) {
-    try {
-        return fs.lstatSync(candidate);
-    }
-    catch (error) {
-        if (error.code === 'ENOENT')
-            return null;
-        throw error;
-    }
-}
-function assertExistingPathIsDirect(candidate, label, stat = fs.lstatSync(candidate)) {
-    if (stat.isSymbolicLink()) {
-        throw new Error(`${label} must not traverse a reparse point.`);
-    }
-    const real = fs.realpathSync.native(candidate);
-    if (normalizeWindowsPath(real) !== normalizeWindowsPath(candidate)) {
-        throw new Error(`${label} must not traverse a reparse point.`);
-    }
-}
-function normalizeWindowsPath(candidate) {
-    return path.win32.resolve(candidate).replace(/[\\/]+$/, '').toLowerCase();
+    localDirectory(candidate, label, { allowFile: true });
 }
 export function profilesDir() {
     return runtimePath('profiles');

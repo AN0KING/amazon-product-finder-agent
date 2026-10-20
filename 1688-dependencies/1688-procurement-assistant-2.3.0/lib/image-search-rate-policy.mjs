@@ -1,12 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-// Default pacing: 18 seconds plus 20 seconds after every tenth search.
-export const SEARCH_MIN_GAP_MS = 18_000;
+// Ordinary queues use a conservative fixed cadence. Explicit rate trials keep
+// their separately authorized pacing, history and manual verification pauses.
+export const SEARCH_MIN_GAP_MS = 60_000;
 export const SEARCH_COOLDOWN_EVERY = 10;
-export const SEARCH_COOLDOWN_MS = 20_000;
+export const SEARCH_COOLDOWN_MS = 120_000;
 // Platform backoff is independent of the trial's ordinary pacing.
 export const SEARCH_RATE_LIMIT_COOLDOWN_MS = 300_000;
+export const isSearchExecutionPause = code => ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED'].includes(code);
 const HOUR_MS = 3_600_000;
 const TRIAL_STATUSES = new Set(['waiting', 'running', 'throughput_limited', 'stopped_risk', 'stopped_manual']);
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -91,7 +93,11 @@ export class ImageSearchRatePolicy {
     const latestTask = tasks.reduce((latest, task) => ['running', 'queued', 'review_candidates', 'risk_blocked', 'failed'].includes(task.status)
       ? Math.max(latest, Date.parse(task.searchStartedAt || task.updatedAt || '') || 0) : latest, 0);
     this.state.lastStartedAt = Math.max(this.state.lastStartedAt, latestTask);
-    if (this.state.lastStartedAt) this.state.nextAllowedAt = Math.max(this.state.nextAllowedAt, this.state.lastStartedAt + this.effectiveGapMs());
+    if (this.state.lastStartedAt) {
+      const rest = !this.trialPacingActive() && this.state.searchCount > 0
+        && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0;
+      this.state.nextAllowedAt = Math.max(this.state.nextAllowedAt, this.state.lastStartedAt + this.effectiveGapMs() + rest);
+    }
     await this.persist();
     this.loaded = true;
   }
@@ -101,8 +107,8 @@ export class ImageSearchRatePolicy {
     const cooling = this.state.cooldownUntil > this.now();
     return {
       minGapMs: this.effectiveGapMs(), maxConcurrent: 1,
-      cooldownEvery: this.state.rateTrial ? 0 : SEARCH_COOLDOWN_EVERY,
-      cooldownMs: this.state.rateTrial ? 0 : this.cooldownMs,
+      cooldownEvery: this.trialPacingActive() ? 0 : SEARCH_COOLDOWN_EVERY,
+      cooldownMs: this.trialPacingActive() ? 0 : this.cooldownMs,
       nextAllowedAt: next ? new Date(next).toISOString() : null,
       pausedReason: this.state.manualResumeRequired ? this.state.pausedReason : cooling ? 'RATE_LIMITED' : null,
       manualResumeRequired: this.state.manualResumeRequired,
@@ -112,7 +118,9 @@ export class ImageSearchRatePolicy {
     };
   }
 
-  effectiveGapMs() { return this.state.rateTrial ? Math.ceil(HOUR_MS / this.state.rateTrial.targetPerHour) : this.minGapMs; }
+  trialPacingActive() { return ['waiting', 'running', 'throughput_limited'].includes(this.state.rateTrial?.status); }
+
+  effectiveGapMs() { return this.trialPacingActive() ? Math.ceil(HOUR_MS / this.state.rateTrial.targetPerHour) : this.minGapMs; }
 
   stageView(stage, at = this.now()) {
     if (!stage) return null;
@@ -131,7 +139,7 @@ export class ImageSearchRatePolicy {
       history: trial.history.map(stage => this.stageView(stage)),
       actualPerHour: currentStage?.actualPerHour ?? 0,
       successPerHour: currentStage?.successPerHour ?? 0,
-      gapMs: this.effectiveGapMs() };
+      gapMs: Math.ceil(HOUR_MS / trial.targetPerHour) };
   }
 
   async startTrial(options = {}) {
@@ -214,9 +222,9 @@ export class ImageSearchRatePolicy {
       this.state.searchCount += 1;
       this.state.lastStartedAt = this.now();
       this.state.nextAllowedAt = this.now() + this.effectiveGapMs()
-        + (!this.state.rateTrial && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0);
+        + (!this.trialPacingActive() && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0);
       const trial = this.state.rateTrial;
-      if (trial) {
+      if (this.trialPacingActive()) {
         const stage = trial.currentStage;
         if (['running', 'throughput_limited'].includes(trial.status) && stage) { stage.started += 1; stage.lastStartedAt = this.now(); }
         trial.activeSearch = { taskId, sequence: this.state.searchCount, startedAt: this.now(),
@@ -295,7 +303,11 @@ export class ImageSearchRatePolicy {
     return this.mutate(async () => {
       if (!this.state.manualResumeRequired) return true;
       const verifiedAt = Date.parse(this.state.manualVerificationCompletedAt || '');
-      if (confirmed !== true || !Number.isFinite(verifiedAt) || verifiedAt < this.state.pausedAt) return false;
+      // Technical execution failures need an explicit user decision, not a
+      // fabricated captcha/login verification. The bridge checks live workers
+      // before accepting this decision. Risk/auth pauses still need proof.
+      if (confirmed !== true || (!isSearchExecutionPause(this.state.pausedReason)
+        && (!Number.isFinite(verifiedAt) || verifiedAt < this.state.pausedAt))) return false;
       const pausedState = structuredClone(this.state);
       this.state.manualResumeRequired = false;
       this.state.pausedReason = null;

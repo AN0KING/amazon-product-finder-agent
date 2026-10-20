@@ -1,3 +1,5 @@
+import * as reviewRange from "../lib/review-range.mjs";
+import * as listingDate from "../lib/amazon-listing-date.mjs";
 import * as salesPolicy from "../lib/monthly-sales-policy.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -10,6 +12,7 @@ import * as handoff from "../lib/analysis-handoff.mjs";
 import * as coverage from "../lib/analysis-coverage.mjs";
 import * as detailRetry from "../lib/amazon-detail-retry.mjs";
 import { buildSupplierSearchResult } from "../lib/1688-supplier-policy.mjs";
+import { recomputeProductProfit } from "../lib/product-profit-state.mjs";
 import { applySupplierProfitResult } from "../lib/supplier-profit-result.mjs";
 
 const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
@@ -58,25 +61,40 @@ function harness() {
       classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, setAttribute() {}, insertAdjacentHTML(position, html) { this.innerHTML = position === "afterbegin" ? html + this.innerHTML : this.innerHTML + html; }, scrollIntoView() {}, focus() {}, closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }, listeners: {}, addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); } });
     return elements.get(id);
   };
-  const calls = [], timers = [], toasts = [], events = [];
+  const calls = [], timers = [], toasts = [], events = [], exports = [];
+  const preferences = new Map();
+  let today = "2026-10-13";
   let respond = async (path) => { throw new Error(`Unexpected API request: ${path}`); };
   const context = vm.createContext({
-    ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    ...reviewRange, ...salesPolicy, ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    todayDateOnly: () => today,
     document: { body: element("body"), documentElement: element("html"), addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
-    window: { crypto: { randomUUID: () => "new-synthetic-run" }, setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {},
+    window: { sessionStorage: { getItem: key => preferences.has(key) ? preferences.get(key) : null, setItem: (key, value) => preferences.set(key, value) },
+      crypto: { randomUUID: () => "new-synthetic-run" }, setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {},
       setInterval(callback, ms) { timers.push({ callback, ms, interval: true }); return timers.length; }, clearInterval() {}, confirm: () => true,
       EventSource: class { constructor(url) { this.url = url; events.push(this); } } },
     setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {}, requestAnimationFrame(callback) { callback(); }, structuredClone, AbortController, DOMException, URL,
     async fixtureApi(path, options = {}) { calls.push({ path, options, body: typeof options.body === "string" ? JSON.parse(options.body) : options.body ?? null }); return respond(path, options); },
     fixtureToast: (...args) => toasts.push(args),
+    fixtureSpreadsheet: async payload => { exports.push(structuredClone(payload)); return { savedFilePath: "synthetic.xlsx", embeddedImageCount: 0, missingImageCount: 0, failedImageCount: 0 }; },
   });
   const source = appSource.replace(/^import[\s\S]*?;\r?\n/gm, "").replace(/\}\)\(\);\s*$/, `
     const originalAvailability = updateStartAvailability;
+    const originalCriteria = getSetupCriteria;
+    const originalValidateCriteria = validateSetupCriteria;
+    const originalStoreManager = renderStoreManager;
+    const originalAudit = renderStoreAuditUi;
     const originalMarketUi = renderMarketUi;
+    const originalResults = renderResults;
     renderMarketUi = renderStoreAuditUi = renderStoreManager = setImportStatus = resetStoreAuditUi = setDataMode = renderResults = renderRunCoverage = updateHistorySummary = updateStartAvailability = initIcons = restorePending1688RiskStatus = setStage = setProgress = hideProgressError = showProgressError = showView = scheduleRequested1688Resume = () => {};
+    const activity = { recomputed: 0, rendered: 0 };
+    const originalComputed = updateProductComputed;
+    updateProductComputed = (...args) => { activity.recomputed += 1; return originalComputed(...args); };
+    renderResults = () => { activity.rendered += 1; };
     const originalPopulateDrawer = populateDrawer;
     populateDrawer = (product) => { document.getElementById('drawerProductName').textContent = product.name; };
     apiRequest = fixtureApi;
+    requestSpreadsheetExport = fixtureSpreadsheet;
     showToast = fixtureToast;
     delay = async () => {};
     getSetupCriteria = () => ({ useSellerSprite: false });
@@ -85,9 +103,16 @@ function harness() {
       useRealMarketUi: () => { renderMarketUi = originalMarketUi; renderMarketUi(); },
       marketState: () => ({ activeMarket, taskExchangeRate }),
       checkAmazon: refreshAmazonConnection, checkSellerSprite: checkSellerSpriteConnection,
-      bindUpload: bindFileImport, availability: originalAvailability, history: loadHistoryRun, workspace: loadPersistentWorkspace,
-      importState: () => ({ storeList, runHistory, storeImportPending, taskReplacementPending, amazonCollectionJob, supplierPipelineState }),
-      restore: restoreRunSnapshot, poll: pollAmazonCollection, run: runAnalysis, control: controlAmazonCollection,
+      setImportMode, importTaskSource,
+      settleAsinPreview: async () => { while (asinPreviewPromise) await asinPreviewPromise; },
+      setSelectedFile: file => { selectedStoreFile = file; },
+      useRealCriteria: () => { getSetupCriteria = originalCriteria; validateSetupCriteria = originalValidateCriteria; },
+      criteria: originalCriteria, validateCriteria: originalValidateCriteria, syncCriteria: syncAmazonResultCriteria,
+      renderImports: () => { originalAudit(storeList?.audit); originalStoreManager(); },
+      filterReasons: singleStoreFilterExclusionReasons,
+      bindUpload: bindFileImport, bindResults, bindStoreManager, availability: originalAvailability, history: loadHistoryRun, workspace: loadPersistentWorkspace,
+      importState: () => ({ importMode, storeList, runHistory, storeImportPending, taskReplacementPending, amazonCollectionJob, supplierPipelineState }),
+      bindCollection: bindAmazonCollection, restore: restoreRunSnapshot, poll: pollAmazonCollection, run: runAnalysis, control: controlAmazonCollection,
       load: loadAmazonCollectionStatus, apply: applyAmazonCollectionJob, locked: isCollectionWriteLocked,
       save: persistCurrentRun, saveRequired: persistCurrentRunRequired, capture: captureRunSnapshot, render: renderAmazonCollection,
       scheduleResume: scheduleAmazonRunResume,
@@ -95,10 +120,12 @@ function harness() {
       settleSnapshots: async () => { while (amazonCollectionSnapshotPromise) await amazonCollectionSnapshotPromise; },
       loadSupplier: loadSupplierPipelineStatus, pollSupplier: poll1688Status,
       resumeSupplier: () => resumePending1688Candidates(), pauseSupplier: pauseServerSupplierPipeline,
+      requestControl: requestTaskControl, resumeQueue: resume1688AfterVerification,
       applySession: (auth, queue) => apply1688SessionStatus(auth, queue),
       applySupplierResult: apply1688SearchResult, row: (id) => renderProductRow(products.find(product => product.id === id)),
-      spreadsheet: (items) => createSpreadsheetExportPayload(items, activeMarket),
+      spreadsheet: (items, market = activeMarket.code) => createSpreadsheetExportPayload(items, MARKET_CONFIGS[market]),
       fetchLegacy: () => fetchProductCandidates(storeList.stores, runState.criteria, new AbortController().signal, () => {}),
+      fetchProvider: () => fetchProductCandidates(storeList.stores, runState.criteria, new AbortController().signal, () => {}, { allowSellerSprite: true }),
       mutate: () => { approveActiveProduct(); rejectActiveProduct(); rematchActiveProduct(); saveManualCost(); commitProfitEdits(false); exportProducts(); exportAnalysisHandoff(); },
       approve: approveActiveProduct, saveEditor: commitProfitEdits, mapCandidate: mapCandidateProduct, mergeCandidates: mergeAnalyzedCandidateProducts,
       editor: getEditorValues, preview: renderProfitPreview, manualPreview: renderManualCostPreview,
@@ -106,6 +133,11 @@ function harness() {
       useRealDrawer: () => { populateDrawer = originalPopulateDrawer; },
       openManual: openManualCostDialog, approveManual: () => saveManualCost({ approve: true }), saveManualDraft: () => saveManualCost({ allowIncomplete: true }),
       filtered: getFilteredProducts, matching: getAmazonFilteredProductsFor1688, pending: getPending1688ResumeProducts,
+      dateFilters: bindSetupFilters, applyDate: applyAmazonListingDateFilter, dateCoverage: renderAmazonListingDateCoverage,
+      exportRows: getExportProducts, exportAll: () => exportProducts("all"), exportApproved: () => exportProducts("approved"),
+      exportCounts: syncExportMenuCounts, handoffSummary: renderAnalysisHandoffSummary,
+      renderResults: originalResults, handoffInput: buildAnalysisHandoffInput, taskMode: currentTaskInputMode,
+      mergeRecords: mergeCandidateRecords, setupCriteria: () => ({ useSellerSprite: false }),
       startMatching: startFiltered1688Matching, renderSupplier: renderSupplier1688Stage,
       batch: (items) => run1688ImageSearchBatch(items, new AbortController().signal),
       prepareSupplier: (...args) => prepareAmazonCollectionForSupplier(...args),
@@ -119,10 +151,14 @@ function harness() {
       known: (value) => { amazonCollectionStatusKnown = value; },
       queue: (promise) => { persistenceSaveQueue = promise; },
       setRevision: (value) => { amazonCollectionRevision = value; },
+      activity: () => ({ ...activity }),
+      resetActivity: () => { activity.recomputed = 0; activity.rendered = 0; },
+      setPendingProfitSaves: (value) => { profitEditorPendingSaves = value; if (!value) flushDeferredProfitEditorSnapshot(); },
     };
   })();`);
   vm.runInContext(source, context, { filename: "app.js" });
-  return { app: context.scout, element, calls, timers, toasts, events,
+  return { app: context.scout, element, calls, timers, toasts, events, exports, preferences,
+    setToday(value) { today = value; },
     fire(id, type) { return Promise.all((element(id).listeners[type] || []).map(callback => callback({ target: element(id), preventDefault() {} }))); },
     respond(fn) { respond = fn; } };
 }
@@ -141,6 +177,75 @@ test("managed restore never restarts legacy browser collection and retains canon
   assert.equal(product.suppliers[0].name, "Preserved supplier");
   await assert.rejects(app.fetchLegacy(), { code: "COLLECTION_MANAGED_READ_ONLY" });
   assert.equal(calls.length, 0);
+});
+
+test("Amazon product clicks open the imported URL in Edge instead of navigating the current browser", async () => {
+  const fixture = harness();
+  const item = { ...canonicalProduct(), canonicalUrl: "https://www.amazon.com.au/dp/B000000001?th=1&psc=1#productDetails" };
+  fixture.app.restore(snapshot(job("completed"), [item]));
+  fixture.app.bindResults();
+  const link = { dataset: {}, getAttribute: () => item.canonicalUrl };
+  let prevented = false;
+  const event = { target: { closest: selector => selector === "a.product-title-link" ? link : null },
+    preventDefault() { prevented = true; } };
+  fixture.respond(async (path, options) => {
+    assert.equal(path, "/api/amazon/open-in-edge");
+    assert.equal(options.method, "POST");
+    assert.equal(JSON.parse(options.body).url, item.canonicalUrl);
+    return { opened: true, browser: "edge" };
+  });
+  await fixture.element("productTableBody").listeners.click[0](event);
+  assert.equal(prevented, true, "The ordinary/default browser navigation must be canceled.");
+  assert.equal(fixture.calls.length, 1);
+  assert.match(fixture.app.row(item.id), /href="microsoft-edge:https:\/\/www\.amazon\.com\.au\/dp\/B000000001\?th=1&amp;psc=1#productDetails"/);
+  assert.equal(fixture.app.state().activeProductId, null);
+});
+
+test("an Edge-opening failure keeps default-browser navigation canceled and reports the failure", async () => {
+  const fixture = harness();
+  fixture.app.bindResults();
+  const link = { dataset: {}, getAttribute: () => "https://www.amazon.com.au/dp/B09NXS1BLL?th=1" };
+  let prevented = false;
+  fixture.respond(async () => { throw new Error("未找到 Microsoft Edge"); });
+  await fixture.element("productTableBody").listeners.click[0]({
+    target: { closest: selector => selector === "a.product-title-link" ? link : null },
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(fixture.calls.length, 1);
+  assert.match(fixture.toasts[0][0], /无法在 Edge 打开 Amazon.*未找到 Microsoft Edge/);
+  assert.equal(link.dataset.openingEdge, undefined);
+});
+
+test("Amazon title preserves the original imported link even when the fetched page has another canonical URL", () => {
+  const fixture = harness();
+  const saved = snapshot(job("completed"));
+  saved.products[0].canonicalUrl = 'https://www.amazon.com.au/dp/B000000001';
+  saved.storeList.stores[0].productUrls = { B000000001: 'https://www.amazon.com.au/gp/aw/d/B000000001?th=1&psc=1#productDetails' };
+  fixture.app.restore(saved);
+  assert.match(fixture.app.row(productId), /data-amazon-url="https:\/\/www\.amazon\.com\.au\/gp\/aw\/d\/B000000001\?th=1&amp;psc=1#productDetails"/);
+  saved.storeList.stores[0].productUrls.B000000001 = 'https://www.amazon.com.au/dp/B000000002?th=1';
+  fixture.app.restore(saved);
+  assert.match(fixture.app.row(productId), /data-amazon-url="https:\/\/www\.amazon\.com\.au\/dp\/B000000001"/);
+});
+
+test("removing an imported ASIN also removes its saved product URL while retaining other original links", async () => {
+  const fixture = harness();
+  const saved = snapshot(null, []);
+  saved.storeList.inputMode = "asins";
+  saved.storeList.stores[0].asins.push("B000000002");
+  saved.storeList.stores[0].productUrls = {
+    B000000001: "https://www.amazon.com.au/dp/B000000001?th=1",
+    B000000002: "https://www.amazon.com.au/gp/product/B000000002?psc=1",
+  };
+  fixture.app.restore(saved);
+  fixture.app.bindStoreManager();
+  const button = { dataset: { removeAsin: "B000000001" }, disabled: false };
+  fixture.element("currentStoreList").closest = selector => selector === "[data-remove-asin]" ? button : null;
+  await fixture.fire("currentStoreList", "click");
+  const source = fixture.app.importState().storeList.stores[0];
+  assert.deepEqual(Array.from(source.asins), ["B000000002"]);
+  assert.deepEqual({ ...source.productUrls }, { B000000002: "https://www.amazon.com.au/gp/product/B000000002?psc=1" });
 });
 
 test("restore initializes only raw ASINs missing from the canonical snapshot", () => {
@@ -513,6 +618,197 @@ test("missing Amazon fields no longer show the removed cart or delivery-region p
   }
 });
 
+test("retained numeric quote shows pending verification and original observation time in row and drawer", () => {
+  const { app, element } = harness();
+  const item = { ...canonicalProduct(), currentPrice: 14.99, currentPriceStatus: 'pending_revalidation',
+    priceVerifiedAt: '2026-10-20T01:31:27.910Z',
+    priceRefresh: { status: 'pending', retained: true, reason: 'price_requires_cart' },
+    collectionQuality: { fields: { price: { status: 'unavailable', reason: 'price_requires_cart' } } } };
+  app.restore(snapshot(job('completed'), [item]));
+  const html = app.row(item.id);
+  assert.match(html, /14\.99/);
+  assert.match(html, /上次核验报价 · 本次待复核/);
+  assert.match(html, /09:31:27/);
+  app.openLocalDrawer(item.id);
+  assert.match(element('amazonMetrics').innerHTML, /上次核验报价 · 本次待复核/);
+});
+
+test("candidate rows show the exact failed ASIN reason and keep prior verified data untouched", () => {
+  const { app, element, calls } = harness();
+  const product = { ...canonicalProduct(), collectionLastAttempt: { status: "failed", code: "AMAZON_PRODUCT_ASIN_MISMATCH", message: "Amazon specification table belongs to another ASIN." } };
+  app.restore(snapshot(job("completed"), [product]));
+  const row = app.row(productId);
+  assert.match(row, /Amazon 采集失败：旧版 ASIN 校验未通过，待按新规则重新采集/);
+  assert.match(row, /AMAZON_PRODUCT_ASIN_MISMATCH/);
+  assert.match(row, /本轮已结束/);
+  assert.doesNotMatch(row, /待自动补查|已排队重新查找/);
+  app.openLocalDrawer(productId);
+  assert.match(element("amazonMetrics").innerHTML, /Amazon 采集说明/);
+  assert.match(element("amazonMetrics").innerHTML, /旧版 ASIN 校验未通过，待按新规则重新采集/);
+  assert.equal(app.state().products[0].productWeight, product.productWeight);
+  assert.equal(app.state().products[0].currentPrice, product.currentPrice);
+  assert.equal(calls.length, 0);
+});
+
+test("candidate rows distinguish unresolved weight conflict from incomplete information inspection", () => {
+  for (const [reason, label] of [["conflicting_values", "重量值冲突"], ["inspection_timeout", "商品信息区检查超时"]]) {
+    const { app, element } = harness();
+    app.restore(snapshot(job("completed"), [imageCandidate(1, {
+      detailStatus: "success", detailParserVersion: 11, currentPrice: 30, currentPriceStatus: "verified",
+      collectionQuality: { fields: { weight: { status: "missing", reason: "product_information_incomplete", retryable: true } } },
+      productInformation: { version: 1, asin: "B000000001", status: "incomplete", weightStatus: "unresolved", reason, inspection: { reason: "inspection_timeout" } },
+    })]));
+    const row = app.row(productId);
+    assert.ok(row.includes(label));
+    assert.match(row, /Amazon 字段核验/);
+    assert.doesNotMatch(row, /页面未提供重量/);
+    assert.match(row, /上架日期待核验 · 商品信息区检查超时.*不影响利润计算/);
+    app.openLocalDrawer(productId);
+    assert.ok(element("amazonMetrics").innerHTML.includes(label));
+    assert.equal(app.state().products[0].productWeight, null);
+  }
+});
+
+test("captured disabled specifications show their precise unresolved cause without changing data or recovery", async () => {
+  const captured = JSON.parse(await readFile(new URL("./fixtures/amazon-b09nxs1bll-disabled-specifications.json", import.meta.url), "utf8"));
+  const { source: _source, ...recorded } = captured;
+  const { app, element, calls } = harness();
+  const item = { ...imageCandidate(1, { detailStatus: "success", currentPrice: 30, currentPriceStatus: "verified" }),
+    ...recorded, id: `AU:${recorded.asin}`, sourceAsin: recorded.asin,
+    manualSalePrice: true, salePrice: 31, manualPurchaseCost: true, purchaseCost: 8, purchaseUnitCostCny: 8,
+    suppliers: [{ name: "Preserved manual quote", unitPriceCny: 8 }],
+    collectionQuality: { fields: { weight: { status: "missing", reason: "product_information_incomplete", retryable: true } } },
+  };
+  app.restore(snapshot(job("completed"), [item]), { persistMigrations: false });
+  const beforeRendering = JSON.stringify(app.state().products[0]);
+  const row = app.row(item.id);
+  assert.match(row, /重量：完整规格入口当前不可用，Item Weight 待核验/);
+  assert.match(row, /2021-12-21/);
+  assert.doesNotMatch(row, /上架日期待核验|页面未提供重量|商品信息区检查超时/);
+  app.openLocalDrawer(item.id);
+  assert.match(element("amazonMetrics").innerHTML, /完整规格入口当前不可用，Item Weight 待核验/);
+  const restored = app.state().products[0];
+  for (const key of ["productWeight", "productWeightEvidence", "amazonFirstAvailableDate", "amazonFirstAvailableDateStatus",
+    "manualSalePrice", "salePrice", "manualPurchaseCost", "purchaseCost", "purchaseUnitCostCny"]) assert.equal(restored[key], item[key], key);
+  assert.deepEqual(JSON.parse(JSON.stringify(restored.collectionRecovery)), item.collectionRecovery);
+  assert.equal(restored.suppliers[0].name, item.suppliers[0].name);
+  assert.equal(restored.suppliers[0].unitPriceCny, item.suppliers[0].unitPriceCny);
+  assert.equal(JSON.stringify(restored), beforeRendering);
+  assert.equal(restored.productInformation.weightStatus, "unresolved");
+  assert.equal(calls.length, 0);
+});
+
+test("disabled specifications explain unresolved dates only while the recorded entry remains unavailable", async () => {
+  const { productInformation } = JSON.parse(await readFile(new URL("./fixtures/amazon-b09nxs1bll-disabled-specifications.json", import.meta.url), "utf8"));
+  for (const changed of [null, { disabled: false }, { pending: false }, { visible: true }]) {
+    const { app, calls } = harness();
+    const info = structuredClone(productInformation);
+    Object.assign(info.inspection.specifications, changed || {});
+    app.restore(snapshot(job("completed"), [imageCandidate(1, {
+      detailStatus: "success", detailParserVersion: 12, productInformation: info,
+      amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: "unresolved",
+      collectionQuality: { fields: { weight: { status: "missing", reason: "product_information_incomplete" } } },
+    })]), { persistMigrations: false });
+    const row = app.row(productId);
+    assert.match(row, changed ? /上架日期待核验 · 商品信息区检查超时/ : /上架日期待核验 · 完整规格入口当前不可用/);
+    assert.doesNotMatch(row, /Amazon 未提供上架日期|页面未提供重量/);
+    if (changed) assert.doesNotMatch(row, /完整规格入口当前不可用/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('legacy ASIN and weight failures explain the pending new-rule visit while retaining access pause and source errors', () => {
+  for (const version of [9, 11]) {
+    const { app, calls } = harness();
+    const items = [
+      imageCandidate(1, { detailParserVersion: version, detailStatus: 'failed',
+        detailErrorCode: 'AMAZON_PRODUCT_ASIN_MISMATCH', detailError: 'Original ASIN diagnostic' }),
+      imageCandidate(2, { detailParserVersion: version, detailStatus: 'success',
+        collectionQuality: { fields: { weight: { status: 'missing', reason: 'product_information_incomplete' } } },
+        productInformation: { status: 'incomplete', reason: 'conflicting_values' } }),
+      imageCandidate(3, { detailParserVersion: version, detailStatus: 'failed',
+        detailErrorCode: 'AMAZON_ACCESS_CHALLENGE', detailError: 'Original challenge diagnostic' }),
+    ];
+    app.restore(snapshot({ ...job('needs_attention'), causeCode: 'AMAZON_ACCESS_CHALLENGE' }, items), { persistMigrations: false });
+    const asinRow = app.row(items[0].id), weightRow = app.row(items[1].id), challengeRow = app.row(items[2].id);
+    assert.match(asinRow, version < 11 ? /旧版 ASIN 校验未通过，待按新规则重新采集/ : /上次采集记录的页面 ASIN 与输入不一致/);
+    assert.match(weightRow, version < 11 ? /旧版重量核验未完成，待按 Item Weight 重新采集/ : /重量值冲突，尚未确认有效重量/);
+    assert.match(asinRow, /AMAZON_PRODUCT_ASIN_MISMATCH/);
+    assert.match(asinRow, /Original ASIN diagnostic/);
+    assert.match(challengeRow, /验证码或访问验证，需人工处理/);
+    for (const row of [asinRow, weightRow, challengeRow]) assert.match(row, /等待人工处理，已停止自动请求/);
+    assert.equal(app.state().products[0].detailError, 'Original ASIN diagnostic');
+    assert.equal(app.state().products[1].productInformation.reason, 'conflicting_values');
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("candidate retry display follows per-product recovery, manual pauses and access challenges", () => {
+  const fixtures = [
+    { status: "cooldown", code: "AMAZON_REQUEST_TIMEOUT", recovery: { status: "scheduled", attempts: 1, maxAttempts: 2, nextRetryAt: "2026-10-14T07:00:00Z" }, expected: /页面访问超时.*待自动补查.*补查 1 \/ 2/ },
+    { status: "completed", code: "AMAZON_REQUEST_TIMEOUT", recovery: { status: "exhausted", attempts: 2, maxAttempts: 2 }, expected: /页面访问超时.*自动补查已达上限（已补查 2 \/ 2 次）/ },
+    { status: "completed", code: "AMAZON_REQUEST_TIMEOUT", recovery: { status: "waiting", attempts: 1, maxAttempts: 2, nextRetryAt: "2026-10-14T07:00:00Z" }, expected: /页面访问超时.*待自动补查/ },
+    { status: "paused", code: "AMAZON_REQUEST_TIMEOUT", recovery: { status: "scheduled", attempts: 1 }, expected: /已暂停，保留当前结果/ },
+    { status: "needs_attention", code: "AMAZON_ACCESS_CHALLENGE", recovery: { status: "blocked", attempts: 1 }, expected: /验证码或访问验证，需人工处理.*等待人工处理，已停止自动请求/ },
+  ];
+  for (const fixture of fixtures) {
+    const { app, calls } = harness();
+    app.restore(snapshot({ ...job(fixture.status), ...(fixture.recovery.status === "waiting" ? { enabled: true } : {}) }, [imageCandidate(1, {
+      detailStatus: "failed", detailErrorCode: fixture.code, detailError: "Original detail failure", collectionRecovery: fixture.recovery,
+    })]));
+    const row = app.row(productId);
+    assert.match(row, fixture.expected);
+    if (fixture.status === "paused" || fixture.status === "needs_attention") assert.doesNotMatch(row, /待自动补查|已排队重新查找/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("only inspected weight absence is shown as page-not-provided, never a stale absence audit", () => {
+  const { app } = harness();
+  app.restore(snapshot(job("completed"), [imageCandidate(1, {
+    detailStatus: "success", collectionQuality: { fields: { weight: { status: "unavailable", reason: "page_not_provided", retryable: false } } },
+    productInformation: { version: 1, asin: "B000000001", status: "incomplete", weightStatus: "not_provided", reason: "inspection_timeout" },
+  })]));
+  const row = app.row(productId);
+  assert.match(row, /重量：商品信息区检查超时/);
+  assert.doesNotMatch(row, /已完整检查，页面未提供重量/);
+});
+
+test("browser inspection failures retain their exact cause and date-only rechecks show the bounded status", () => {
+  for (const [code, message, expected] of [
+    ["EDGE_CDP_TIMEOUT", "CDP operation timed out", /浏览器检查超时/],
+    ["AMAZON_EDGE_NAVIGATION_FAILED", "Browser navigation interrupted", /浏览器连接或页面导航失败/],
+  ]) {
+    const { app, element } = harness();
+    app.restore(snapshot(job("cooldown"), [{ ...canonicalProduct(), amazonFirstAvailableDateStatus: "unresolved",
+      collectionQuality: { fields: { weight: { status: "verified" }, price: { status: "verified" }, title: { status: "verified" }, image: { status: "verified" } } },
+      collectionRecovery: { status: "scheduled", attempts: 1, maxAttempts: 2, nextRetryAt: "2026-10-14T07:00:00Z" },
+      productInformation: { version: 1, asin: "B000000001", status: "incomplete", reason: "root_missing", inspection: {
+        version: 2, asin: "B000000001", status: "incomplete", reason: "browser_inspection_failed", errorCode: code, errorMessage: message,
+      } },
+    }]));
+    const row = app.row(productId);
+    assert.match(row, expected);
+    assert.match(row, /上架日期：.*待自动补查.*补查 1 \/ 2/);
+    assert.ok(row.includes(code));
+    assert.ok(row.includes(message));
+    app.openLocalDrawer(productId);
+    assert.ok(element("amazonMetrics").innerHTML.includes(code));
+    assert.equal(app.state().products[0].productWeight, 0.1);
+  }
+});
+
+test("per-product collection causes escape returned HTML and do not leak a different run's retry state", () => {
+  const { app } = harness();
+  app.restore(snapshot(job("completed"), [imageCandidate(1, {
+    detailStatus: "failed", detailErrorCode: "AMAZON_UNKNOWN_FAILURE", detailError: '<img src=x onerror="alert(1)">',
+  })]));
+  app.apply({ ...job("running", 8), runId: "another-run", tasks: { B000000001: { status: "pending", attempts: 1 } } });
+  const row = app.row(productId);
+  assert.match(row, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
+  assert.doesNotMatch(row, /<img src=x|已排队重新查找|待自动补查/);
+});
+
 test("repeatedly opening actual local product drawers never requests Amazon details", async () => {
   const { app, calls, element } = harness();
   app.restore(snapshot(job("paused"), [
@@ -822,15 +1118,16 @@ test("a new collection revision automatically computes profit once weight arrive
   Object.assign(pricedWithoutWeight, {
     manualSalePrice: false, salePrice: null, productWeight: null, fbaWeight: null, billingWeight: null,
     manualFbaFee: false, fbaFee: null,
+    productInformation: productInformationWithoutWeight(),
     profitInputs: { ...pricedWithoutWeight.profitInputs, actualWeightKg: null, commissionRate: 9, marketingRate: 7, airFreightRateCnyPerKg: 52, airFreightRateSource: "product_manual" },
   });
   app.restore(snapshot(job("running", 1), [pricedWithoutWeight]));
   const incomplete = app.state().products[0];
   assert.equal(incomplete.salePrice, 9.99);
   assert.equal(incomplete.margin, null);
-  assert.ok(incomplete.profitPendingReasons.includes("商品重量"));
-  assert.equal(incomplete.fbaFee, 3.67);
-  assert.equal(incomplete.fbaEstimate.weightSource, "页面未提供重量 · FBA 配送费按最低档估算");
+  assert.equal(incomplete.profitCalculation, null);
+  assert.equal(incomplete.fbaFee, null);
+  assert.equal(incomplete.fbaEstimate, null);
   const nextProduct = { ...structuredClone(pricedWithoutWeight), productWeight: 0.12, billingWeight: 0.12 };
   fixture.respond(async (path) => path === "/api/amazon/collection" ? job("completed", 2) : snapshot(job("completed", 2), [nextProduct]));
   await app.poll();
@@ -912,6 +1209,195 @@ test("a supplier result event refreshes quotes and formula profit in the visible
   assert.deepEqual(calls.map(call => call.path), [`/api/runs/${runId}`]);
   assert.equal(calls.every(call => !call.options.method || call.options.method === "GET"), true);
 });
+
+function amazonProductEvent(product, revision = 2, baseRevision = revision - 1) {
+  return { runId, kind: "amazon_product", baseRevision, revision, products: [product],
+    job: job("running", revision), runState: { mode: "live", completedAt: null }, formulaVersion: profitModel.PROFIT_FORMULA_VERSION };
+}
+function emitSnapshotEvent(events, update) { events[0].onmessage({ data: JSON.stringify(update) }); }
+
+test("Amazon product events display canonical profit immediately and preserve untouched products and the current view", async () => {
+  const { app, calls, events, element } = harness();
+  app.restore(snapshot(job(), [canonicalProduct(), imageCandidate(2)]));
+  const untouched = app.state().products[1];
+  app.view(productId, 3, { minRating: 4.5, minReviews: 20 });
+  element("resultSearch").value = "manual search";
+  element("resultMinMargin").value = "25";
+  element("resultsCompleteToggle").checked = true;
+  element(".view-stack").scrollTop = 730; element(".drawer-content").scrollTop = 221;
+  const next = recomputeProductProfit({ ...canonicalProduct(), name: "Fresh canonical product", productWeight: 0.8, billingWeight: 0.8,
+    manualFbaFee: false, fbaFee: null, profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.8 } });
+  app.startEvents(); app.resetActivity();
+  emitSnapshotEvent(events, amazonProductEvent(next));
+  const state = app.state();
+  assert.equal(state.revision, 2);
+  assert.equal(state.runState.amazonCollectionJob.revision, 2);
+  assert.equal(state.runState.amazonCollectionRevision, 2);
+  assert.equal(state.products[0].margin, next.margin);
+  assert.equal(state.products[0].fbaFee, next.fbaFee);
+  assert.equal(state.products[0].billingWeight, 0.8);
+  assert.strictEqual(state.products[1], untouched);
+  assert.equal(app.activity().recomputed, 0, "canonical event data must not recompute all products");
+  assert.equal(app.activity().rendered, 1);
+  assert.equal(element("drawerProductName").textContent, "Fresh canonical product");
+  assert.equal(state.activeProductId, productId); assert.equal(state.resultPage, 3);
+  assert.equal(state.activeRunCriteria.minRating, 4.5);
+  assert.equal(element("resultSearch").value, "manual search");
+  assert.equal(element("resultMinMargin").value, "25");
+  assert.equal(element("resultsCompleteToggle").checked, true);
+  assert.equal(element(".view-stack").scrollTop, 730); assert.equal(element(".drawer-content").scrollTop, 221);
+  assert.equal(calls.length, 0, "a contiguous event neither fetches a full snapshot nor writes it back");
+  assert.match(app.row(productId), /FBA 封顶估算/);
+});
+
+for (const status of ["paused", "needs_attention", "completed"]) {
+  test(`${status} product event preserves the known running worker until a status read confirms it stopped`, async () => {
+    const fixture = harness(); const { app, events, calls } = fixture;
+    app.restore(snapshot(job("running", 1))); app.startEvents();
+    const update = amazonProductEvent(recomputeProductProfit(canonicalProduct()));
+    update.job = job(status, 2); delete update.job.workerActive;
+    emitSnapshotEvent(events, update);
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, true);
+    assert.equal(app.locked(), true);
+    assert.equal(calls.length, 0, "worker-state protection must preserve the incremental update path");
+    fixture.respond(async path => { assert.equal(path, "/api/amazon/collection"); return { ...job(status, 2), workerActive: false }; });
+    await app.load();
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, false);
+    assert.equal(app.locked(), false);
+    update.baseRevision = 2; update.revision = 3; update.job.revision = 3;
+    emitSnapshotEvent(events, update);
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, false);
+    assert.equal(app.locked(), false, "later persisted events retain the explicit stopped state");
+  });
+
+  test(`${status} full snapshot preserves the known worker flag and accepts a later explicit false`, async () => {
+    const fixture = harness(); const { app } = fixture;
+    app.restore(snapshot(job("running", 1)));
+    const persistedJob = job(status, 2); delete persistedJob.workerActive;
+    fixture.respond(async path => path === "/api/amazon/collection"
+      ? { ...persistedJob, workerActive: false } : snapshot(persistedJob));
+    await app.refresh();
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, true);
+    assert.equal(app.locked(), true);
+    await app.load(); await app.refresh();
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, false);
+    assert.equal(app.locked(), false);
+  });
+}
+
+for (const route of ["status", "snapshot"]) {
+  test(`worker state is not inherited from a different run through ${route}`, () => {
+    const { app } = harness();
+    app.restore(snapshot(job("running", 1)));
+    const other = { ...job("paused", 2), runId: "other-synthetic-run" }; delete other.workerActive;
+    if (route === "status") {
+      app.apply(other);
+      assert.equal(app.importState().amazonCollectionJob.workerActive, undefined);
+      assert.equal(app.state().runState.amazonCollectionJob.workerActive, true, "the original run keeps its own lock");
+    }
+    app.restore(snapshot(other));
+    assert.equal(app.state().runState.id, other.runId);
+    assert.equal(app.state().runState.amazonCollectionJob.workerActive, undefined);
+    assert.equal(app.locked(), false);
+  });
+}
+
+test("stale Amazon product events and archived runs are ignored without refresh or recomputation", async () => {
+  const { app, calls, events } = harness();
+  app.restore(snapshot(job("running", 4))); app.startEvents(); app.resetActivity();
+  const original = app.state().products[0];
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), name: "Stale" }, 3, 2));
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), name: "Duplicate" }, 4, 3));
+  app.state().runState.archivedAt = "2026-10-13T00:00:00.000Z";
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), name: "Archived" }, 5, 4));
+  await app.settleSnapshots();
+  assert.strictEqual(app.state().products[0], original);
+  assert.equal(app.state().revision, 4); assert.equal(calls.length, 0);
+  assert.equal(app.activity().recomputed, 0); assert.equal(app.activity().rendered, 0);
+});
+
+for (const reason of ["gap", "new product", "old formula", "job revision mismatch"]) {
+  test(`unsafe Amazon product event (${reason}) falls back to a canonical snapshot`, async () => {
+    const fixture = harness(); const { app, calls, events } = fixture;
+    app.restore(snapshot()); app.startEvents();
+    const update = amazonProductEvent(recomputeProductProfit({ ...canonicalProduct(), name: "Event data" }));
+    if (reason === "gap") { update.baseRevision = 5; update.revision = 6; update.job.revision = 6; }
+    if (reason === "new product") update.products = [imageCandidate(2)];
+    if (reason === "old formula") update.formulaVersion = "profit-workbook-au-ca-envelope-fba-v10";
+    if (reason === "job revision mismatch") update.job.revision = 9;
+    fixture.respond(async path => { assert.equal(path, `/api/runs/${runId}`); return snapshot(job("running", 6), [{ ...canonicalProduct(), name: "Full canonical snapshot" }]); });
+    emitSnapshotEvent(events, update); await app.settleSnapshots();
+    assert.equal(app.state().products[0].name, "Full canonical snapshot");
+    assert.equal(app.state().revision, 6);
+    assert.equal(calls.length, 1); assert.ok(!calls[0].options.method || calls[0].options.method === "GET");
+  });
+}
+
+test("Amazon product events during a snapshot refresh request a second read and retain the newer revision", async () => {
+  const fixture = harness(); const { app, calls, events } = fixture;
+  app.restore(snapshot()); app.startEvents();
+  let resolveFirst;
+  fixture.respond(async () => calls.length === 1 ? new Promise(resolve => { resolveFirst = resolve; })
+    : snapshot(job("running", 3), [{ ...canonicalProduct(), name: "Latest persisted product" }]));
+  const refresh = app.refresh();
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), name: "Newer event" }, 3, 2));
+  assert.equal(calls.length, 1);
+  resolveFirst(snapshot(job("running", 2)));
+  await refresh; await app.settleSnapshots();
+  assert.equal(calls.length, 2);
+  assert.equal(app.state().revision, 3);
+  assert.equal(app.state().products[0].name, "Latest persisted product");
+});
+
+test("Amazon product events racing a profit save use the deferred full snapshot after saving", async () => {
+  const fixture = harness(); const { app, calls, events } = fixture;
+  app.restore(snapshot()); app.startEvents(); app.setPendingProfitSaves(1);
+  fixture.respond(async () => snapshot(job("paused", 2), [{ ...canonicalProduct(), salePrice: 29 }]));
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), salePrice: 999 }));
+  await app.settleSnapshots();
+  assert.equal(app.state().products[0].salePrice, 18);
+  app.setPendingProfitSaves(0); await app.settleSnapshots();
+  assert.equal(app.state().products[0].salePrice, 29);
+  assert.equal(calls.length, 2);
+});
+
+test("Amazon product events preserve an unsaved profit editor draft through snapshot fallback", async () => {
+  const fixture = harness(); const { app, calls, events, element } = fixture;
+  app.restore(snapshot(job("paused", 1))); app.openLocalDrawer(productId); app.bindEditor(); app.startEvents();
+  element("editSalePrice").value = "25";
+  await fixture.fire("editSalePrice", "input");
+  fixture.respond(async () => snapshot(job("paused", 2), [{ ...canonicalProduct(), name: "Backend refreshed" }]));
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), salePrice: 999 }));
+  await app.settleSnapshots();
+  assert.equal(calls.length, 1);
+  assert.equal(app.state().products[0].name, "Backend refreshed");
+  assert.equal(Number(element("editSalePrice").value), 25);
+});
+
+test("Amazon event fallback captures a drawer input even before its input handler runs", async () => {
+  const fixture = harness(); const { app, events, element } = fixture;
+  app.restore(snapshot(job("paused", 1))); app.openLocalDrawer(productId); app.startEvents();
+  element("editSalePrice").value = "25";
+  fixture.respond(async () => snapshot(job("paused", 2), [canonicalProduct()]));
+  emitSnapshotEvent(events, amazonProductEvent({ ...canonicalProduct(), salePrice: 999 }));
+  await app.settleSnapshots();
+  assert.equal(app.state().products[0].salePrice, 18);
+  assert.equal(Number(element("editSalePrice").value), 25);
+});
+
+for (const [marketplace, cap] of [["AU", 475], ["CA", 500]]) {
+  test(`${marketplace} overweight drawer labels the capped estimate and retains the real freight weight`, () => {
+    const { app, element } = harness();
+    const item = automaticEnvelopeProduct(marketplace, 20, 2.345);
+    app.restore(snapshot(job("paused"), [item])); app.useRealDrawer(); app.openLocalDrawer(item.id);
+    const result = app.state().products[0];
+    assert.equal(result.billingWeight, 2.345);
+    assert.equal(result.profitCalculation.domesticFreightWeightKg, 2.345);
+    assert.match(element("amazonMetrics").innerHTML, /FBA 超重封顶估算/);
+    assert.match(element("amazonMetrics").innerHTML, new RegExp(`${cap} g · 国内运费与空运头程按实际重量`));
+    assert.match(app.row(item.id), /FBA 封顶估算/);
+  });
+}
 
 test("supplier events for another run and malformed events leave the active run and requests untouched", async () => {
   const { app, calls, events } = harness();
@@ -1160,23 +1646,95 @@ test("a cooldown resume response reports waiting rather than active image matchi
   assert.match(fixture.toasts.at(-1)[0], /冷却/);
 });
 
+function productInformationWithoutWeight(asin = "B000000001") {
+  return { version: 1, asin, status: "complete", reason: null, weightStatus: "not_provided", rowCount: 2,
+    inspection: { version: 3, asin, status: "complete", stable: true, rowCount: 2, parsedSections: [{ selector: "#productDetails_feature_div", rowCount: 2 }], sections: [{ selector: "#productDetails_feature_div", status: "complete", rowCount: 2 }] },
+    sections: [{ selector: "#productDetails_feature_div", heading: "Item details", rows: [{ label: "ASIN", value: asin }, { label: "Brand", value: "Example" }] }] };
+}
+
 function pageWithoutWeight(overrides = {}) {
   return { ...canonicalProduct(), productWeight: null, fbaWeight: null, billingWeight: null,
     manualFbaFee: false, fbaFee: null,
+    productInformation: productInformationWithoutWeight(),
     collectionQuality: { fields: { weight: { status: "unavailable", reason: "page_not_provided" } } },
     profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: null }, ...overrides };
 }
 
-test("confirmed absent weight uses minimum FBA and can be reviewed without fabricating weight or profit", () => {
+for (const marketplace of ["AU", "CA", "US", "NL", "UK", "DE", "FR", "IT", "ES", "PL", "MX", "BR"]) {
+  test(`${marketplace} uncollected, incomplete and absent Item Weight show independent minimum-tier profit estimates`, () => {
+    for (const state of ["uncollected", "incomplete", "not_provided"]) {
+      const { app, element } = harness();
+      const item = pageWithoutWeight({ marketplace, detailStatus: state === "uncollected" ? "pending" : "success",
+        ...(state !== "not_provided" ? { productInformation: state === "incomplete" ? { ...productInformationWithoutWeight(), status: "incomplete", weightStatus: "unresolved" } : null,
+          collectionQuality: { fields: { weight: { status: "missing", reason: "product_information_incomplete" } } } } : {}) });
+      app.restore(snapshot(job("completed"), [item]));
+      const current = app.state().products[0];
+      const assumed = marketplace === "AU" ? 0.075 : marketplace === "CA" ? 0.1 : 0.25 / 2.2046226218;
+      assert.equal(current.productWeight, null);
+      assert.equal(current.billingWeight, null);
+      assert.equal(current.profitInputs.actualWeightKg, null);
+      if (["AU", "CA"].includes(marketplace)) {
+        assert.equal(current.profitInputs.assumedWeightKg, undefined);
+        assert.equal(current.profitCalculation, null);
+        assert.equal(current.fbaFee, null);
+        assert.ok(current.amazonMissing.includes("商品重量、包裹重量及尺寸均缺失"));
+        continue;
+      }
+      assert.equal(current.profitInputs.assumedWeightKg, assumed);
+      assert.equal(current.profitCalculation.airFreight.actualWeightKg, null);
+      assert.equal(current.profitCalculation.assumedWeightKg, assumed);
+      assert.ok(Number.isFinite(current.margin));
+      assert.equal(current.complete, false);
+      assert.match(app.row(productId), /最低档暂估/);
+      app.openLocalDrawer(productId);
+      assert.equal(element("editWeight").value, "");
+      assert.match(element("drawerProfitValue").innerHTML, /最低档暂估/);
+      assert.match(element("costBreakdown").innerHTML, /实际重量未知/);
+      assert.doesNotMatch(element("costBreakdown").innerHTML, /nullg|商品重量 0g/);
+      app.openManual();
+      assert.match(element("manualCostProfitMargin").textContent, /最低档暂估/);
+    }
+  });
+}
+
+test("FBM missing weight still needs real weight and does not inherit a minimum-tier assumption", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("completed"), [pageWithoutWeight({ fulfillmentMode: "FBM", fbmFee: 3, manualFbmFee: true })]));
+  const current = app.state().products[0];
+  assert.equal(current.profitCalculation, null);
+  assert.equal(current.profitInputs.assumedWeightKg, undefined);
+  app.openLocalDrawer(productId);
+  assert.equal(element("approveProductButton").disabled, true);
+});
+
+test("invalid saved actual weight cannot silently become a minimum-tier estimate in the frontend", () => {
+  for (const raw of [0, -1, "invalid", false]) {
+    for (const field of ["productWeight", "profitInputs"]) {
+      const { app, element } = harness();
+      const item = pageWithoutWeight({ detailParserVersion: 11,
+        ...(field === "profitInputs" ? { profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: raw } } : { productWeight: raw }) });
+      app.restore(snapshot(job("completed"), [item]));
+      const current = app.state().products[0];
+      assert.equal(current.profitCalculation, null, `${field}=${raw}`);
+      assert.equal(current.profitInputs.assumedWeightKg, undefined);
+      assert.equal(current.fbaFee, null);
+      app.openLocalDrawer(productId);
+      assert.equal(element("approveProductButton").disabled, true);
+      assert.doesNotMatch(element("costBreakdown").innerHTML, /最低档|假设重量/);
+    }
+  }
+});
+
+test("confirmed absent weight estimates minimum-tier profit and can be reviewed without fabricating actual weight", () => {
   const { app, element, toasts } = harness();
   const original = pageWithoutWeight();
   app.restore(snapshot(job("completed"), [original]));
   const restoredSuppliers = structuredClone(app.state().products[0].suppliers);
   app.openLocalDrawer(productId);
   assert.equal(element("editWeight").value, "");
-  assert.equal(Number(element("editFbaFee").value), 4.58);
+  assert.equal(element("editFbaFee").value, "");
   assert.equal(element("approveProductButton").disabled, false);
-  assert.match(element("costBreakdown").innerHTML, /最低档/);
+  assert.doesNotMatch(element("costBreakdown").innerHTML, /最低档/);
   app.approve();
   const product = app.state().products[0];
   assert.equal(product.reviewStatus, "approved");
@@ -1185,10 +1743,11 @@ test("confirmed absent weight uses minimum FBA and can be reviewed without fabri
   assert.equal(product.profitInputs.actualWeightKg, null);
   assert.equal(product.profitCalculation, null);
   assert.equal(product.margin, null);
+  assert.ok(product.amazonMissing.includes("商品重量、包裹重量及尺寸均缺失"));
   assert.equal(product.salePrice, original.salePrice);
   assert.equal(product.purchaseCost, original.purchaseCost);
   assert.deepEqual(structuredClone(product.suppliers), restoredSuppliers);
-  assert.match(toasts.at(-1)[0], /初审通过.*最低档估算/);
+  assert.match(toasts.at(-1)[0], /初审通过.*尚无完整利润/);
 });
 
 test("candidate initial review may precede purchase quotes and price collection", () => {
@@ -1208,14 +1767,18 @@ test("candidate initial review may precede purchase quotes and price collection"
   assert.equal(product.manualPurchaseCost, false);
 });
 
-for (const status of ["pending", "failed"]) test(status + " detail does not qualify as page weight absence", () => {
+for (const status of ["pending", "failed"]) test(status + " detail can estimate profit without claiming page weight absence", () => {
   const { app, element } = harness();
   app.restore(snapshot(job("paused"), [pageWithoutWeight({ detailStatus: status })]));
   app.openLocalDrawer(productId);
-  assert.equal(element("approveProductButton").disabled, true);
+  assert.equal(element("approveProductButton").disabled, false);
   assert.equal(app.state().products[0].fbaFee, null);
+  assert.match(element("amazonMetrics").innerHTML, /待核验|尚未|待采集/);
+  assert.doesNotMatch(element("costBreakdown").innerHTML, /页面未提供重量/);
   app.approve();
-  assert.equal(app.state().products[0].reviewStatus, "pending");
+  assert.equal(app.state().products[0].reviewStatus, "approved");
+  assert.equal(app.state().products[0].detailStatus, status);
+  assert.equal(app.state().products[0].productWeight, null);
 });
 
 for (const raw of ["0", "-1", "oops"]) test("invalid weight " + raw + " cannot pass initial review", () => {
@@ -1258,7 +1821,7 @@ test("manual cost dialog also permits confirmed missing weight and preserves man
   assert.equal(product.billingWeight, null);
   assert.equal(product.salePrice, 18);
   assert.equal(product.manualSalePrice, true);
-  assert.equal(product.fbaFee, 4.58);
+  assert.equal(product.fbaFee, null);
 });
 
 for (const raw of ["0", "-1", "oops"]) test("manual dialog rejects invalid weight " + raw, () => {
@@ -1335,6 +1898,8 @@ test("a real manual weight replaces the minimum FBA assumption with an ordinary 
   assert.equal(product.fbaFeeSource, "au_standard_envelope_price_rate");
   assert.equal(product.fbaEstimate.assumption, "standard_envelope_dimensions_assumed");
   assert.equal(product.profitInputs.actualWeightKg, 0.2);
+  assert.equal(product.profitInputs.assumedWeightKg, undefined);
+  assert.equal(product.profitCalculation.weightAssumption, undefined);
   assert.ok(Number.isFinite(product.margin));
 });
 
@@ -2088,23 +2653,26 @@ test('confirmed missing weight follows the current price band and still permits 
     ['AU', 13, 13.01, 4.58], ['CA', 13.99, 14, 4.73 * 1.035],
   ]) {
     const initial = { ...automaticEnvelopeProduct(marketplace, before, null),
+      productInformation: productInformationWithoutWeight(),
       collectionQuality: { fields: { weight: { status: 'unavailable', reason: 'page_not_provided' } } } };
     const { app, element, fire } = editableProfitFixture(initial);
     element('editSalePrice').value = String(after);
     await fire('editSalePrice', 'input');
-    assert.equal(app.editor().fulfillmentFee, expected);
-    assert.equal(element('editFbaFee').value, expected.toFixed(2));
+    assert.equal(app.editor().fulfillmentFee, null);
+    assert.equal(element('editFbaFee').value, '');
     app.approve();
     const result = app.state().products[0];
     assert.equal(result.reviewStatus, 'approved');
-    assert.equal(result.fbaFee, expected);
+    assert.equal(result.fbaFee, null);
     assert.equal(result.billingWeight, null);
     assert.equal(result.profitCalculation, null);
+    assert.equal(result.margin, null);
   }
 });
 
 
-test('v9 migration retains preliminary approval unless the automatic fee really changes', () => {
+for (const formulaVersion of ['profit-workbook-au-weight-only-fba-v9', 'profit-workbook-au-ca-envelope-fba-v10']) {
+test(`${formulaVersion} migration retains preliminary approval unless the automatic fee really changes`, () => {
   const cases = [
     { product: { ...canonicalProduct(), manualFbaFee: true, fbaFee: 2 }, status: 'approved', fee: 2 },
     { product: { ...canonicalProduct(), manualFbaFee: false, fbaFee: 2, fbaFeeSource: 'manual' }, status: 'approved', fee: 2 },
@@ -2115,7 +2683,7 @@ test('v9 migration retains preliminary approval unless the automatic fee really 
   for (const { product, status, fee } of cases) {
     product.reviewStatus = 'approved';
     product.profitInputs = { ...(product.profitInputs || canonicalProduct().profitInputs),
-      formulaVersion: 'profit-workbook-au-weight-only-fba-v9' };
+      formulaVersion };
     const { app } = harness();
     app.restore(snapshot(job('completed'), [product]), { persistMigrations: false });
     const restored = app.state().products[0];
@@ -2124,6 +2692,7 @@ test('v9 migration retains preliminary approval unless the automatic fee really 
   }
 });
 
+}
 
 function uploadFixture(status = 'paused', marketplace = 'AU', exchangeRate = null) {
   const fixture = harness();
@@ -2446,4 +3015,1275 @@ test("a late successful collection result cannot overwrite manually entered mont
   assert.equal(saved.fieldSources.sales30, "manual");
   assert.equal(saved.manualAmazonFields.sales30, true);
   assert.equal(app.filtered().some(item => item.id === manual.id), false);
+});
+
+
+const lostControlResponse = () => Object.assign(new Error('Response timed out after submission'), { code: 'REQUEST_TIMEOUT' });
+
+test('a lost Amazon pause response is confirmed once and a later snapshot timeout is only a sync warning', async () => {
+  const fixture = harness();
+  const { app, calls, toasts } = fixture;
+  app.restore(snapshot(job('running', 1)));
+  const paused = { ...job('paused', 2), causeCode: 'USER_PAUSED' };
+  fixture.respond(async path => {
+    if (path === '/api/amazon/collection/control') throw lostControlResponse();
+    if (path === '/api/amazon/collection') return paused;
+    if (path === `/api/runs/${runId}`) throw lostControlResponse();
+    throw new Error(`Unexpected ${path}`);
+  });
+  await app.control('pause');
+  assert.equal(app.state().runState.amazonCollectionJob.status, 'paused');
+  assert.deepEqual(calls.map(call => call.path), ['/api/amazon/collection/control', '/api/amazon/collection', `/api/runs/${runId}`]);
+  assert.ok(toasts.some(([message]) => message.includes('已确认') && message.includes('进度待同步')));
+  assert.equal(toasts.some(([message]) => /状态未更新|尚未开始/.test(message)), false);
+});
+
+test('an unconfirmed command for another run is never replayed by a second click', async () => {
+  const fixture = harness();
+  const { app, calls, toasts } = fixture;
+  app.restore(snapshot(job('running', 1)));
+  fixture.respond(async path => {
+    if (path === '/api/amazon/collection/control') throw new TypeError('Failed to fetch');
+    if (path === '/api/amazon/collection') return { ...job('paused', 2), runId: 'different-run', causeCode: 'USER_PAUSED' };
+    throw new Error(`Unexpected ${path}`);
+  });
+  await app.control('pause');
+  await app.control('pause');
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
+  assert.equal(calls.filter(call => call.path === '/api/amazon/collection').length, 2);
+  assert.equal(app.state().runState.amazonCollectionJob.status, 'running');
+  assert.ok(toasts.every(([message]) => message.includes('结果待确认')));
+});
+
+for (const action of ['resume', 'resume_after_supplier', 'retry_missing']) {
+  for (const advanced of [false, true]) {
+    test(`Amazon ${action} requires a newer revision to confirm completed after a lost response (${advanced})`, async () => {
+      const fixture = harness();
+      const { app, calls } = fixture;
+      const before = { ...job('paused', 3), causeCode: action === 'resume_after_supplier' ? 'SUPPLIER_MATCHING' : 'USER_PAUSED' };
+      app.restore(snapshot(before));
+      fixture.respond(async path => {
+        if (path.endsWith('/control')) throw lostControlResponse();
+        assert.equal(path, '/api/amazon/collection');
+        return job('completed', advanced ? 4 : 3);
+      });
+      const pending = app.requestControl('amazon', { runId, action });
+      if (advanced) assert.equal((await pending).status, 'completed');
+      else await assert.rejects(pending, { code: 'CONTROL_OUTCOME_UNKNOWN' });
+      assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
+      assert.equal(calls.length, 2);
+    });
+  }
+}
+
+test('retry_missing does not infer acceptance from an unchanged active revision', async () => {
+  const fixture = harness();
+  const { app } = fixture;
+  app.restore(snapshot(job('running', 5)));
+  fixture.respond(async path => { if (path.endsWith('/control')) throw lostControlResponse(); return job('running', 5); });
+  await assert.rejects(app.requestControl('amazon', { runId, action: 'retry_missing' }), { code: 'CONTROL_OUTCOME_UNKNOWN' });
+});
+
+for (const [workerActive, snapshotRevision, expected] of [[false, 2, true], [true, 2, false], [false, 1, false]]) {
+  test(`supplier preparation after a lost pause response requires an idle worker and matching snapshot (${workerActive},${snapshotRevision})`, async () => {
+    const fixture = harness();
+    const { app, calls } = fixture;
+    app.restore(snapshot(job('running', 1), [imageCandidate()]));
+    const paused = { ...job('paused', 2), causeCode: 'SUPPLIER_MATCHING', workerActive };
+    fixture.respond(async path => {
+      if (path === '/api/amazon/collection/control') throw lostControlResponse();
+      if (path === '/api/amazon/collection') return paused;
+      if (path === `/api/runs/${runId}`) return snapshot({ ...paused, revision: snapshotRevision }, [imageCandidate()]);
+      throw new Error(`Unexpected ${path}`);
+    });
+    assert.equal(await app.prepareSupplier(), expected);
+    assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
+    assert.equal(calls.some(call => call.path.includes('/1688/')), false);
+  });
+}
+
+test('a lost supplier resume response is adopted even when its subsequent snapshot cannot load', async () => {
+  const fixture = harness();
+  const { app, calls, toasts } = fixture;
+  app.restore(supplierSnapshot(supplierPipeline({ status: 'paused', enabled: false, revision: 1 }), [imageCandidate()]));
+  const running = supplierPipeline({ revision: 2 });
+  fixture.respond(async path => {
+    if (path === '/api/1688/pipeline/control') throw lostControlResponse();
+    if (path === '/api/1688/pipeline') return running;
+    if (path === `/api/runs/${runId}`) throw lostControlResponse();
+    throw new Error(`Unexpected ${path}`);
+  });
+  assert.equal(await app.resumeSupplier(), true);
+  assert.equal(app.state().runState.supplier1688Pipeline.status, 'running');
+  assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
+  assert.ok(toasts.some(([message]) => message.includes('进度待同步')));
+  assert.equal(toasts.some(([message]) => /暂未继续|尚未开始/.test(message)), false);
+});
+
+test('supplier pause response loss performs one status read and adopts the confirmed paused task', async () => {
+  const fixture = harness();
+  const { app, calls } = fixture;
+  app.restore(supplierSnapshot(supplierPipeline(), [imageCandidate()]));
+  const paused = supplierPipeline({ status: 'paused', enabled: false, revision: 2 });
+  fixture.respond(async path => {
+    if (path === '/api/1688/pipeline/control') throw new TypeError('Failed to fetch');
+    if (path === '/api/1688/pipeline') return paused;
+    if (path === `/api/runs/${runId}`) return supplierSnapshot(paused, [imageCandidate()]);
+    throw new Error(`Unexpected ${path}`);
+  });
+  await app.pauseSupplier();
+  assert.equal(app.state().runState.supplier1688Pipeline.status, 'paused');
+  assert.deepEqual(calls.map(call => call.path), ['/api/1688/pipeline/control', '/api/1688/pipeline', `/api/runs/${runId}`]);
+});
+
+for (const [revision, includesSelection, expected] of [[1, true, false], [2, false, false], [2, true, true]]) {
+  test(`lost append response requires the selected IDs and revision evidence (${revision},${includesSelection})`, async () => {
+    const fixture = harness();
+    const { app, calls } = fixture;
+    app.restore(supplierSnapshot(supplierPipeline({ status: 'paused', enabled: false }), [imageCandidate(), imageCandidate(2)]));
+    const selected = [productId, imageCandidate(2).id];
+    fixture.respond(async path => {
+      if (path.endsWith('/control')) throw lostControlResponse();
+      return supplierPipeline({ revision, productIds: includesSelection ? selected : [productId] });
+    });
+    const pending = app.requestControl('supplier', { runId, action: 'append', productIds: selected });
+    if (expected) assert.equal((await pending).revision, revision);
+    else await assert.rejects(pending, { code: 'CONTROL_OUTCOME_UNKNOWN' });
+    assert.equal(calls.length, 2);
+    assert.equal(calls.filter(call => call.options.method === 'POST').length, 1);
+  });
+}
+
+for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED']) {
+  test(`${code} exposes an explicit technical recovery button without describing a captcha or automatically resuming`, async () => {
+    const fixture = harness();
+    const { app, element, calls, toasts } = fixture;
+    app.restore(snapshot(job('completed', 1), [imageCandidate()]));
+    app.applySession({ ready: true, reason: 'ready' }, { running: 0, queued: 0, activeTasks: [], ratePolicy: { pausedReason: code, manualResumeRequired: true } });
+    assert.equal(element('resume1688Button').hidden, false);
+    assert.equal(element('resume1688Button').textContent, '检查后继续');
+    assert.match(element('supplier1688StatusText').textContent, /搜图进程中断/);
+    assert.doesNotMatch(element('supplier1688StatusText').textContent, /验证/);
+    assert.equal(await app.startMatching(), false);
+    assert.equal(calls.length, 0);
+    fixture.respond(async (path, options) => {
+      assert.equal(path, '/api/v1/queue/resume');
+      assert.deepEqual(JSON.parse(options.body), { confirmed: true });
+      return { auth: { ready: true, reason: 'ready' }, queue: { running: 0, queued: 0, activeTasks: [], ratePolicy: { pausedReason: null } } };
+    });
+    assert.equal(await app.resumeQueue(), true);
+    assert.equal(calls.length, 1);
+    assert.equal(toasts.some(([message]) => message.includes('图片验证已确认')), false);
+  });
+}
+
+
+test('technical interruption keeps the ordinary login entry available after session expiry', () => {
+  const { app, element, calls } = harness();
+  app.restore(snapshot(job('completed', 1), [imageCandidate()]));
+  app.applySession({ ready: false, reason: 'login_required' }, { running: 0, queued: 0, activeTasks: [],
+    ratePolicy: { pausedReason: 'SEARCH_INTERRUPTED', manualResumeRequired: true } });
+  assert.equal(element('login1688Button').hidden, false);
+  assert.match(element('login1688Button').title, /专用 Edge/);
+  assert.doesNotMatch(element('login1688Button').title, /图片搜索验证/);
+  assert.match(element('supplier1688StatusText').textContent, /请先登录/);
+  assert.equal(calls.length, 0);
+});
+
+
+test("the drawer retains complete Product information rows and escapes their original text", () => {
+  const { app, element } = harness();
+  const product = canonicalProduct();
+  product.productInformation = { version: 1, asin: product.asin, status: "complete", weightStatus: "found", rowCount: 3,
+    sections: [{ selector: "#prodDetails", heading: "Item details", rows: [
+      { label: "ASIN", value: product.asin }, { label: "Item Weight", value: "20 g" },
+      { label: "Brand", value: '<img src=x onerror="alert(1)">' },
+    ] }] };
+  app.restore(snapshot(job("completed"), [product]));
+  app.openLocalDrawer(product.id);
+  const html = element("amazonProductInformation").innerHTML;
+  assert.match(html, /已完整读取 3 项/);
+  assert.match(html, /Item Weight/);
+  assert.match(html, /20 g/);
+  assert.match(html, /&lt;img/);
+  assert.doesNotMatch(html, /<img/);
+  assert.equal(element("amazonProductInformation").hidden, false);
+});
+
+test("an old successful page without Product information proof can estimate profit without claiming page absence", () => {
+  const { app, element } = harness();
+  const product = pageWithoutWeight({ productInformation: null });
+  app.restore(snapshot(job("completed"), [product]));
+  app.openLocalDrawer(product.id);
+  assert.match(element("amazonProductInformation").innerHTML, /尚未完整读取/);
+  assert.equal(app.state().products[0].fbaFee, null);
+  assert.equal(app.state().products[0].profitCalculation, null);
+  assert.doesNotMatch(element("costBreakdown").innerHTML, /页面未提供重量/);
+});
+
+
+function datedCandidate(index, date, extra = {}) {
+  return imageCandidate(index, { detailStatus: "success", amazonFirstAvailableDate: date,
+    amazonFirstAvailableDateStatus: date ? "found" : "unresolved", rating: 4.7, reviews: 40, missing: [], amazonMissing: [],
+    amazonFirstAvailableDateEvidence: date ? { source: "amazon_product_information", asin: `B${String(index).padStart(9, "0")}`,
+      marketplace: "AU", label: "Date First Available", rawText: date, value: date } : null, ...extra });
+}
+
+test("missing listing dates are labelled without blocking profit, complete candidates or explicit date filtering", () => {
+  const { app, element, calls } = harness();
+  const items = ['found', 'not_provided', 'unresolved'].map((status, index) => {
+    const asin = `B${String(index + 1).padStart(9, '0')}`;
+    return { ...canonicalProduct(), id: `AU:${asin}`, asin, sourceAsin: asin,
+      sales30Evidence: { ...canonicalProduct().sales30Evidence, asin },
+      amazonFirstAvailableDate: status === 'found' ? '2026-10-01' : null, amazonFirstAvailableDateStatus: status,
+      missing: ['竞品上架时间'], amazonMissing: ['竞品上架时间'], complete: false };
+  });
+  const saved = snapshot(job('completed'), items);
+  saved.runState.inputMode = saved.storeList.inputMode = 'asins';
+  app.restore(saved);
+  app.view(null, 1, {});
+  element('resultsCompleteToggle').checked = true;
+  const restored = app.state().products;
+  assert.equal(app.filtered().length, 3);
+  for (const product of restored) {
+    assert.equal(product.complete, true);
+    assert.ok(Number.isFinite(product.margin));
+    assert.equal(product.margin, restored[0].margin);
+    assert.equal(product.profitValue, restored[0].profitValue);
+    assert.ok(!product.missing.some(value => /上架|日期/.test(value)));
+    assert.ok(!product.profitPendingReasons.some(value => /上架|日期/.test(value)));
+    assert.doesNotMatch(app.row(product.id), /待计算/);
+  }
+  assert.match(app.row(restored[1].id), /Amazon 未提供上架日期.*不影响利润计算/);
+  assert.match(app.row(restored[2].id), /上架日期待核验.*不影响利润计算/);
+  app.openLocalDrawer(restored[1].id);
+  assert.match(element('amazonMetrics').innerHTML, /Amazon 未提供上架日期/);
+  assert.match(element('amazonMetrics').innerHTML, /不影响利润计算及正常分析/);
+  app.dateCoverage();
+  assert.match(element('amazonListingDateCoverage').textContent, /未知日期正常参与分析/);
+  element('amazonFirstAvailableFrom').value = '2026-10-01';
+  app.applyDate();
+  assert.deepEqual(Array.from(app.filtered(), product => product.id), [restored[0].id]);
+  assert.equal(restored[1].margin, restored[0].margin, 'An active date filter must not erase stored profit.');
+  assert.equal(calls.length, 0);
+});
+
+test("unavailable and unverified listing dates do not block the default ASIN supplier-matching selection", () => {
+  const { app, element } = harness();
+  const items = ['not_provided', 'unresolved'].map((status, index) => imageCandidate(index + 1, {
+    detailStatus: 'success', currentPrice: 30, currentPriceStatus: 'verified', productWeight: 0.1, billingWeight: 0.1,
+    amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: status,
+  }));
+  const saved = snapshot(job('completed'), items);
+  saved.runState.inputMode = saved.storeList.inputMode = 'asins';
+  app.restore(saved);
+  app.view(null, 1, {});
+  assert.equal(app.filtered().length, 2);
+  assert.equal(app.matching().length, 2);
+  element('amazonFirstAvailableFrom').value = '2026-10-01';
+  app.applyDate();
+  assert.equal(app.filtered().length, 0);
+  assert.equal(app.matching().length, 0);
+  assert.equal(app.state().products.length, 2);
+});
+
+test("calendar filtering includes start and local today, excludes unknown/future dates and never mutates or recollects products", async () => {
+  const fixture = harness();
+  const { app, element, calls } = fixture;
+  app.restore(snapshot(job("paused"), []));
+  const items = [datedCandidate(1, "2026-10-01"), datedCandidate(2, "2026-10-13"), datedCandidate(3, "2026-09-30"),
+    datedCandidate(4, "2026-10-14"), datedCandidate(5, null, { amazonFirstAvailableDateStatus: "not_provided" }),
+    datedCandidate(6, null, { listingAvailableAt: "2026-10-12", firstFba: "2026-10-12" }),
+    datedCandidate(7, "2026-02-30"), datedCandidate(8, null)];
+  app.setProducts(items);
+  app.view(null, 6, {});
+  app.dateFilters();
+  const before = JSON.stringify(items);
+  assert.equal(element("amazonFirstAvailableFrom").max, "2026-10-13");
+  element("amazonFirstAvailableFrom").value = "2026-10-01";
+  await fixture.fire("amazonFirstAvailableFrom", "change");
+  assert.deepEqual(Array.from(app.filtered(), p => p.asin), [items[0].asin, items[1].asin]);
+  assert.equal(app.state().resultPage, 1);
+  assert.equal(app.capture().resultCriteria.amazonFirstAvailableFrom, "2026-10-01");
+  assert.equal(app.capture().criteria.amazonFirstAvailableFrom, undefined, "date is a display criterion, never a collection input");
+  app.dateCoverage();
+  assert.match(element("amazonListingDateCoverage").textContent, /已取得 4 \/ 8.*未知 4.*页面未提供 1/);
+  assert.match(element("amazonListingDateCoverage").textContent, /2026-10-01 至 2026-10-13/);
+  await fixture.fire("clearAmazonListingDateButton", "click");
+  assert.equal(app.filtered().length, 8);
+  assert.equal(element("amazonFirstAvailableFrom").value, "");
+  assert.equal(JSON.stringify(items), before);
+  assert.match(app.row(items[4].id), /Amazon 未提供上架日期.*不影响利润计算/);
+  assert.equal(calls.length, 0);
+});
+
+test("invalid and future calendar input leaves the accepted range unchanged", () => {
+  const { app, element, toasts, calls } = harness();
+  app.restore(snapshot(job("paused"), [datedCandidate(1, "2026-10-03")]));
+  element("amazonFirstAvailableFrom").value = "2026-10-01";
+  assert.equal(app.applyDate(), true);
+  for (const invalid of ["2026-10-14", "2026-02-30", "10/01/2026"]) {
+    element("amazonFirstAvailableFrom").value = invalid;
+    assert.equal(app.applyDate(), false);
+    assert.equal(app.state().activeRunCriteria.amazonFirstAvailableFrom, "2026-10-01");
+  }
+  assert.equal(toasts.filter(([message]) => message.includes("有效上架起始日期")).length, 3);
+  assert.equal(calls.length, 0);
+});
+
+test("date criterion restores from snapshots, remains local to each run and survives a newer collection snapshot", async () => {
+  const fixture = harness();
+  const { app, element } = fixture;
+  const initial = snapshot(job("running", 1), [datedCandidate(1, "2026-10-12")]);
+  initial.resultCriteria.amazonFirstAvailableFrom = "2026-10-01";
+  app.restore(initial);
+  assert.equal(element("amazonFirstAvailableFrom").value, "2026-10-01");
+  element("amazonFirstAvailableFrom").value = "2026-10-10";
+  app.applyDate();
+  const newer = snapshot(job("running", 2), [datedCandidate(1, "2026-10-12")]);
+  fixture.respond(async path => { assert.equal(path, `/api/runs/${runId}`); return newer; });
+  await app.refresh();
+  assert.equal(app.state().activeRunCriteria.amazonFirstAvailableFrom, "2026-10-10");
+  assert.equal(element("amazonFirstAvailableFrom").value, "2026-10-10");
+  const other = snapshot({ ...job("paused"), runId: "other-date-run" }, [datedCandidate(2, null)]);
+  app.restore(other);
+  assert.equal(element("amazonFirstAvailableFrom").value, "");
+  assert.equal(app.filtered().length, 1);
+  app.restore(initial);
+  assert.equal(element("amazonFirstAvailableFrom").value, "2026-10-10");
+  const isolated = harness();
+  isolated.app.restore({ ...initial, resultCriteria: app.capture().resultCriteria });
+  assert.equal(isolated.element("amazonFirstAvailableFrom").value, "2026-10-10", "portable snapshot restores in a fresh browser session");
+});
+
+test("date and existing filters share the complete export/matching range and export button counts", async () => {
+  const fixture = harness();
+  const { app, element, exports } = fixture;
+  app.restore(snapshot(job("paused"), []));
+  const base = { complete: true, margin: 35, productWeight: 0.12, billingWeight: 0.12, sales30: 60, reviewStatus: "approved" };
+  app.setProducts([datedCandidate(1, "2026-10-01", base), datedCandidate(2, "2026-10-13", { ...base, reviewStatus: "pending" }),
+    datedCandidate(3, "2026-09-30", base), datedCandidate(4, null, base),
+    datedCandidate(5, "2026-10-12", { ...base, rating: 2 }), datedCandidate(6, "2026-10-12", { ...base, sales30: 120 }),
+    datedCandidate(7, "2026-10-12", { ...base, productWeight: 0.3 }), datedCandidate(8, "2026-10-12", { ...base, margin: 5 }),
+    datedCandidate(9, "2026-10-12", { ...base, name: "Red product", englishName: "Red product" }),
+    datedCandidate(10, "2026-10-12", { ...base, complete: false })]);
+  app.view(null, 3, { monthlySalesBand: "50_to_100", minRating: 4, minReviews: 20, amazonFirstAvailableFrom: "2026-10-01" });
+  element("resultSearch").value = "blue";
+  element("resultWeightBand").value = "100_150";
+  element("resultMinMargin").value = "20";
+  element("resultsCompleteToggle").checked = true;
+  const expected = Array.from(app.filtered(), p => p.id);
+  assert.equal(expected.length, 2);
+  assert.deepEqual(Array.from(app.exportRows(), p => p.id), expected);
+  assert.deepEqual(Array.from(app.matching(), p => p.id), expected);
+  app.exportCounts();
+  app.handoffSummary();
+  assert.equal(String(element("exportAllCandidateCount").textContent), "2");
+  assert.equal(String(element("exportApprovedProductCount").textContent), "1");
+  assert.equal(String(element("analysisReviewedExportCount").textContent), "1");
+  assert.equal(element("exportAllCandidatesButton").disabled, false);
+  await app.exportAll();
+  await app.exportApproved();
+  assert.deepEqual(exports.map(payload => payload.rows.length), [2, 1], JSON.stringify(fixture.toasts));
+  element("resultSearch").value = "matches-nothing";
+  app.exportCounts();
+  app.handoffSummary();
+  assert.equal(element("exportAllCandidatesButton").disabled, true);
+  assert.equal(element("exportApprovedProductsButton").disabled, true);
+  assert.equal(element("exportAnalysisHandoffButton").disabled, true);
+});
+
+test("Amazon listing fields survive mapping and successful refreshes replace dates without changing SellerSprite dates", () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job("paused"), []));
+  const old = datedCandidate(1, "2026-10-01", { listingAvailableAt: "2024-01-01", firstFba: "2024-02-01", manualFbaFee: true, fbaFee: 2 });
+  const incoming = { asin: old.asin, sourceAsin: old.asin, marketplace: "AU", detailStatus: "success", detailParserVersion: 8,
+    amazonFirstAvailableDate: "2026-10-12", amazonFirstAvailableDateStatus: "found", amazonFirstAvailableDateEvidence: { rawText: "12 October 2026", value: "2026-10-12" } };
+  const mapped = app.mapCandidate(incoming, 0);
+  assert.equal(mapped.amazonFirstAvailableDate, "2026-10-12");
+  assert.equal(mapped.amazonFirstAvailableDateEvidence.rawText, "12 October 2026");
+  assert.equal(mapped.listingAvailableAt, null);
+  app.setProducts([old]);
+  app.mergeCandidates([incoming]);
+  assert.equal(old.amazonFirstAvailableDate, "2026-10-12");
+  assert.equal(old.listingAvailableAt, "2024-01-01");
+  assert.equal(old.fbaFee, 2);
+  app.openLocalDrawer(old.id);
+  assert.match(element("amazonMetrics").innerHTML, /Amazon 上架日期/);
+  const failed = { ...incoming, detailStatus: "failed", detailErrorCode: "AMAZON_FETCH_TIMEOUT", amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: "unresolved" };
+  app.mergeCandidates([failed]);
+  assert.equal(old.amazonFirstAvailableDate, "2026-10-12");
+  const absent = { ...incoming, amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: "not_provided", amazonFirstAvailableDateEvidence: null };
+  app.mergeCandidates([absent]);
+  assert.equal(old.amazonFirstAvailableDate, null);
+  assert.equal(old.amazonFirstAvailableDateStatus, "not_provided");
+  assert.equal(old.collectionLastAttempt, undefined);
+  const batch = app.mergeRecords(incoming, absent);
+  assert.equal(batch.amazonFirstAvailableDate, null);
+  assert.equal(batch.amazonFirstAvailableDateStatus, "not_provided");
+  assert.equal(app.mapCandidate({ ...incoming, amazonFirstAvailableDate: null, listingAvailableAt: "2026-10-13" }, 0).amazonFirstAvailableDate, null);
+});
+
+
+for (const [marketplace, currency] of [["AU", "AUD"], ["CA", "CAD"]]) {
+  test(`Excel preserves the 35-column review contract and numeric/date values for ${marketplace}`, () => {
+    const { app } = harness();
+    const source = canonicalProduct();
+    Object.assign(source, { marketplace, sourceMarketplace: marketplace, currency, id: `${marketplace}:${source.asin}`,
+      amazonFirstAvailableDate: "2024-02-29", amazonFirstAvailableDateStatus: "found" });
+    const saved = snapshot(job("paused"), [source]);
+    saved.runState.marketplace = marketplace; saved.runState.currency = currency;
+    app.restore(saved);
+    const product = app.state().products[0];
+    const payload = app.spreadsheet([product,
+      { ...product, amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: "not_provided", listingAvailableAt: "2024-02-29" },
+      { ...product, amazonFirstAvailableDate: "2024-02-30", amazonFirstAvailableDateStatus: "found" }], marketplace);
+    const expected = ["商品 ID", "竞品图片", "源 ASIN", "商品名称", "生效采购件数",
+      `竞品当前售价 (${currency})`, "竞品当前售价 (CNY)", `我们的售价 (${currency})`, "我们的售价 (CNY)",
+      "评分", "评价数", "竞品 30 天销量", "利润计算重量 (kg)", "商品上架时间", "整套采购成本 (CNY)", "采购税率 (%)", "采购税费 (CNY)", "落地采购成本 (CNY)",
+      "履约方式", `FBA 配送费 (${currency})`, "FBA 配送费 (CNY)", "空运单价 (CNY/kg)", "单件空运头程 (CNY)",
+      "Amazon 佣金率 (%)", "汇损率 (%)", "营销费率 (%)", "管理费率 (%)", "退货预留率 (%)",
+      `预估总成本 (${currency})`, "预估总成本 (CNY)", `预估单件利润 (${currency})`, "预估单件利润 (CNY)", "预估经营利润率 (%)", "数据采集时间", "重量来源"];
+    assert.deepEqual(Array.from(payload.headers), expected);
+    assert.equal(payload.layout, "reviewed-products-v1");
+    assert.equal(payload.imageColumnIndex, 1);
+    assert.equal(payload.columnFormats[13], "yyyy-mm-dd");
+    assert.equal(payload.columnFormats.length, 35);
+    assert.deepEqual(Array.from(payload.rows, row => row.length), [35, 35, 35]);
+    assert.equal(payload.rows[0][13], 45351, "2024-02-29 is a numeric Excel date, independent of local timezone");
+    assert.equal(payload.rows[1][13], "", "unknown Amazon date never falls back to SellerSprite");
+    assert.equal(payload.rows[2][13], "");
+    const row = payload.rows[0];
+    assert.equal(row[4], 2);
+    assert.equal(row[5], 9.99);
+    assert.equal(row[7], 18);
+    assert.equal(row[12], 0.1);
+    assert.equal(row[14], 6);
+    assert.equal(row[19], 2);
+    for (const column of [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21]) assert.equal(typeof row[column], "number");
+    assert.equal(payload.images.length, 3);
+    assert.equal(payload.images[0].url, product.imageUrl);
+    assert.equal((product.amazonMissing || []).some(label => label.includes("上架")), false, "Amazon date is not a completeness requirement");
+  });
+}
+
+
+test("focusing the calendar after midnight updates today without clearing its accepted start", async () => {
+  const fixture = harness();
+  fixture.app.restore(snapshot(job("paused"), [datedCandidate(1, "2026-10-13")]));
+  fixture.app.dateFilters();
+  fixture.element("amazonFirstAvailableFrom").value = "2026-10-01";
+  fixture.app.applyDate();
+  fixture.setToday("2026-10-14");
+  await fixture.fire("amazonFirstAvailableFrom", "focus");
+  assert.equal(fixture.element("amazonFirstAvailableFrom").max, "2026-10-14");
+  assert.equal(fixture.element("amazonFirstAvailableFrom").value, "2026-10-01");
+  assert.equal(fixture.app.state().activeRunCriteria.amazonFirstAvailableFrom, "2026-10-01");
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("the upper product-data reset clears its date filter without altering the saved source products", async () => {
+  const fixture = harness();
+  fixture.app.restore(snapshot(job("running"), [datedCandidate(1, "2026-10-01"), datedCandidate(2, null)]));
+  fixture.app.dateFilters();
+  const before = JSON.stringify(fixture.app.state().products);
+  fixture.element("amazonFirstAvailableFrom").value = "2026-10-01";
+  fixture.app.applyDate();
+  assert.equal(fixture.app.filtered().length, 1);
+  await fixture.fire("clearFiltersButton", "click");
+  assert.equal(fixture.element("amazonFirstAvailableFrom").value, "");
+  assert.equal(fixture.app.state().activeRunCriteria.amazonFirstAvailableFrom, "");
+  assert.equal(fixture.app.filtered().length, 2);
+  assert.equal(JSON.stringify(fixture.app.state().products), before);
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("the review template exports the effective manual weight while preserving original Amazon weight", () => {
+  const { app } = harness();
+  const product = canonicalProduct();
+  Object.assign(product, { productWeight: 0.1, billingWeight: 0.25, manualBillingWeight: true,
+    profitInputs: { ...product.profitInputs, actualWeightKg: 0.25, weightSource: "product_manual" } });
+  app.restore(snapshot(job("paused"), [product]));
+  const current = app.state().products[0];
+  const payload = app.spreadsheet([current]);
+  assert.equal(payload.rows[0][payload.headers.indexOf("利润计算重量 (kg)")], 0.25);
+  assert.equal(current.productWeight, 0.1);
+  assert.equal(current.billingWeight, 0.25);
+  assert.equal(current.profitInputs.actualWeightKg, 0.25);
+  assert.equal(current.purchaseCost, 6);
+  assert.equal(current.salePrice, 18);
+  assert.equal(current.fbaFee, 2);
+});
+
+test('Item Weight policy rejects package and unsourced legacy mass consistently in rows, filters, drawer and export', () => {
+  for (const evidence of [null, { label: 'Package Weight', kind: 'package', value: 0.3 }]) {
+    const { app, element, calls } = harness();
+    const product = { ...canonicalProduct(), detailParserVersion: 11, productWeight: 0.3,
+      productWeightEvidence: evidence, fbaWeight: 0.3, billingWeight: 0.3,
+      profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.3 } };
+    app.restore(snapshot(job('paused'), [product]), { persistMigrations: false });
+    app.view(null, 1, {});
+    assert.match(app.row(productId), /商品及包裹重量待采集/);
+    assert.doesNotMatch(app.row(productId), /Item Weight 0\.3/);
+    element('resultWeightBand').value = '250_500';
+    assert.equal(app.filtered().length, 0);
+    app.openLocalDrawer(productId);
+    const metrics = element('amazonMetrics').innerHTML;
+    assert.doesNotMatch(metrics, /<dt>商品重量<\/dt><dd>0\.3/);
+    assert.match(metrics, /<dt>FBA 包装重量<\/dt><dd>0\.3/);
+    const current = app.state().products[0];
+    const payload = app.spreadsheet([current]);
+    assert.equal(payload.rows[0][payload.headers.indexOf('利润计算重量 (kg)')], '');
+    assert.equal(current.profitCalculation, null);
+    assert.equal(current.margin, null);
+    assert.equal(current.fbaWeight, 0.3);
+    assert.equal(current.purchaseCost, 6);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('Item Weight and manual override use the same product mass in row, drawer, filter and export', () => {
+  for (const manual of [false, true]) {
+    const { app, element } = harness();
+    const product = { ...canonicalProduct(), detailParserVersion: 11, productWeight: 0.14,
+      productWeightEvidence: { label: 'Item Weight', kind: 'product', value: 0.14 },
+      fbaWeight: 0.5, billingWeight: 0.5,
+      ...(manual ? { manualBillingWeight: true, billingWeight: 0.2,
+        profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.2, weightSource: 'product_manual' } } : {}) };
+    const mass = manual ? 0.2 : 0.14;
+    app.restore(snapshot(job('paused'), [product]), { persistMigrations: false });
+    app.view(null, 1, {});
+    assert.match(app.row(productId).replace(/<[^>]*>/g, ''), new RegExp(`${manual ? '人工重量' : 'Item Weight'}${mass}`));
+    element('resultWeightBand').value = manual ? '150_250' : '100_150';
+    assert.equal(app.filtered().length, 1);
+    element('resultWeightBand').value = '250_500';
+    assert.equal(app.filtered().length, 0);
+    app.openLocalDrawer(productId);
+    assert.match(element('amazonMetrics').innerHTML, new RegExp(`<dt>利润计算重量</dt><dd>${mass}`));
+    const current = app.state().products[0];
+    const payload = app.spreadsheet([current]);
+    assert.equal(payload.rows[0][payload.headers.indexOf('利润计算重量 (kg)')], mass);
+    assert.equal(current.profitCalculation.airFreight.actualWeightKg, mass);
+    assert.equal(current.productWeight, 0.14);
+    assert.equal(current.fbaWeight, 0.5);
+    assert.equal(current.purchaseCost, 6);
+  }
+});
+
+test('package fallback is labelled in row, drawer and export and drives profit without changing Item Weight', () => {
+  const { app, element } = harness();
+  const product = { ...canonicalProduct(), detailParserVersion: 13, productWeight: null,
+    productWeightEvidence: null, fbaWeight: .06, billingWeight: null,
+    packageWeightEvidence: { kind: 'package', label: 'parcel dimensions', value: .06, unit: 'kg',
+      source: 'amazon_product_page', asin: 'B000000001', selector: '#detailBullets_feature_div',
+      rawText: '16.5 x 15 x 1.9 cm; 60 g' } };
+  app.restore(snapshot(job('completed'), [product]), { persistMigrations: false });
+  app.view(null, 1, {});
+  assert.match(app.row(productId).replace(/<[^>]*>/g, ''), /包裹重量0.06/);
+  app.openLocalDrawer(productId);
+  assert.match(element('amazonMetrics').innerHTML, /包裹重量/);
+  const current = app.state().products[0];
+  assert.equal(current.profitCalculation.airFreight.actualWeightKg, .06);
+  assert.equal(current.productWeight, null);
+  const payload = app.spreadsheet([current]);
+  assert.equal(payload.rows[0][payload.headers.indexOf('利润计算重量 (kg)')], .06);
+  assert.match(payload.rows[0][payload.headers.indexOf('重量来源')], /包裹重量/);
+});
+
+test('raw Item Weight-only candidates retain policy and manual override without package fallback', () => {
+  const { app } = harness();
+  app.restore(snapshot(job('paused'), []));
+  const raw = { asin: 'B000000001', title: 'Package only', detailStatus: 'success',
+    weightSelection: { policy: 'item_weight_only' }, productWeightKg: null, packageWeightKg: 0.5 };
+  const mapped = app.mapCandidate(raw, 0);
+  assert.equal(mapped.productWeight, null);
+  assert.equal(mapped.billingWeight, null);
+  assert.equal(mapped.fbaWeight, 0.5);
+  assert.equal(profitModel.usesItemWeightOnly(mapped), true);
+  const manual = app.mapCandidate({ ...raw, billingWeight: 0.2, manualBillingWeight: true }, 0);
+  assert.equal(profitModel.resolveManualWeightOverride(manual).weightKg, 0.2);
+  assert.equal(manual.fbaWeight, 0.5);
+});
+
+test('successive manual weight edits preview and save the entered mass under Item Weight policy', async () => {
+  const item = { ...automaticEnvelopeProduct('AU', 18, 0.14), detailParserVersion: 11,
+    productWeightEvidence: { label: 'Item Weight', kind: 'product', value: 0.14 }, fbaWeight: 0.5 };
+  const { app, element, fire } = editableProfitFixture(item);
+  for (const [mass, fee] of [[0.3, 5.61], [0.14, 5.26]]) {
+    element('editWeight').value = String(mass);
+    await fire('editWeight', 'input');
+    assert.equal(app.editor().fulfillmentFee, fee);
+    assert.equal(await app.saveEditorToDisk(), true);
+    const product = app.state().products[0];
+    assert.equal(product.billingWeight, mass);
+    assert.equal(product.profitInputs.actualWeightKg, mass);
+    assert.equal(product.profitCalculation.airFreight.actualWeightKg, mass);
+    assert.equal(product.fbaFee, fee);
+    assert.equal(product.productWeight, 0.14);
+    assert.equal(product.fbaWeight, 0.5);
+    assert.equal(product.purchaseCost, 6);
+  }
+});
+
+
+const parsedAsins = (marketplace = "CA", asins = ["B09V6TRGTD", "B000000002"]) => ({
+  inputMode: "asins", marketplace,
+  audit: { marketplace, uniqueSellers: 0, uniqueAsins: asins.length, rawRows: asins.length, duplicates: 0, invalid: 0, resolved: 1, unresolved: 0 },
+  stores: [{ marketplace, sellerId: null, sellerName: null, sellerUrl: null, asins, rowNumbers: asins.map((_, i) => i + 1), resolved: true }],
+  rows: asins.map((asin, i) => ({ asin, marketplace, rowNumber: i + 1, rowNumbers: [i + 1], productUrl: `https://www.amazon.ca/dp/${asin}` })),
+});
+
+test("ASIN input mode, text and draft market changes leave a running task and manual fields untouched", async () => {
+  const fixture = uploadFixture("running");
+  const before = JSON.stringify(fixture.app.state());
+  await fixture.fire("asinImportTab", "click");
+  fixture.element("asinTextInput").value = "B09V6TRGTD";
+  fixture.element("asinMarketplaceSelect").value = "CA";
+  await fixture.fire("asinMarketplaceSelect", "change");
+  assert.equal(fixture.app.importState().importMode, "asins");
+  assert.equal(fixture.element("asinImportPanel").hidden, false);
+  assert.equal(JSON.stringify(fixture.app.state()), before);
+  assert.equal(fixture.app.marketState().activeMarket.code, "AU");
+  assert.equal(fixture.calls.length, 0);
+  fixture.app.restore(snapshot(job("running", 2)));
+  assert.equal(fixture.app.importState().importMode, "asins");
+  assert.equal(fixture.element("asinMarketplaceSelect").value, "CA");
+  assert.equal(fixture.element("asinTextInput").value, "B09V6TRGTD");
+});
+
+test("valid ASIN text archives only after parsing, preserves the old snapshot and waits for explicit start", async () => {
+  const fixture = uploadFixture("paused");
+  fixture.respond(async (path, options) => {
+    if (path === "/api/asin-list/parse") {
+      assert.deepEqual(JSON.parse(options.body), { text: "B09V6TRGTD B000000002", marketplace: "CA" });
+      assert.equal(fixture.app.state().runState.id, runId);
+      return parsedAsins();
+    }
+    if (path === "/api/runs") {
+      const saved = JSON.parse(options.body);
+      assert.equal(saved.products[0].purchaseCost, 6);
+      assert.equal(saved.runState.marketplace, "AU");
+      return { runs: [] };
+    }
+    if (path === `/api/runs/${runId}/archive`) return archivedUpload();
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.fire("asinImportTab", "click");
+  fixture.element("asinTextInput").value = "B09V6TRGTD B000000002";
+  fixture.element("asinMarketplaceSelect").value = "CA";
+  await fixture.fire("importAsinsButton", "click");
+  assert.deepEqual(fixture.calls.map(call => call.path), ["/api/asin-list/parse", "/api/runs", `/api/runs/${runId}/archive`]);
+  assert.equal(fixture.app.importState().storeList.inputMode, "asins");
+  assert.equal(fixture.app.state().runState.mode, "idle");
+  assert.equal(fixture.app.marketState().activeMarket.code, "CA");
+  fixture.app.renderImports(); fixture.app.availability();
+  assert.equal(fixture.element("uniqueStoresMetric").textContent, "2");
+  assert.equal(fixture.element("uniqueImportMetricLabel").textContent, "唯一 ASIN");
+  assert.equal(fixture.element("startAnalysisButton").disabled, false);
+  assert.match(fixture.element("startAnalysisButton").innerHTML, /开始采集 2 个ASIN/);
+  assert.match(fixture.element("currentStoreList").innerHTML, /B09V6TRGTD/);
+  assert.doesNotMatch(fixture.element("currentStoreList").innerHTML, /Seller ID|未提供/);
+});
+
+for (const code of ["INVALID_ASIN_INPUT", "ASIN_MARKETPLACE_MISMATCH"]) {
+  test(`ASIN parse ${code} leaves old task and input intact without archive`, async () => {
+    const fixture = uploadFixture("running");
+    fixture.element("asinTextInput").value = "bad or mixed input";
+    const before = JSON.stringify(fixture.app.state());
+    fixture.respond(async path => {
+      assert.equal(path, "/api/asin-list/parse");
+      throw Object.assign(new Error("无效 ASIN 或不同站点，请修正后重试。"), { code });
+    });
+    await fixture.fire("importAsinsButton", "click");
+    assert.equal(JSON.stringify(fixture.app.state()), before);
+    assert.equal(fixture.element("asinTextInput").value, "bad or mixed input");
+    assert.deepEqual(fixture.calls.map(call => call.path), ["/api/asin-list/parse"]);
+  });
+}
+
+test("ASIN Excel uses the ASIN parser and the explicit draft marketplace", async () => {
+  const fixture = uploadFixture("paused");
+  await fixture.fire("asinImportTab", "click");
+  fixture.element("asinMarketplaceSelect").value = "CA";
+  fixture.respond(async (path, options) => {
+    if (path === "/api/asin-list/parse") {
+      assert.equal(options.headers["X-Marketplace"], "CA");
+      assert.equal(options.headers["X-File-Name"], "new-stores.xlsx");
+      assert.ok(options.body instanceof ArrayBuffer);
+      return parsedAsins();
+    }
+    if (path === "/api/runs") return { runs: [] };
+    if (path.endsWith("/archive")) return archivedUpload();
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.fire("storeFileInput", "change");
+  assert.equal(fixture.app.importState().storeList.inputMode, "asins");
+  assert.equal(fixture.calls.some(call => call.path === "/api/store-list/parse"), false);
+});
+
+test("concurrent ASIN submissions make only one parse and one archive", async () => {
+  const fixture = uploadFixture("running");
+  let release;
+  fixture.respond(async path => {
+    if (path === "/api/asin-list/parse") return new Promise(resolve => { release = () => resolve(parsedAsins()); });
+    if (path.endsWith("/archive")) return archivedUpload();
+    throw new Error(`Unexpected ${path}`);
+  });
+  const first = fixture.app.importTaskSource({ text: "B09V6TRGTD", mode: "asins", marketplace: "CA" });
+  const second = fixture.app.importTaskSource({ text: "B000000002", mode: "asins", marketplace: "CA" });
+  release();
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results, [true, false]);
+  assert.equal(fixture.calls.filter(call => call.path === "/api/asin-list/parse").length, 1);
+  assert.equal(fixture.calls.filter(call => call.path.endsWith("/archive")).length, 1);
+});
+
+test("review interval filters include both bounds, exclude unknown without converting it to zero, and drive exports", () => {
+  const fixture = harness();
+  const items = [0, 10, 20, 21, null].map((reviews, index) => imageCandidate(index + 1, { reviews, detailStatus: "success" }));
+  fixture.app.restore(snapshot(job("completed"), items));
+  fixture.app.useRealCriteria();
+  fixture.element("minReviews").value = "10";
+  fixture.element("maxReviews").value = "20";
+  assert.equal(fixture.app.syncCriteria(), true);
+  assert.deepEqual(Array.from(fixture.app.filtered(), product => product.reviews), [10, 20]);
+  assert.deepEqual(Array.from(fixture.app.exportRows("all"), product => product.reviews), [10, 20]);
+  const saved = fixture.app.capture();
+  assert.equal(saved.criteria.minReviews, 10);
+  assert.equal(saved.criteria.maxReviews, 20);
+  assert.equal(saved.resultCriteria.maxReviews, 20);
+  fixture.app.restore(saved);
+  assert.equal(fixture.element("maxReviews").value, 20);
+  assert.deepEqual(Array.from(fixture.app.filterReasons(items[4], { maxReviews: 20 })).filter(reason => reason.startsWith("REVIEWS")), ["REVIEWS_MISSING"]);
+  assert.deepEqual(Array.from(fixture.app.filterReasons(items[0], { minReviews: 0, maxReviews: 0 })).filter(reason => reason.startsWith("REVIEWS")), []);
+});
+
+test("invalid review intervals reject before changing result filters; clearing removes both bounds", async () => {
+  const fixture = harness();
+  fixture.app.restore(snapshot(job("completed")));
+  fixture.app.useRealCriteria();
+  const before = JSON.stringify(fixture.app.state().activeRunCriteria);
+  for (const [min, max] of [["20", "10"], ["-1", ""], ["", "1.5"], ["", "9007199254740992"]]) {
+    fixture.element("minReviews").value = min; fixture.element("maxReviews").value = max;
+    assert.equal(fixture.app.syncCriteria(), false);
+    assert.equal(JSON.stringify(fixture.app.state().activeRunCriteria), before);
+  }
+  fixture.element("minReviews").value = "10"; fixture.element("maxReviews").value = "20";
+  fixture.app.syncCriteria(); fixture.app.dateFilters();
+  fixture.respond(async path => { assert.equal(path, "/api/runs"); return { runs: [] }; });
+  await fixture.fire("clearFiltersButton", "click");
+  await fixture.app.settleSaves();
+  assert.equal(fixture.element("minReviews").value, "");
+  assert.equal(fixture.element("maxReviews").value, "");
+  assert.equal(fixture.app.state().activeRunCriteria.minReviews, null);
+  assert.equal(fixture.app.state().activeRunCriteria.maxReviews, null);
+});
+
+
+test("explicit ASIN start persists direct mode and review bounds before transferring the exact batch to background collection", async () => {
+  const fixture = harness();
+  const saved = snapshot(job("completed"), []);
+  saved.storeList = parsedAsins("AU");
+  saved.runState.inputMode = "asins";
+  fixture.app.restore(saved); fixture.app.known(true); fixture.app.useRealCriteria();
+  fixture.element("minReviews").value = "10"; fixture.element("maxReviews").value = "20";
+  const nextJob = { ...job("queued", 1), runId: "new-synthetic-run" };
+  let nextSnapshot;
+  fixture.respond(async (path, options) => {
+    if (path === "/api/runs") {
+      nextSnapshot = JSON.parse(options.body);
+      assert.equal(nextSnapshot.runState.inputMode, "asins");
+      assert.equal(nextSnapshot.storeList.inputMode, "asins");
+      assert.equal(nextSnapshot.criteria.maxReviews, 20);
+      assert.deepEqual(nextSnapshot.storeList.stores[0].asins, ["B09V6TRGTD", "B000000002"]);
+      assert.equal(nextSnapshot.storeList.stores[0].sellerId, null);
+      return { runs: [] };
+    }
+    if (path === "/api/amazon/collection/start") return nextJob;
+    if (path === `/api/runs/${nextJob.runId}`) return { ...nextSnapshot, amazonCollection: nextJob };
+    throw new Error(`Unexpected ${path}`);
+  });
+  await fixture.app.run();
+  assert.deepEqual(fixture.calls.map(call => call.path), ["/api/runs", "/api/amazon/collection/start", `/api/runs/${nextJob.runId}`]);
+  assert.equal(fixture.app.state().runState.inputMode, "asins");
+});
+
+test("ASIN provider requests explicitly preserve input mode, source ASINs and both review bounds", async () => {
+  const fixture = harness();
+  const saved = snapshot(null, []);
+  saved.storeList = parsedAsins("AU");
+  saved.criteria = { useSellerSprite: true, monthlySalesBand: "all", minReviews: 10, maxReviews: 20 };
+  saved.runState.inputMode = "asins";
+  saved.runState.analysisSourceMode = "amazon_sellsprite";
+  fixture.app.restore(saved); fixture.app.known(true);
+  fixture.respond(async (path, options) => {
+    if (path === "/api/runs") return { runs: [] };
+    assert.equal(path, "/api/products/search");
+    const body = JSON.parse(options.body);
+    assert.equal(body.inputMode, "asins");
+    assert.equal(body.stores[0].sellerId, null);
+    assert.deepEqual(body.stores[0].asins, ["B09V6TRGTD", "B000000002"]);
+    assert.equal(body.filters.minReviews, 10); assert.equal(body.filters.maxReviews, 20);
+    if (body.phase === "discover") {
+      assert.equal(body.useSellerSprite, false);
+      return { discoveryComplete: true, items: [], errors: [], unresolved: [], storeVisits: [{ storeIndex: 0, sellerId: null,
+        asins: body.stores[0].asins, status: "not_required", complete: true, discoveredAsins: 2, reportedTotalAsins: 2 }] };
+    }
+    assert.equal(body.phase, "analyze");
+    assert.equal(body.useSellerSprite, true);
+    return { discoveryComplete: true, items: [], errors: [], unresolved: [], analysisAudit: { uniqueAsins: 0, retainedSourceAsins: 0 },
+      storeVisits: [{ storeIndex: 0, sellerId: null, asins: body.stores[0].asins, status: "not_required", complete: true, discoveredAsins: 2 }] };
+  });
+  await fixture.app.fetchProvider();
+  assert.deepEqual(fixture.calls.filter(call => call.path === "/api/products/search").map(call => call.body.phase), ["discover", "analyze"]);
+  assert.equal(fixture.calls.some(call => call.path.includes("/sellsprite/")), false);
+});
+
+test("saved row review limits intersect with both current result bounds and report an empty intersection", () => {
+  const fixture = harness();
+  const saved = snapshot(job("completed"), [imageCandidate(1, { reviews: 10 }), imageCandidate(2, { reviews: 15 }), imageCandidate(3, { reviews: 20 })]);
+  saved.storeList.stores[0].criteria = { minReviews: 12, maxReviews: 30 };
+  fixture.app.restore(saved);
+  fixture.app.view(null, 1, { minReviews: 0, maxReviews: 15 });
+  assert.deepEqual(Array.from(fixture.app.filtered(), item => item.reviews), [15]);
+  fixture.app.view(null, 1, { minReviews: 0, maxReviews: 10 });
+  assert.equal(fixture.app.filtered().length, 0);
+});
+
+
+for (const marker of ["manualAmazonFields", "fieldSources"]) {
+  for (const replacement of ["different_date", "not_provided", "failed"]) {
+    test(`manual listing date survives ${replacement} browser merges when protected by ${marker}`, () => {
+      const { app } = harness();
+      app.restore(snapshot(job("paused"), []));
+      const original = datedCandidate(1, "2025-01-03", {
+        amazonFirstAvailableDateStatus: "manual",
+        amazonFirstAvailableDateEvidence: { source: "manual", value: "2025-01-03", note: "Verified by user" },
+        manualAmazonFields: marker === "manualAmazonFields" ? { amazonFirstAvailableDate: true } : {},
+        fieldSources: marker === "fieldSources" ? { amazonFirstAvailableDate: "manual" } : { amazonFirstAvailableDate: "amazon_product_page" },
+      });
+      const incoming = { asin: original.asin, sourceAsin: original.asin, marketplace: "AU",
+        detailStatus: replacement === "failed" ? "failed" : "success",
+        detailErrorCode: replacement === "failed" ? "AMAZON_FETCH_TIMEOUT" : null,
+        amazonFirstAvailableDate: replacement === "different_date" ? "2026-10-01" : null,
+        amazonFirstAvailableDateStatus: replacement === "different_date" ? "found" : replacement === "failed" ? "unresolved" : "not_provided",
+        amazonFirstAvailableDateEvidence: replacement === "different_date" ? { value: "2026-10-01", source: "amazon_product_page" } : null,
+        fieldSources: { amazonFirstAvailableDate: "amazon_product_page" },
+      };
+      const merged = app.mergeRecords(original, incoming);
+      app.setProducts([structuredClone(original)]); app.mergeCandidates([incoming]);
+      for (const result of [merged, app.state().products[0]]) {
+        assert.equal(result.amazonFirstAvailableDate, "2025-01-03");
+        assert.equal(result.amazonFirstAvailableDateStatus, "manual");
+        assert.deepEqual(structuredClone(result.amazonFirstAvailableDateEvidence), original.amazonFirstAvailableDateEvidence);
+        assert.equal(result.fieldSources.amazonFirstAvailableDate, "manual");
+        assert.equal(result.manualAmazonFields.amazonFirstAvailableDate, true);
+      }
+    });
+  }
+}
+
+test("new manual listing date wins over older manual data in both frontend merge paths and mapping retains its flag", () => {
+  const { app } = harness();
+  app.restore(snapshot(job("paused"), []));
+  const original = datedCandidate(1, "2025-01-03", { manualAmazonFields: { amazonFirstAvailableDate: true }, fieldSources: { amazonFirstAvailableDate: "manual" } });
+  const incoming = { asin: original.asin, sourceAsin: original.asin, marketplace: "AU", detailStatus: "success",
+    amazonFirstAvailableDate: "2025-03-09", amazonFirstAvailableDateStatus: "manual",
+    amazonFirstAvailableDateEvidence: { source: "manual", value: "2025-03-09" }, manualAmazonFields: { amazonFirstAvailableDate: true } };
+  assert.equal(app.mapCandidate(incoming, 0).manualAmazonFields.amazonFirstAvailableDate, true);
+  const merged = app.mergeRecords(original, incoming);
+  app.setProducts([original]); app.mergeCandidates([incoming]);
+  for (const result of [merged, app.state().products[0]]) {
+    assert.equal(result.amazonFirstAvailableDate, "2025-03-09");
+    assert.equal(result.amazonFirstAvailableDateStatus, "manual");
+    assert.equal(result.fieldSources.amazonFirstAvailableDate, "manual");
+    assert.deepEqual(structuredClone(result.amazonFirstAvailableDateEvidence), incoming.amazonFirstAvailableDateEvidence);
+  }
+});
+
+
+const withExcelAsinProjection = (saved, data = parsedAsins("AU", ["B09V6TRGTD", "B000000002"])) => {
+  saved.storeList.fileName = "current-upload.xlsx";
+  data.audit.sourceColumn = "asin";
+  saved.storeList.directAsinInput = { version: 1, source: "uploaded_excel_asin_column", status: "ready", data };
+  return saved;
+};
+
+for (const status of ["running", "paused", "needs_attention"]) {
+  test(`selecting ASIN mode then start replaces ${status} store run with only original Excel ASINs and never resumes it`, async () => {
+    const fixture = harness();
+    const saved = withExcelAsinProjection(snapshot(job(status)));
+    saved.storeList.stores = Array.from({ length: 5 }, (_, index) => ({ marketplace: "AU", sellerId: `SELLER${index}`, asins: ["B999999999"] }));
+    saved.storeList.audit.uniqueSellers = 5;
+    fixture.app.restore(saved); fixture.app.bindUpload(); fixture.app.known(true);
+    let nextSnapshot;
+    const nextJob = { ...job("queued", 1), runId: "new-synthetic-run" };
+    fixture.respond(async (path, options) => {
+      if (path === "/api/runs") {
+        const body = JSON.parse(options.body);
+        if (body.runState.id === nextJob.runId) {
+          nextSnapshot = body;
+          assert.equal(body.runState.inputMode, "asins");
+          assert.equal(body.products.length, 0);
+          assert.deepEqual(body.storeList.stores[0].asins, ["B09V6TRGTD", "B000000002"]);
+          assert.equal(body.storeList.stores[0].sellerId, null);
+          assert.equal(body.runState.amazonCollectionJob, undefined);
+        } else assert.equal(body.runState.id, runId);
+        return { runs: [] };
+      }
+      if (path === `/api/runs/${runId}/archive`) return archivedUpload();
+      if (path === "/api/amazon/collection") return null;
+      if (path === "/api/amazon/collection/start") {
+        assert.deepEqual(JSON.parse(options.body), { runId: nextJob.runId });
+        return nextJob;
+      }
+      if (path === `/api/runs/${nextJob.runId}`) return { ...nextSnapshot, amazonCollection: nextJob };
+      throw new Error(`Unexpected request ${path}`);
+    });
+    await fixture.fire("asinImportTab", "click");
+    assert.equal(fixture.calls.length, 0, "mode switch is a local preview only");
+    fixture.app.availability();
+    assert.equal(fixture.element("startAnalysisButton").disabled, false);
+    assert.match(fixture.element("startAnalysisButton").innerHTML, /新 ASIN.*2/);
+    assert.equal(fixture.element("importMetrics").hidden, true);
+    assert.equal(fixture.element("storeManager").hidden, true);
+    assert.match(fixture.element("selectedInputSummary").textContent, /2 个唯一 ASIN/);
+    assert.doesNotMatch(fixture.element("selectedInputSummary").textContent, /SELLER|B999999999/);
+    await fixture.app.run();
+    assert.ok(nextSnapshot);
+    assert.equal(fixture.calls.some(call => call.path === "/api/amazon/collection/control"), false);
+    assert.equal(fixture.calls.filter(call => call.path.endsWith("/archive")).length, 1);
+    assert.equal(fixture.calls.filter(call => call.path === "/api/amazon/collection/start").length, 1);
+    assert.equal(fixture.app.state().runState.id, nextJob.runId);
+    assert.equal(fixture.app.state().products.length, 0);
+  });
+}
+
+for (const state of ["legacy", "empty", "invalid"]) {
+  test(`selected ASIN start with ${state} Excel scope neither resumes nor archives a previous task`, async () => {
+    const fixture = harness();
+    const saved = snapshot(job("paused"));
+    if (state !== "legacy") saved.storeList.directAsinInput = { version: 1, source: "uploaded_excel_asin_column", status: "unavailable", data: null,
+      error: { code: "INVALID_ASIN_INPUT", message: state === "empty" ? "ASIN 列为空" : "ASIN 格式无效" } };
+    fixture.app.restore(saved); fixture.app.bindUpload(); fixture.app.known(true);
+    const before = JSON.stringify(fixture.app.state());
+    await fixture.fire("asinImportTab", "click"); fixture.app.availability();
+    assert.equal(fixture.element("startAnalysisButton").disabled, true);
+    await fixture.app.run();
+    assert.equal(JSON.stringify(fixture.app.state()), before);
+    assert.equal(fixture.calls.length, 0);
+    assert.match(fixture.toasts.at(-1)[0], /ASIN|Excel/);
+  });
+}
+
+test("an available current workbook is parsed only for preview and unsupported store-only data cannot become ASIN scope", async () => {
+  const fixture = uploadFixture("paused");
+  fixture.app.setSelectedFile(fixture.element("storeFileInput").files[0]);
+  fixture.respond(async path => {
+    assert.equal(path, "/api/asin-list/parse");
+    throw Object.assign(new Error("文件只有店铺链接，没有商品 ASIN"), { code: "INVALID_ASIN_INPUT" });
+  });
+  await fixture.fire("asinImportTab", "click"); await fixture.app.settleAsinPreview();
+  fixture.app.availability();
+  assert.equal(fixture.element("startAnalysisButton").disabled, true);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.calls.some(call => call.path.endsWith("/archive")), false);
+  assert.equal(fixture.app.state().runState.id, runId);
+});
+
+test("reloaded original Excel ASIN projection is usable without file bytes and remains limited to its ASIN column", async () => {
+  const saved = withExcelAsinProjection(snapshot(job("paused")));
+  const fixture = harness(); fixture.app.restore(JSON.parse(JSON.stringify(saved))); fixture.app.bindUpload();
+  await fixture.fire("asinImportTab", "click");
+  fixture.app.availability();
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(fixture.element("startAnalysisButton").disabled, false);
+  assert.match(fixture.element("selectedInputSummary").textContent, /current-upload.xlsx.*ASIN 列.*AU.*2 个/);
+  assert.equal(fixture.app.capture().storeList.directAsinInput.data.audit.sourceColumn, "asin");
+});
+
+test("fresh single-column product links produce an explicit marketplace preview without enumeration", async () => {
+  const fixture = uploadFixture("paused");
+  fixture.app.setSelectedFile(fixture.element("storeFileInput").files[0]);
+  fixture.respond(async path => {
+    assert.equal(path, "/api/asin-list/parse");
+    const data = parsedAsins("AU", ["B09V6TRGTD"]);
+    data.audit.sourceColumn = "product_url"; data.audit.sourceFormat = "headerless_single_column";
+    return data;
+  });
+  await fixture.fire("asinImportTab", "click"); await fixture.app.settleAsinPreview(); fixture.app.availability();
+  assert.equal(fixture.element("startAnalysisButton").disabled, false);
+  assert.match(fixture.element("selectedInputSummary").textContent, /商品链接.*AU.*1 个唯一 ASIN/);
+  assert.deepEqual(fixture.calls.map(call => call.path), ["/api/asin-list/parse"]);
+});
+
+
+for (const oldMode of ["stores", "asins"]) {
+  test(`invalid replacement file blocks start for an old ${oldMode} task until the user explicitly discards it`, async () => {
+    const fixture = harness();
+    const saved = withExcelAsinProjection(snapshot(job("paused")));
+    if (oldMode === "asins") saved.storeList = parsedAsins("AU");
+    fixture.app.restore(saved); fixture.app.bindUpload(); fixture.app.known(true);
+    await fixture.fire("asinImportTab", "click");
+    fixture.element("storeFileInput").files = [{ name: "invalid-new-asins.xlsx", arrayBuffer: async () => new ArrayBuffer(4) }];
+    fixture.respond(async path => {
+      assert.equal(path, "/api/asin-list/parse");
+      throw Object.assign(new Error("新文件 ASIN 格式无效"), { code: "INVALID_ASIN_INPUT" });
+    });
+    await fixture.fire("storeFileInput", "change");
+    fixture.app.availability();
+    assert.equal(fixture.element("startAnalysisButton").disabled, true);
+    assert.match(fixture.element("selectedInputSummary").textContent, /invalid-new-asins.xlsx.*ASIN 格式无效/);
+    await fixture.app.run();
+    assert.deepEqual(fixture.calls.map(call => call.path), ["/api/asin-list/parse"]);
+    assert.equal(fixture.app.state().runState.id, runId);
+    assert.equal(fixture.app.state().products[0].purchaseCost, 6);
+    await fixture.fire("discardImportDraftButton", "click"); fixture.app.availability();
+    assert.equal(fixture.app.importState().importMode, oldMode);
+    assert.equal(fixture.element("selectedInputSummary").hidden, true);
+    assert.equal(fixture.calls.length, 1, "discarding a draft does not start or resume anything");
+  });
+}
+
+test("persisted direct-product projection supports an uploaded headerless URL workbook without using seller scope", async () => {
+  const fixture = harness();
+  const saved = snapshot(job("paused"));
+  const data = parsedAsins("AU", ["B09V6TRGTD"]);
+  data.audit.sourceColumn = "product_url"; data.audit.sourceFormat = "headerless_single_column";
+  saved.storeList.fileName = "ASIN测试数据集.xlsx";
+  saved.storeList.directAsinInput = { version: 1, source: "uploaded_excel_direct_products", status: "ready", data };
+  fixture.app.restore(saved); fixture.app.bindUpload();
+  await fixture.fire("asinImportTab", "click"); fixture.app.availability();
+  assert.equal(fixture.element("startAnalysisButton").disabled, false);
+  assert.match(fixture.element("selectedInputSummary").textContent, /ASIN测试数据集.xlsx.*商品链接.*AU.*1 个唯一 ASIN/);
+  assert.equal(fixture.calls.length, 0);
+});
+
+function directAsinSnapshot(items, { legacy = false, band = "100_plus" } = {}) {
+  const saved = snapshot(job("completed"), items);
+  if (!legacy) saved.runState.inputMode = "asins";
+  saved.storeList = parsedAsins("AU", items.map(product => product.asin));
+  saved.criteria = { useSellerSprite: false, monthlySalesBand: band, minReviews: null, maxReviews: null, minRating: null };
+  saved.resultCriteria = { ...saved.criteria };
+  saved.amazonCollection.items = [];
+  return saved;
+}
+
+for (const legacy of [false, true]) test(`restored ${legacy ? "source-list legacy" : "persisted"} ASIN task restores monthly screening while retaining low/unknown source records`, () => {
+  const fixture = harness();
+  const rows = [0, 20, null, 60, 120].map((sales30, index) => imageCandidate(index + 1, {
+    sales30, sales30Evidence: sales30 === null ? null : { source: "amazon_product_page", period: "past_month", kind: "lower_bound", value: sales30, rawText: `${sales30}+ bought in past month`, asin: `B${String(index + 1).padStart(9, "0")}` },
+    filterMatch: false, filterExclusionReasons: [sales30 === null ? "MONTHLY_SALES_EVIDENCE_MISSING" : "MONTHLY_SALES_BELOW_100"],
+  }));
+  const saved = directAsinSnapshot(rows, { legacy });
+  saved.storeList.stores[0].criteria = { monthlySalesBand: "50_to_100" };
+  fixture.app.restore(saved, { persistMigrations: false });
+  fixture.app.setImportMode("stores");
+  const before = JSON.stringify(fixture.app.state().products.map(product => [product.sales30, product.sales30Evidence, product.filterMatch, product.filterExclusionReasons]));
+  fixture.app.renderResults();
+  assert.equal(fixture.app.taskMode(), "asins");
+  assert.equal(fixture.app.filtered().length, 1);
+  assert.equal(fixture.app.filtered()[0].id, rows[4].id);
+  assert.equal(String(fixture.element("totalCandidateCount").textContent), "5");
+  assert.equal(String(fixture.element("navCandidateCount").textContent), "5");
+  assert.equal(String(fixture.element("visibleCount").textContent), "1");
+  assert.equal(String(fixture.element("filteredAsinCount").textContent), "4");
+  assert.equal(fixture.element("monthlySalesBand").disabled, false);
+  assert.equal(fixture.element("monthlySalesFilter").hidden, false);
+  assert.match(fixture.element("monthlySalesAdmissionNote").textContent, /默认显示全部商品/);
+  assert.match(fixture.element("monthlySalesCoverage").textContent, /已取得 4 \/ 5.*达到 50：2.*低于 50：2.*未知：1/);
+  assert.equal(JSON.stringify(fixture.app.state().products.map(product => [product.sales30, product.sales30Evidence, product.filterMatch, product.filterExclusionReasons])), before, "rendering never fabricates sales or rewrites saved evidence/filter flags");
+  assert.equal(fixture.app.handoffInput().runState.inputMode, "asins");
+  assert.equal(fixture.calls.length, 0, "restoration and filtering do not retry or save a completed collection");
+});
+
+test("switching to the ASIN import draft does not loosen an existing store task's monthly admission", async () => {
+  const fixture = harness();
+  const rows = [imageCandidate(1, { sales30: null, sales30Evidence: null }), imageCandidate(2, { sales30: 60 }), imageCandidate(3, { sales30: 120 })];
+  const saved = directAsinSnapshot(rows);
+  saved.runState.inputMode = "stores";
+  saved.storeList.inputMode = "stores";
+  fixture.app.restore(saved, { persistMigrations: false });
+  fixture.app.setImportMode("asins");
+  await fixture.app.settleAsinPreview();
+  fixture.app.renderResults();
+  assert.equal(fixture.app.importState().importMode, "asins");
+  assert.equal(fixture.app.taskMode(), "stores");
+  assert.deepEqual(Array.from(fixture.app.filtered(), product => product.asin), [rows[2].asin]);
+  assert.equal(fixture.element("monthlySalesBand").disabled, false);
+  assert.equal(fixture.element("monthlySalesFilter").hidden, false);
+  assert.equal(fixture.app.handoffInput().runState.inputMode, "stores");
+  assert.equal(fixture.calls.length, 0);
+});
+
+test("ASIN direct candidates keep review range, rating, date, weight, completion, margin and search filters aligned with exports and matching", async () => {
+  const fixture = harness();
+  const { app, element } = fixture;
+  const base = { sales30: 120, complete: true, margin: 35, productWeight: 0.12, billingWeight: 0.12, reviews: 33, rating: 4.5, reviewStatus: "approved" };
+  const rows = [datedCandidate(1, "2026-10-01", base), datedCandidate(2, "2026-10-13", { ...base, reviewStatus: "pending" }),
+    datedCandidate(3, "2026-10-12", { ...base, reviews: 10 }), datedCandidate(4, "2026-10-12", { ...base, reviews: 51 }),
+    datedCandidate(5, "2026-10-12", { ...base, rating: 2 }), datedCandidate(6, "2026-09-01", base),
+    datedCandidate(7, null, base), datedCandidate(8, "2026-10-12", { ...base, productWeight: 0.3 }),
+    datedCandidate(9, "2026-10-12", { ...base, complete: false }), datedCandidate(10, "2026-10-12", { ...base, margin: 5 }),
+    datedCandidate(11, "2026-10-12", { ...base, name: "Red product", englishName: "Red product" })];
+  app.restore(directAsinSnapshot([]), { persistMigrations: false });
+  app.setProducts(rows);
+  app.view(null, 1, { monthlySalesBand: "100_plus", minReviews: 20, maxReviews: 50, minRating: 4, amazonFirstAvailableFrom: "2026-10-01" });
+  element("resultWeightBand").value = "100_150"; element("resultsCompleteToggle").checked = true;
+  element("resultMinMargin").value = "20"; element("resultSearch").value = "blue";
+  const expected = rows.slice(0, 2).map(product => product.id);
+  assert.deepEqual(Array.from(app.filtered(), product => product.id), expected);
+  assert.deepEqual(Array.from(app.matching(), product => product.id), expected);
+  assert.deepEqual(Array.from(app.exportRows(), product => product.id), expected);
+  app.exportCounts();
+  assert.equal(String(element("exportAllCandidateCount").textContent), "2");
+  assert.equal(String(element("exportApprovedProductCount").textContent), "1");
+  await app.exportAll(); await app.exportApproved();
+  assert.deepEqual(fixture.exports.map(payload => payload.rows.length), [2, 1]);
+});
+
+test("ASIN fixed supplier cohort filters low/unknown sales without changing the saved selection", () => {
+  const fixture = harness();
+  const rows = [imageCandidate(1, { sales30: null, sales30Evidence: null }), imageCandidate(2, { sales30: 0 }), imageCandidate(3, { sales30: 20 })];
+  fixture.app.restore(directAsinSnapshot(rows), { persistMigrations: false });
+  fixture.app.setPipeline({ status: "paused", productIds: [rows[0].id, rows[1].id], remaining: 2 });
+  assert.deepEqual(Array.from(fixture.app.pending(), product => product.id), []);
+  assert.equal(fixture.app.matching().length, 0);
+  assert.equal(fixture.app.capture().runState.supplier1688Pipeline.productIds.length, 2);
+  assert.equal(fixture.calls.length, 0);
+});
+
+for (const route of ["drawer", "manual"]) {
+  for (const inputMode of ["asins", "stores"]) test(`${inputMode} ${route} preliminary approval respects task-specific monthly admission`, () => {
+    const fixture = harness();
+    const product = pageWithoutWeight({ sales30: null, sales30Evidence: null });
+    const saved = directAsinSnapshot([product]);
+    saved.runState.inputMode = inputMode; saved.storeList.inputMode = inputMode;
+    fixture.app.restore(saved, { persistMigrations: false });
+    fixture.app.openLocalDrawer(productId);
+    if (route === "manual") { fixture.app.openManual(); fixture.app.approveManual(); }
+    else fixture.app.approve();
+    const result = fixture.app.state().products[0];
+    assert.equal(result.reviewStatus, "pending");
+    assert.equal(result.sales30, null);
+    assert.equal(result.sales30Evidence, null);
+  });
+}
+
+test("ASIN qualifying monthly sales permit minimum-tier approval while retaining unverified weight", () => {
+  const fixture = harness();
+  fixture.app.restore(directAsinSnapshot([pageWithoutWeight({ detailStatus: "failed" })]), { persistMigrations: false });
+  fixture.app.openLocalDrawer(productId);
+  assert.equal(fixture.element("approveProductButton").disabled, false);
+  fixture.app.approve();
+  assert.equal(fixture.app.state().products[0].reviewStatus, "approved");
+  assert.equal(fixture.app.state().products[0].productWeight, null);
+  assert.equal(fixture.app.state().products[0].detailStatus, "failed");
+  assert.equal(fixture.app.state().products[0].margin, null);
+});
+
+test('access pause exposes the original product link and manual instructions without dispatching requests', () => {
+  const h = harness();
+  const saved = snapshot({ ...job('needs_attention'), causeCode: 'AMAZON_ACCESS_CHALLENGE' }, [{ ...canonicalProduct(), detailStatus: 'failed', detailErrorCode: 'AMAZON_ACCESS_CHALLENGE', detailError: 'Amazon browser page requires access verification.' }]);
+  saved.storeList.stores[0].asins = ['B000000001'];
+  saved.storeList.stores[0].productUrls = { B000000001: 'https://www.amazon.com.au/product/dp/B000000001?th=1' };
+  h.app.restore(saved);
+  h.app.render();
+  assert.match(h.element('collectionAccessProducts').innerHTML, /https:\/\/www.amazon.com.au\/product\/dp\/B000000001\?th=1/);
+  assert.match(h.element('collectionAccessProducts').innerHTML, /data-copy-amazon-url/);
+  assert.match(h.element('collectionAccessProducts').innerHTML, /新标签页/);
+  assert.match(h.element('collectionAccessProducts').innerHTML, /未保存验证页面证据/);
+  assert.equal(h.element('collectionAccessResumeButton').disabled, true);
+  assert.equal(h.calls.length, 0);
+});
+
+test('access recovery controls stay unavailable for a different task and an active worker', () => {
+  const h = harness();
+  h.app.restore(snapshot());
+  h.app.apply({...job('needs_attention'), runId:'another-task', causeCode:'AMAZON_ACCESS_CHALLENGE'});
+  h.app.render();
+  assert.equal(h.element('collectionAccessPanel').hidden, true);
+  assert.equal(h.element('collectionAccessResumeButton').disabled, true);
+});
+
+
+test('manual access resume requires a deliberate checkbox and preserves the original run and manual values', async () => {
+  const h = harness();
+  const blocked = {...job('needs_attention'), causeCode:'AMAZON_ACCESS_CHALLENGE'};
+  h.app.restore(snapshot(blocked));
+  h.app.bindCollection();
+  await h.fire('collectionAccessResumeButton', 'click');
+  assert.equal(h.calls.length, 0);
+  h.element('collectionAccessConfirmed').checked = true;
+  await h.fire('collectionAccessConfirmed', 'change');
+  assert.equal(h.element('collectionAccessResumeButton').disabled, false);
+  h.respond(async (path, options) => {
+    if (path === '/api/runs') {
+      const saved = JSON.parse(options.body);
+      assert.equal(saved.products[0].purchaseCost, 6);
+      assert.equal(saved.products[0].salePrice, 18);
+      return {runs:[]};
+    }
+    if (path === '/api/amazon/collection/control') {
+      assert.deepEqual(JSON.parse(options.body), {runId,action:'resume'});
+      return job('running',2);
+    }
+    return snapshot(job('running',2));
+  });
+  await h.fire('collectionAccessResumeButton', 'click');
+  assert.equal(h.calls.filter(call => call.path.endsWith('/control')).length, 1);
+  assert.equal(h.app.state().runState.id,runId);
+  assert.equal(h.element('collectionAccessPanel').hidden,true);
+  assert.equal(h.element('collectionAccessConfirmed').checked,false);
+});
+
+test('new access failure revision clears prior confirmation, and active worker cannot be resumed', () => {
+  const h=harness();
+  h.app.restore(snapshot({...job('needs_attention',2),causeCode:'AMAZON_ACCESS_CHALLENGE'}));
+  h.element('collectionAccessConfirmed').checked=true;
+  h.app.render();
+  h.app.apply({...job('needs_attention',3),causeCode:'AMAZON_ACCESS_CHALLENGE',workerActive:true});
+  h.app.render();
+  assert.equal(h.element('collectionAccessConfirmed').checked,false);
+  h.element('collectionAccessConfirmed').checked=true;
+  h.app.render();
+  assert.equal(h.element('collectionAccessResumeButton').disabled,true);
+  assert.equal(h.calls.length,0);
+});
+
+test('CA dimensions-only profit reaches drawer, editor and handoff with a volumetric label', () => {
+  const { app, element } = harness();
+  const original = { ...canonicalProduct(), marketplace: 'CA', sourceMarketplace: 'CA', detailParserVersion: 13,
+    productWeight: null, fbaWeight: null, billingWeight: null, manualFbaFee: false, fbaFee: null,
+    productDimensions: '20 x 10 x 6 cm', profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: null } };
+  app.restore(snapshot(job('completed'), [original]), { persistMigrations: false });
+  app.openLocalDrawer(productId);
+  const product = app.state().products[0];
+  assert.equal(product.fbaEstimate.selectedWeightSource, 'dimensional');
+  assert.equal(product.fbaEstimate.calculationWeightKg, 1200 / 5021.69);
+  assert.ok(Number.isFinite(product.margin));
+  assert.equal(product.profitInputs.actualWeightKg, null);
+  assert.ok(!product.missing.includes('计费重量'));
+  assert.match(element('amazonMetrics').innerHTML, /加拿大体积重/);
+  assert.match(element('amazonMetrics').innerHTML, /5021\.69/);
+  assert.match(element('costBreakdown').innerHTML, /加拿大体积重/);
+  assert.equal(element('editWeight').value, '');
+  assert.equal(app.editor().fulfillmentFee, product.fbaFee);
+  app.openManual();
+  assert.equal(element('manualCostApproveButton').disabled, false);
+  const exported = handoff.evaluateAnalysisProduct(product, { runState: { marketplace: 'CA', inputMode: 'asins' } });
+  assert.equal(exported.preliminary_profit.inputs.actualWeightKg, null);
+  assert.equal(exported.preliminary_profit.inputs.dimensionalWeightEstimateKg, 1200 / 5021.69);
+  assert.ok(exported.preliminary_profit.result);
+});
+
+test('AU dimensions alone retain missing real-weight status without a volumetric FBA fee', () => {
+  const { app, element } = harness();
+  app.restore(snapshot(job('completed'), [{ ...pageWithoutWeight(), productDimensions: '20 x 10 x 2 cm' }]));
+  app.openLocalDrawer(productId);
+  const product = app.state().products[0];
+  assert.equal(product.fbaFee, null);
+  assert.equal(product.margin, null);
+  assert.ok(!product.amazonMissing.includes('商品重量、包裹重量及尺寸均缺失'));
+  assert.doesNotMatch(element('amazonMetrics').innerHTML, /加拿大体积重/);
 });

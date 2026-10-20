@@ -1,3 +1,5 @@
+import * as listingDate from "../lib/amazon-listing-date.mjs";
+import * as reviewRange from "../lib/review-range.mjs";
 import * as salesPolicy from "../lib/monthly-sales-policy.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -137,12 +139,28 @@ function appHarness() {
     };
   })();`);
   const context = vm.createContext({
-    ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    ...salesPolicy, ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry, ...reviewRange,
     document: { addEventListener() {}, getElementById() { return null; } }, setTimeout() {}, structuredClone,
   });
   vm.runInContext(source, context, { filename: "app.js" });
   return context.scout;
 }
+
+test('candidate merge and analyzed refresh preserve original price time when incoming collection time advances', () => {
+  const app = appHarness();
+  const stamp = '2026-10-20T01:31:27.910Z';
+  const left = completeLegacy({ detailParserVersion: 12, currency: 'AUD', currentPrice: 14.99, collectedAt: stamp,
+    priceEvidence: { asin: 'B000000001', currency: 'AUD', source: 'visible_main_price', selector: '#price', rawText: '$14.99' } });
+  const right = detail({ currentPrice: null, priceEvidence: null, collectedAt: '2026-10-20T02:00:00Z', detailParserVersion: 12,
+    pageContextEvidence: { priceUnavailableReason: 'price_requires_cart' } });
+  const merged = app.mergeRecords(left, right);
+  assert.equal(merged.currentPrice, 14.99);
+  assert.equal(merged.priceVerifiedAt, stamp);
+  app.setProducts([left]);
+  app.merge([right]);
+  assert.equal(app.products()[0].currentPrice, 14.99);
+  assert.equal(app.products()[0].priceVerifiedAt, stamp);
+});
 
 function completeLegacy(extra = {}) {
   return legacy({
@@ -265,4 +283,120 @@ test("manual field source alone survives actual restore and merged incoming prov
   const raw = app.mergeRecords(product, detail({ currentPrice: null }));
   assert.equal(raw.currentPrice, 20);
   assert.equal(raw.fieldSources.currentPrice, "manual");
+});
+
+
+function confirmedWeightless(extra = {}) {
+  const asin = "B000000001";
+  return completeLegacy({ detailParserVersion: 8, productWeight: null, fbaWeight: null, billingWeight: null,
+    manualFbaFee: false, fbaFee: null, fbaFeeSource: null,
+    productInformation: { version: 1, asin, status: "complete", reason: null, weightStatus: "not_provided", rowCount: 1,
+      inspection: { version: 3, asin, status: "complete", stable: true, rowCount: 1,
+        sections: [{ selector: "#prodDetails", status: "complete", rowCount: 1 }],
+        parsedSections: [{ selector: "#prodDetails", rowCount: 1 }] },
+      sections: [{ selector: "#prodDetails", rows: [{ label: "ASIN", value: asin }] }] },
+    collectionQuality: { version: 2, fields: { weight: { status: "unavailable", reason: "page_not_provided" } } },
+    profitInputs: { ...profitModel.DEFAULT_PROFIT_RATES, formulaVersion: profitModel.PROFIT_FORMULA_VERSION,
+      exchangeRate: 4.8, actualWeightKg: null, airFreightActualWeightOnly: true }, ...extra });
+}
+function weightlessDetail(extra = {}) {
+  const source = confirmedWeightless();
+  return detail({ detailParserVersion: 8, productWeightKg: null, fbaPackageWeightKg: null,
+    productInformation: source.productInformation, collectionQuality: source.collectionQuality, ...extra });
+}
+
+function assertMissingSpecificationsPending(product) {
+  assert.equal(product.fbaFee, null);
+  assert.equal(product.productWeight, null);
+  assert.equal(product.billingWeight, null);
+  assert.equal(product.profitInputs.actualWeightKg, null);
+  assert.equal(product.profitCalculation, null);
+  assert.equal(product.margin, null);
+  assert.ok(product.profitPendingReasons.includes('FBA 配送费'));
+}
+
+test("a failed candidate refresh loses proven-absence status and keeps profit pending without specifications", () => {
+  const app = appHarness();
+  const product = confirmedWeightless();
+  app.setProducts([product]);
+  app.merge([weightlessDetail()]);
+  assert.equal(product.fbaFee, null);
+  const information = structuredClone(product.productInformation);
+  app.merge([weightlessDetail({ detailStatus: "failed", detailErrorCode: "AMAZON_FETCH_TIMEOUT", currentPrice: null,
+    productInformation: null, collectionQuality: null })]);
+  assert.equal(product.detailStatus, "success");
+  assert.equal(product.currentPrice, 9.99);
+  assert.equal(product.currentPriceStatus, "refresh_failed");
+  assert.equal(product.collectionLastAttempt.code, "AMAZON_FETCH_TIMEOUT");
+  assert.deepEqual(product.productInformation, information);
+  assert.equal(profitModel.isAmazonWeightUnavailable(product), false);
+  assertMissingSpecificationsPending(product);
+  app.merge([weightlessDetail()]);
+  assert.equal(product.collectionLastAttempt, undefined);
+  assert.equal(product.lastCollectionError, undefined);
+  assert.equal(product.currentPriceStatus, "verified");
+  assert.equal(profitModel.isAmazonWeightUnavailable(product), true);
+  assertMissingSpecificationsPending(product);
+});
+
+for (const marker of [
+  { lastCollectionError: { code: "AMAZON_FETCH_TIMEOUT", checkedAt: now } },
+  { collectionLastAttempt: { status: "failed", code: "AMAZON_FETCH_TIMEOUT", collectedAt: now } },
+]) {
+  test(`retained-success failure survives batch and candidate mapping: ${Object.keys(marker)[0]}`, () => {
+    const app = appHarness();
+    const merged = app.mergeRecords(weightlessDetail(), weightlessDetail(marker));
+    assert.equal(merged.detailStatus, "success");
+    assert.equal(merged.collectionLastAttempt.code, "AMAZON_FETCH_TIMEOUT");
+    app.setProducts([]);
+    app.merge([merged]);
+    const product = app.products()[0];
+    assert.equal(product.collectionLastAttempt.code, "AMAZON_FETCH_TIMEOUT");
+    assert.equal(profitModel.isAmazonWeightUnavailable(product), false);
+    assertMissingSpecificationsPending(product);
+    // A pending response must not erase the latest failure either.
+    const pending = app.mergeRecords(merged, { asin: merged.asin, detailStatus: "pending" });
+    assert.equal(pending.collectionLastAttempt.code, "AMAZON_FETCH_TIMEOUT");
+    const recovered = app.mergeRecords(merged, weightlessDetail());
+    assert.equal(recovered.collectionLastAttempt, undefined);
+    assert.equal(recovered.lastCollectionError, undefined);
+    app.merge([recovered]);
+    assert.equal(profitModel.isAmazonWeightUnavailable(app.products()[0]), true);
+    assertMissingSpecificationsPending(app.products()[0]);
+  });
+}
+
+test("a successful refresh without information proof clears the old proof as well as its failure marker", () => {
+  const app = appHarness();
+  const product = confirmedWeightless({ collectionLastAttempt: { status: "failed", code: "AMAZON_FETCH_TIMEOUT" } });
+  app.setProducts([product]);
+  const fresh = weightlessDetail({ productInformation: null, collectionQuality: null });
+  app.merge([fresh]);
+  assert.equal(product.collectionLastAttempt, undefined);
+  assert.equal(product.productInformation, null);
+  assert.equal(profitModel.isAmazonWeightUnavailable(product), false);
+  assertMissingSpecificationsPending(product);
+  const batch = app.mergeRecords(weightlessDetail(), fresh);
+  assert.equal(batch.productInformation, null);
+  assert.equal(profitModel.isAmazonWeightUnavailable(batch), false);
+});
+
+test("failed and recovered candidate refreshes preserve manual price, weight, fee, purchase cost and quotes", () => {
+  const app = appHarness();
+  const product = completeLegacy({ detailParserVersion: 8, currentPrice: 20, manualProductWeight: true,
+    productWeight: 0.1, billingWeight: 0.1, fieldSources: { currentPrice: "manual", productWeight: "manual" } });
+  const suppliers = structuredClone(product.suppliers);
+  app.setProducts([product]);
+  for (const incoming of [weightlessDetail({ lastCollectionError: { code: "AMAZON_FETCH_TIMEOUT" }, productWeightKg: 9 }), weightlessDetail()]) {
+    app.merge([incoming]);
+    assert.equal(product.currentPrice, 20);
+    assert.equal(product.currentPriceStatus, "manual");
+    assert.equal(product.productWeight, 0.1);
+    assert.equal(product.billingWeight, 0.1);
+    assert.equal(product.fbaFee, 2);
+    assert.equal(product.manualFbaFee, true);
+    assert.equal(product.purchaseCost, 5);
+    assert.deepEqual(product.suppliers, suppliers);
+  }
+  assert.equal(product.collectionLastAttempt, undefined);
 });

@@ -5,6 +5,7 @@ import {
   getAnalysisFormulaContract, selectManuallyReviewedProducts,
 } from "../lib/analysis-handoff.mjs";
 import { DEFAULT_PROFIT_RATES } from "../lib/profit-model.mjs";
+import { todayDateOnly } from "../lib/amazon-listing-date.mjs";
 
 const runState = { id: "synthetic-sales-handoff", marketplace: "AU" };
 const evidence = (value = 50, overrides = {}) => ({
@@ -23,6 +24,36 @@ const product = (overrides = {}) => ({
   ...overrides,
 });
 const evaluate = (item, criteria = {}) => evaluateAnalysisProduct(item, { runState, criteria });
+
+test("handoff audits Amazon listing-date evidence and inclusive calendar bounds without using SellerSprite dates", () => {
+  const today = todayDateOnly();
+  const criteria = { results: { amazonFirstAvailableFrom: "2020-02-29" } };
+  for (const date of ["2020-02-29", today]) {
+    const item = product({ amazonFirstAvailableDate: date, amazonFirstAvailableDateStatus: "found",
+      amazonFirstAvailableDateEvidence: { asin: "B000000001", marketplace: "AU", value: date, source: "amazon_product_information" } });
+    const original = structuredClone(item);
+    const record = evaluate(item, criteria);
+    assert.equal(record.filter.decision, "pass");
+    assert.equal(record.amazon_observations.first_available_date, date);
+    assert.deepEqual(record.amazon_observations.first_available_date_evidence, item.amazonFirstAvailableDateEvidence);
+    assert.equal(record.filter.effective_result_rules.amazonFirstAvailableThrough, today);
+    assert.deepEqual(item, original);
+  }
+  for (const date of ["2020-02-28", "9999-12-31"]) {
+    const record = evaluate(product({ amazonFirstAvailableDate: date, amazonFirstAvailableDateStatus: "found" }), criteria);
+    assert.ok(record.filter.reasons.includes("AMAZON_FIRST_AVAILABLE_DATE_OUTSIDE_RANGE"));
+  }
+  for (const overrides of [{}, { listingAvailableAt: today }, { amazonFirstAvailableDate: today, amazonFirstAvailableDateStatus: "unresolved" }, { amazonFirstAvailableDate: "2025-02-29", amazonFirstAvailableDateStatus: "found" }]) {
+    const item = product(overrides);
+    assert.equal(evaluate(item).filter.decision, "pass", "Optional date does not block a product without date filtering");
+    const record = evaluate(item, criteria);
+    assert.equal(record.amazon_observations.first_available_date, null);
+    assert.ok(record.filter.reasons.includes("AMAZON_FIRST_AVAILABLE_DATE_UNVERIFIED"));
+  }
+  for (const start of ["2025-02-29", "2026/01/01", "9999-12-31"]) {
+    assert.throws(() => evaluate(product(), { amazon: { amazonFirstAvailableFrom: start } }), /Invalid Amazon/);
+  }
+});
 
 test("unknown or numeric-only monthly sales cannot enter the default all candidate scope", () => {
   for (const sales30 of [undefined, null, 0, 50, 100, 1200]) {
@@ -116,4 +147,75 @@ test("same-ASIN SellerSprite evidence follows the enabled source in handoff filt
   assert.equal(selectManuallyReviewedProducts(disabled).length, 0);
   assert.equal(evaluate(item, disabled.criteria).amazon_observations.monthly_sales, null);
   assert.equal(selectManuallyReviewedProducts({ ...enabled, products: [{ ...item, marketplace: "AU" }] }).length, 0);
+});
+
+test("direct ASIN handoffs enforce monthly eligibility and selected bands without changing observations", () => {
+  for (const value of [null, 30, 50, 200]) {
+    const item = product({ sales30: value, sales30Evidence: value === null ? null : evidence(value) });
+    const input = { runState: { ...runState, inputMode: "asins" }, products: [item], criteria: { monthlySalesBand: "100_plus" } };
+    const before = structuredClone(input);
+    const pack = createAnalysisHandoffPackage(input);
+    const record = evaluateAnalysisProduct(item, input);
+    const storeRecord = evaluateAnalysisProduct(item, { ...input, runState });
+    assert.deepEqual(record.filter.reasons, storeRecord.filter.reasons);
+    assert.equal(record.filter.decision, value === null ? "pending" : value < 100 ? "excluded" : "pass");
+    assert.equal(pack.products.length, value !== null && value >= 50 ? 1 : 0);
+    assert.equal(record.amazon_observations.monthly_sales, value);
+    assert.equal(pack.filter_rules.input_mode, "asins");
+    assert.equal(pack.filter_rules.amazon.monthlySalesFilterApplied, true);
+    assert.equal(pack.filter_rules.amazon.monthlySalesBand, "100_plus");
+    assert.equal(pack.formula_contract.amazon_monthly_sales_policy.minimum, 50);
+    assert.equal(pack.formula_contract.amazon_monthly_sales_policy.applied, true);
+    assert.equal(pack.manual_selection.required_candidate_eligibility, "verified_current_asin_monthly_sales_at_least_50");
+    assert.deepEqual(input, before);
+  }
+  assert.throws(() => evaluateAnalysisProduct(product(), {
+    runState: { ...runState, inputMode: "asins" }, criteria: { monthlySalesBand: "stale-unsupported-band" },
+  }), /Unsupported monthlySalesBand/);
+});
+
+test("ASIN filtering preserves review, rating, detail, date and manual selection requirements", () => {
+  const directRun = { ...runState, inputMode: "asins" };
+  for (const [fields, criteria, expected] of [
+    [{ reviews: 5 }, { minReviews: 10 }, "REVIEWS_BELOW_MINIMUM"],
+    [{ reviews: 30 }, { maxReviews: 20 }, "REVIEWS_ABOVE_MAXIMUM"],
+    [{ rating: 2 }, { minRating: 4 }, "RATING_BELOW_MINIMUM"],
+    [{ detailStatus: "pending" }, {}, "AMAZON_DETAIL_NOT_COMPLETE"],
+    [{}, { results: { amazonFirstAvailableFrom: "2020-01-01" } }, "AMAZON_FIRST_AVAILABLE_DATE_UNVERIFIED"],
+    [{ reviewStatus: "rejected" }, {}, "ANALYSIS_REVIEW_REJECTED"],
+  ]) {
+    const record = evaluateAnalysisProduct(product(fields), { runState: directRun, criteria });
+    assert.ok(record.filter.reasons.includes(expected));
+  }
+  assert.equal(selectManuallyReviewedProducts({ runState: directRun, products: [product({ reviewStatus: "pending" })] }).length, 0);
+});
+
+test("legacy bypass flags cannot disable sales in either import mode and JSON restore preserves revisions", () => {
+  for (const inputMode of ["stores", "asins"]) {
+    const item = product({ sales30: null, sales30Evidence: null, inputMode: "asins",
+      storeCriteria: [{ monthlySalesBand: "100_plus", monthlySalesFilterApplied: false }] });
+    const input = { runState: { ...runState, inputMode }, products: [item], criteria: { monthlySalesBand: '100_plus', monthlySalesFilterApplied: false } };
+    assert.ok(evaluateAnalysisProduct(item, input).filter.reasons.includes("MONTHLY_SALES_EVIDENCE_MISSING"));
+    const pack = createAnalysisHandoffPackage(input);
+    assert.equal(pack.products.length, 0);
+    assert.equal(pack.package_id, createAnalysisHandoffPackage(JSON.parse(JSON.stringify(input))).package_id);
+    assert.equal(pack.filter_rules.amazon.monthlySalesFilterApplied, true);
+  }
+});
+
+test("ASIN all handoff retains manually reviewed low/unknown sales while explicit bands still require sales", () => {
+  for (const value of [null, 0, 30]) {
+    const item = product({ sales30: value, sales30Evidence: value === null ? null : evidence(value) });
+    const before = structuredClone(item);
+    const input = { runState: { ...runState, inputMode: 'asins' }, products: [item], criteria: { monthlySalesBand: 'all' } };
+    const pack = createAnalysisHandoffPackage(input);
+    assert.equal(pack.products.length, 1);
+    assert.equal(pack.products[0].amazon_observations.monthly_sales, value);
+    assert.equal(pack.filter_rules.amazon.monthlySalesFilterApplied, false);
+    assert.equal(pack.formula_contract.amazon_monthly_sales_policy.applied, false);
+    assert.equal(pack.products[0].filter.decision, 'pass');
+    assert.equal(createAnalysisHandoffPackage({ ...input, criteria: { monthlySalesBand: '50_plus' } }).products.length, 0);
+    assert.equal(createAnalysisHandoffPackage({ ...input, runState }).products.length, 0);
+    assert.deepEqual(item, before);
+  }
 });

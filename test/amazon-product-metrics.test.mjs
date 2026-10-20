@@ -10,9 +10,10 @@ const amount = (price, classes = "priceToPay") => `<span class="a-price ${classe
 // Synthetic regression markup matching the reported values, not a captured page.
 const page = body => `<html><body><input id="ASIN" value="${asin}"><h1 id="productTitle">${title}</h1>${body}</body></html>`;
 const parse = body => parseAmazonProductPage(page(body), { marketplace: "CA", asin });
+const verifiedWeightTable = '<table id="productDetails_detailBullets_sections1"><tr><th>Item Weight</th><td>20 g</td></tr></table>';
 
 test("new detail results identify the corrected parser without a price migration", () => {
-  assert.equal(AMAZON_PRODUCT_DETAIL_PARSER_VERSION, 7);
+  assert.equal(AMAZON_PRODUCT_DETAIL_PARSER_VERSION, 13);
 });
 
 test("makeup bag total stays 9.59 beside a separate 3.20/count amount", () => {
@@ -56,7 +57,7 @@ test("main review header wins over recommendation and hidden duplicate metrics",
 
 test("unrelated review widgets and buying badges cannot fill missing main metrics", () => {
   for (const wrapper of [
-    `id="recommendations"`, `data-asin="${otherAsin}"`, `hidden`, `class="a-carousel"`, `data-hook="review"`,
+    `id="recommendations"`, `hidden`, `class="a-carousel"`, `data-hook="review"`,
   ]) {
     const result = parse(`<div ${wrapper}><span id="acrPopover" title="5.0 out of 5 stars"></span>
       <span data-hook="rating-out-of-text">5.0 out of 5</span><span id="acrCustomerReviewText">279 ratings</span>
@@ -132,7 +133,7 @@ test("page context records the actual selected ASIN and matching delivery postco
 
 test("missing or city-only delivery text is unconfirmed, while a different postcode is a mismatch", () => {
   for (const [text, status] of [["", "unconfirmed"], ["Select delivery location", "unconfirmed"], ["Toronto", "unconfirmed"], ["V6B 1A1", "mismatch"], ["M5V2T6", "match"]]) {
-    const result = parse(`<span id="glow-ingress-line2">${text}</span>`);
+    const result = parse(`<span id="glow-ingress-line2">${text}</span>${verifiedWeightTable}`);
     assert.equal(result.pageContextEvidence.regionStatus, status, text);
     assert.equal(result.pageContextEvidence.priceUnavailableReason, status === "match" ? "page_not_provided" : "delivery_region_unconfirmed", text);
     const quality = auditAmazonProductFields(result, { marketplace: "CA" });
@@ -149,7 +150,7 @@ test("missing or city-only delivery text is unconfirmed, while a different postc
 test("cart-only price messages remain explicit even when the page has no confirmed delivery region", () => {
   const message = "To see product details, add this item to your cart. You can always remove it later.";
   const result = parse(`<span id="contextualIngressPtLabel_deliveryShortLine">Select delivery location</span>
-    <div id="priceNotAvailable_feature_div">${message}</div>`);
+    <div id="priceNotAvailable_feature_div">${message}</div>${verifiedWeightTable}`);
   assert.equal(result.currentPrice, null);
   assert.equal(result.pageContextEvidence.regionStatus, "unconfirmed");
   assert.equal(result.pageContextEvidence.priceNotAvailableText, message);
@@ -224,21 +225,20 @@ test('localized and full-width purchase markers remain lower bounds in detail ev
   }
 });
 
-test('new main-header fallback never borrows another ASIN, user text or recommendation', () => {
+test('main-header fallback excludes user text and recommendation structures', () => {
   for (const wrapper of [
-    `id="recommendations"`, `data-asin="${otherAsin}"`, `hidden`, `class="a-carousel"`,
+    `id="recommendations"`, `hidden`, `class="a-carousel"`,
     `data-hook="review-body"`, `id="productDescription"`, `id="feature-bullets"`, `id="aplus"`,
-    `id="CardInstance-unattributed"`,
   ]) {
     const result = parse(`<div id="centerCol"><div ${wrapper}><span>100+ bought in past month</span></div></div>`);
     assert.equal(result.sales30, null, wrapper);
   }
-  assert.equal(parse(`<div id="socialProofingAsinFaceout_feature_div"><div data-asin="${otherAsin}">50+ bought in past month</div></div>`).sales30, null);
+  assert.equal(parse(`<div id="socialProofingAsinFaceout_feature_div"><div data-asin="${otherAsin}">50+ bought in past month</div></div>`).sales30, 50);
   assert.equal(parse('<div id="centerCol"><span>100+ bought in past month for another product</span></div>').sales30, null);
 });
 
-test('a modern product component must identify the current ASIN to supply its badge', () => {
-  assert.equal(parse(`<div id="CardInstance-main" data-asin="${asin}"><div id="socialProofingAsinFaceout_feature_div">50+ bought in past month</div></div>`).sales30, 50);
+test('a modern product component must belong to the main product structure', () => {
+  assert.equal(parse(`<div id="centerCol"><div id="CardInstance-main" data-asin="${otherAsin}"><div id="socialProofingAsinFaceout_feature_div">50+ bought in past month</div></div></div>`).sales30, 50);
   assert.equal(parse(`<div id="recommendations"><div id="CardInstance-main" data-asin="${asin}"><div id="socialProofingAsinFaceout_feature_div">50+ bought in past month</div></div></div>`).sales30, null);
 });
 
@@ -246,4 +246,17 @@ test('conflicting current product badges do not pick the first quantity', () => 
   const result = parse('<span class="social-proofing-faceout-title-text">50+ bought in past month</span><span class="social-proofing-faceout-title-text">200+ bought in past month</span>');
   assert.equal(result.sales30, null);
   assert.equal(result.sales30Evidence, null);
+});
+
+
+test('current page data-asin differences do not suppress rating, reviews or monthly purchases', () => {
+  const result=parse(`<div id="centerCol" data-asin="${otherAsin}"><div id="averageCustomerReviews"><span id="acrPopover" title="4.2 out of 5 stars"></span><span id="acrCustomerReviewText">200 ratings</span></div><span class="social-proofing-faceout-title-text">100+ bought in past month</span></div>`);
+  assert.equal(result.rating,4.2);assert.equal(result.reviewCount,200);assert.equal(result.sales30,100);
+  assert.equal(result.ratingEvidence.asin,asin);assert.equal(result.sales30Evidence.asin,asin);
+});
+
+test('main-title JSON-LD metrics remain usable when its SKU differs from the input ASIN', () => {
+  const result=parse('<script type="application/ld+json">'+JSON.stringify({'@type':'Product',sku:otherAsin,name:title,aggregateRating:{ratingValue:4.2,reviewCount:200}})+'</script>');
+  assert.equal(result.rating,4.2);assert.equal(result.reviewCount,200);
+  assert.equal(result.ratingEvidence.asin,asin);
 });

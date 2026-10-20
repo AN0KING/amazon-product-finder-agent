@@ -62,7 +62,7 @@ test("manual fulfillment input is exported without applying CA discount or surch
   assert.equal(exported.fee_sources.fulfillment.manual_override, true);
 });
 
-test("missing-weight minimum fee remains a preliminary input without inventing weight", () => {
+test("missing-weight minimum envelope estimates profit without inventing actual weight", () => {
   const item = candidate(4.06755);
   item.analysisProfitInputs.actualWeightKg = null;
   item.analysisProfitInputs.actualWeightSource = "missing_weight_lowest_freight_assumption";
@@ -70,7 +70,70 @@ test("missing-weight minimum fee remains a preliminary input without inventing w
   const record = pack.products[0];
   assert.equal(record.preliminary_profit.inputs.fulfillmentFee, 4.06755);
   assert.equal(record.preliminary_profit.inputs.actualWeightKg, null);
+  assert.equal(record.preliminary_profit.inputs.assumedWeightKg, undefined);
   assert.equal(record.preliminary_profit.result, null);
   assert.equal(record.filter.decision, "pass");
-  assert.match(pack.formula_contract.ca_fba.missing_weight, /allow preliminary review/);
+  assert.match(pack.formula_contract.ca_fba.missing_weight, /5021.69/);
+});
+
+for (const marketplace of ["AU", "CA", "US", "NL", "UK", "DE", "FR", "IT", "ES", "PL", "MX", "BR"]) {
+  test(`${marketplace} handoff keeps actual weight unknown and exports its minimum-tier assumption`, () => {
+    const item = candidate(7.12345, { marketplace, manualFbaFee: true });
+    item.analysisProfitInputs.actualWeightKg = null;
+    const record = exportOne(item).products[0];
+    const profit = record.preliminary_profit;
+    const assumed = marketplace === "AU" ? 0.075 : marketplace === "CA" ? 0.1 : 0.25 / 2.2046226218;
+    assert.equal(record.amazon_observations.item_weight_kg, null);
+    assert.equal(profit.inputs.actualWeightKg, null);
+    if (["AU", "CA"].includes(marketplace)) {
+      assert.equal(profit.inputs.assumedWeightKg, undefined);
+      assert.equal(profit.result, null);
+      assert.equal(profit.inputs.fulfillmentFee, 7.12345);
+      assert.ok(profit.missing_inputs.includes("actualWeightKg"));
+      return;
+    }
+    assert.equal(profit.inputs.assumedWeightKg, assumed);
+    assert.equal(profit.inputs.weightAssumptionMarket, marketplace);
+    assert.equal(profit.result.airFreight.actualWeightKg, null);
+    assert.equal(profit.result.domesticFreightWeightKg, assumed);
+    assert.equal(profit.result.fulfillmentFee, 7.12345, 'Preserve the explicit manual fee.');
+    assert.equal(profit.fee_sources.weight_assumption.assumed_weight_kg, assumed);
+    assert.deepEqual(profit.missing_inputs, []);
+  });
+}
+
+test("handoff recomputes legacy fake weight as a separate assumption and real weight clears it", () => {
+  const item = candidate(4.06755);
+  item.analysisProfitInputs.actualWeightKg = 0.075;
+  item.analysisProfitInputs.actualWeightSource = "missing_weight_lowest_freight_assumption";
+  let record = exportOne(item).products[0];
+  assert.equal(record.preliminary_profit.inputs.actualWeightKg, null);
+  assert.equal(record.preliminary_profit.inputs.assumedWeightKg, undefined);
+  item.analysisProfitInputs.actualWeightKg = 0.11;
+  delete item.analysisProfitInputs.actualWeightSource;
+  item.analysisProfitInputs.assumedWeightKg = 0.1;
+  item.analysisProfitInputs.weightAssumption = "missing_weight_minimum_envelope";
+  record = exportOne(item).products[0];
+  assert.equal(record.preliminary_profit.inputs.actualWeightKg, 0.11);
+  assert.equal(record.preliminary_profit.inputs.assumedWeightKg, undefined);
+  assert.equal(record.preliminary_profit.fee_sources.weight_assumption, null);
+});
+
+test("FBM and explicitly invalid weight cannot use the missing-weight assumption in handoff", () => {
+  for (const weight of [0, -1, "invalid", false]) {
+    for (const detailParserVersion of [undefined, 11]) {
+      const item = candidate(4, { detailParserVersion });
+      item.analysisProfitInputs.actualWeightKg = weight;
+      const profit = exportOne(item).products[0].preliminary_profit;
+      assert.equal(profit.result, null, `weight=${weight}; parser=${detailParserVersion}`);
+      assert.ok(profit.missing_inputs.includes("actualWeightKg"));
+      assert.equal(profit.inputs.assumedWeightKg, undefined);
+    }
+  }
+  const item = candidate(4);
+  item.analysisProfitInputs.actualWeightKg = null;
+  item.analysisProfitInputs.fulfillmentMode = "FBM";
+  const profit = exportOne(item).products[0].preliminary_profit;
+  assert.equal(profit.result, null);
+  assert.equal(profit.inputs.assumedWeightKg, undefined);
 });

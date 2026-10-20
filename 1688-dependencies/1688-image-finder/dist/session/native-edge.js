@@ -8,10 +8,13 @@ import { acquireLock } from './lock.js';
 import { defaultProfileName, edgeCacheDir, lockFile, profilePath, profilesDir, } from './paths.js';
 import { CliError } from '../io/errors.js';
 const DEVTOOLS_ACTIVE_PORT = 'DevToolsActivePort';
-const EDGE_START_TIMEOUT_MS = 20_000;
+const EDGE_START_TIMEOUT_MS = 60_000;
 const EDGE_CDP_SETTLE_MS = 5_000;
 const EDGE_CLOSE_TIMEOUT_MS = 30_000;
-const EDGE_WINDOW_PROOF_TIMEOUT_MS = 10_000;
+// The helper deadline includes PowerShell startup and C# compilation, before
+// its unchanged six-second native window search begins.
+const EDGE_WINDOW_PROOF_TIMEOUT_MS = 30_000;
+const EDGE_WINDOW_PROOF_STARTUP_ALLOWANCE_MS = 24_000;
 const EDGE_WINDOW_PROOF_MAX_OUTPUT_BYTES = 64 * 1024;
 const WINDOWS_POWERSHELL_PATH = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
 const PROFILE_RELEASE_TIMEOUT_MS = 5_000;
@@ -1023,7 +1026,6 @@ function assertExactDefaultProfile(candidateProfileDir, candidateLockPath) {
     if (normalizeWindowsPath(resolved) !== normalizeWindowsPath(expectedProfile)
         || normalizeWindowsPath(resolvedLock) !== normalizeWindowsPath(expectedLock)
         || normalizeWindowsPath(parent) !== normalizeWindowsPath(expectedParent)
-        || path.win32.parse(resolved).root.toUpperCase() !== 'D:\\'
         || pathIsWithin(resolved, resolvedLock)) {
         throw nativeEdgeError('EDGE_PROFILE_RECOVERY_UNSAFE', 'Only the dedicated default Edge profile with an external lock can be changed.', 6);
     }
@@ -1347,6 +1349,15 @@ async function proveOwnedVisibleEdgeWindow(browserPids, discovery) {
     if (ownedBrowserPids.length === 0) {
         throw nativeEdgeError('EDGE_OWNERSHIP_UNPROVEN', 'Microsoft Edge did not expose its owned browser process.');
     }
+    const proofStartedAt = Date.now();
+    const helperTimeoutMs = discovery
+        ? discovery.startupTimeoutMs + EDGE_WINDOW_PROOF_STARTUP_ALLOWANCE_MS
+        : EDGE_WINDOW_PROOF_TIMEOUT_MS;
+    const failure = (reason, cause, exitCode) => edgeWindowProofError(reason, cause, {
+        exitCode,
+        elapsedMs: Date.now() - proofStartedAt,
+        timeoutMs: helperTimeoutMs,
+    });
     let stdout = '';
     let stderr = '';
     let outputOverflow = false;
@@ -1376,7 +1387,7 @@ async function proveOwnedVisibleEdgeWindow(browserPids, discovery) {
         });
     }
     catch (cause) {
-        throw edgeWindowNotVisibleError(cause);
+        throw failure('spawn_failed', cause);
     }
     const collect = (current, chunk) => {
         if (outputOverflow)
@@ -1397,12 +1408,9 @@ async function proveOwnedVisibleEdgeWindow(browserPids, discovery) {
     });
     const exitCode = await new Promise((resolve, reject) => {
         let settled = false;
-        const helperTimeoutMs = discovery
-            ? discovery.startupTimeoutMs + 3_000
-            : EDGE_WINDOW_PROOF_TIMEOUT_MS;
         const timer = setTimeout(() => {
+            finish(() => reject(failure('timeout', new Error('The Windows window proof helper timed out.'))));
             child.kill();
-            finish(() => reject(edgeWindowNotVisibleError(new Error('The Windows window proof helper timed out.'))));
         }, helperTimeoutMs);
         const finish = (callback) => {
             if (settled)
@@ -1412,7 +1420,7 @@ async function proveOwnedVisibleEdgeWindow(browserPids, discovery) {
             callback();
         };
         child.once('error', (cause) => {
-            finish(() => reject(edgeWindowNotVisibleError(cause)));
+            finish(() => reject(failure('process_error', cause)));
         });
         child.once('close', (code) => {
             finish(() => resolve(code));
@@ -1424,12 +1432,54 @@ async function proveOwnedVisibleEdgeWindow(browserPids, discovery) {
             .filter(Boolean)
             .join(' | ')
             .slice(0, 2_000);
-        throw edgeWindowNotVisibleError(new Error(detail || `The Windows window proof helper exited with code ${String(exitCode)}.`));
+        const reason = classifyOwnedEdgeWindowProofFailure({ exitCode, outputOverflow, stdout, stderr });
+        throw failure(reason, new Error(detail || `The Windows window proof helper exited with code ${String(exitCode)}.`), exitCode);
     }
     return proof;
 }
-function edgeWindowNotVisibleError(cause) {
-    return nativeEdgeError('EDGE_WINDOW_NOT_VISIBLE', 'Microsoft Edge did not create a visible, usable login window.', 1, cause);
+function classifyOwnedEdgeWindowProofFailure({ exitCode, outputOverflow, stdout, stderr }) {
+    if (outputOverflow)
+        return 'output_overflow';
+    let record;
+    for (const line of stdout.replace(/^\uFEFF/, '').split(/\r?\n/).reverse()) {
+        try {
+            const candidate = JSON.parse(line.trim());
+            if (candidate && typeof candidate === 'object') {
+                record = candidate;
+                break;
+            }
+        }
+        catch { /* Only the helper's terminal JSON is used for safe classification. */ }
+    }
+    if (exitCode === 3 && record?.ok === false && record.reason === 'wrong_desktop')
+        return 'wrong_desktop';
+    if (exitCode === 4 && record?.ok === false && record.reason === undefined)
+        return 'no_window';
+    if (exitCode !== 0)
+        return /(?:Add-Type|Compilation errors?|CompilerError|CS\d{4})/i.test(stderr)
+            ? 'compilation_failed' : 'execution_failed';
+    return 'invalid_proof';
+}
+function edgeWindowProofError(reason, cause, timing = {}) {
+    const allowed = ['spawn_failed', 'process_error', 'compilation_failed', 'execution_failed',
+        'output_overflow', 'invalid_proof', 'wrong_desktop', 'no_window', 'timeout'];
+    const safeReason = allowed.includes(reason) ? reason : 'execution_failed';
+    const [code, message] = safeReason === 'timeout'
+        ? ['EDGE_WINDOW_PROOF_TIMEOUT', 'The Windows visibility check timed out before the Edge login window could be verified.']
+        : safeReason === 'wrong_desktop'
+            ? ['EDGE_WINDOW_WRONG_DESKTOP', 'Windows could not verify that the Edge login window is on the current interactive desktop.']
+            : safeReason === 'no_window'
+                ? ['EDGE_WINDOW_NOT_VISIBLE', 'Microsoft Edge did not create a visible, usable login window.']
+                : ['EDGE_WINDOW_CHECK_FAILED', 'The Windows visibility check failed before the Edge login window could be verified.'];
+    // Raw helper output remains diagnostic cause only; CLI messages and details
+    // must never expose command lines, profile paths, account data or tokens.
+    return nativeEdgeError(code, message, 1, cause).withDetails({
+        stage: 'window_proof',
+        reason: safeReason,
+        exitCode: Number.isInteger(timing.exitCode) ? timing.exitCode : null,
+        elapsedMs: Number.isFinite(timing.elapsedMs) ? Math.max(0, Math.round(timing.elapsedMs)) : null,
+        timeoutMs: Number.isFinite(timing.timeoutMs) && timing.timeoutMs > 0 ? Math.round(timing.timeoutMs) : null,
+    });
 }
 async function closeOwnedNativeEdge(session) {
     if (!session.owned)

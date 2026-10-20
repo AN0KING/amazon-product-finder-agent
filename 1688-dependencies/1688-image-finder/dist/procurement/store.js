@@ -6,7 +6,6 @@ import { PROCUREMENT_CONTACT_ATTEMPT_STATUSES, PROCUREMENT_SEARCH_PROGRESS_PHASE
 export const MAX_PROCUREMENT_IMAGE_BYTES = 25 * 1024 * 1024;
 export const MAX_PROCUREMENT_IMPORT_BATCH_ITEMS = 200;
 const STATE_VERSION = 1;
-const WINDOWS_DRIVE_ROOT = 'd:\\';
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 const CONTROL_CHARACTER_RUNS = /[\u0000-\u001f\u007f-\u009f]+/g;
 const CONTACT_MESSAGE_CONTROL_CHARACTERS = /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
@@ -1154,18 +1153,20 @@ function normalizeRoot(value) {
         throw storeError('PROCUREMENT_ROOT_REQUIRED', 'A procurement data root is required.');
     }
     const raw = value.trim();
-    if (!path.win32.isAbsolute(raw)) {
+    if (!/^[a-z]:[\\/]/i.test(raw) || /^[\\/]{2}/.test(raw) || /[\0-\x1f]/.test(raw)) {
         throw storeError('PROCUREMENT_ROOT_ABSOLUTE_REQUIRED', 'The procurement data root must be absolute.');
     }
     if (raw.split(/[\\/]+/).includes('..')) {
         throw storeError('PROCUREMENT_PATH_ESCAPE', 'The procurement data root cannot contain traversal.');
     }
     const resolved = path.win32.resolve(raw);
-    if (path.win32.parse(resolved).root.toLocaleLowerCase('en-US') !== WINDOWS_DRIVE_ROOT) {
-        throw storeError('PROCUREMENT_ROOT_DRIVE_REQUIRED', 'The procurement data root must be on D:.');
+    const driveRoot = path.win32.parse(resolved).root.toLowerCase();
+    if (canonicalWindowsPath(resolved) === driveRoot) {
+        throw storeError('PROCUREMENT_ROOT_TOO_BROAD', 'The procurement data root cannot be a drive root.');
     }
-    if (canonicalWindowsPath(resolved) === WINDOWS_DRIVE_ROOT) {
-        throw storeError('PROCUREMENT_ROOT_TOO_BROAD', 'The procurement data root cannot be the D: root.');
+    const components = resolved.slice(driveRoot.length).split(/[\\/]+/);
+    if (components.some((part) => /[<>:"|?*]|[ .]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+        throw storeError('PROCUREMENT_PATH_ESCAPE', 'The procurement data root contains an unsafe path component.');
     }
     return resolved.replace(/[\\/]+$/, '');
 }

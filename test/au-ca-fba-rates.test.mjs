@@ -27,7 +27,11 @@ test('AU fractional grams advance across standard-envelope weight bands', () => 
   assert.equal(next75.fee, 4.35);
   assert.equal(next225.billableWeightG, 226);
   assert.equal(next225.fee, 4.70);
-  assert.equal(estimateAu2026FbaFeeByProductWeight({ actualWeightKg: 0.475001, itemPriceAud: 13 }), null);
+  const above = estimateAu2026FbaFeeByProductWeight({ actualWeightKg: 0.475001, itemPriceAud: 13 });
+  assert.equal(above.billableWeightG, 476);
+  assert.equal(above.feeWeightG, 475);
+  assert.equal(above.fee, 4.70);
+  assert.equal(above.overweightCapped, true);
 });
 
 test('AU only permits standard envelopes, including legacy automatic policy callers', () => {
@@ -48,7 +52,10 @@ test('AU supplied dimensions are checked independent of dimension order', () => 
   assert.equal(fitting.dimensionsAssumption, null);
   for (const dimensionsCm of [[33.01, 23, 2.5], [33, 23.01, 2.5], [33, 23, 2.501]]) {
     assert.equal(estimateAu2026FbaFeeByProductWeight({ actualWeightKg: 0.1, itemPriceAud: 13, dimensionsCm }), null);
-    assert.equal(estimateMinimumFbaFee({ marketplace: 'AU', salePrice: 13, dimensionsCm }), null);
+    const assumed = estimateMinimumFbaFee({ marketplace: 'AU', salePrice: 13, dimensionsCm });
+    assert.equal(assumed.fee, 3.67);
+    assert.equal(assumed.dimensionsAssumption, 'minimum_envelope_despite_known_dimensions');
+    assert.equal(assumed.actualWeightKg, null);
   }
 });
 
@@ -82,8 +89,11 @@ test('CA fractional grams advance into the next band and never fall back to US f
   for (const [weight, nextBase] of [[0.100001, 4.99], [0.200001, 5.31], [0.300001, 5.60], [0.400001, 5.95]]) {
     assert.equal(estimateCa2026FbaFeeByProductWeight({ actualWeightKg: weight, itemPriceCad: 20 }).baseFee, nextBase);
   }
-  assert.equal(estimateCa2026FbaFeeByProductWeight({ actualWeightKg: 0.500001, itemPriceCad: 20 }), null);
-  assert.equal(estimateCa2026FbaFeeByProductWeight({ actualWeightKg: 2, itemPriceCad: 20 }), null);
+  const above = estimateCa2026FbaFeeByProductWeight({ actualWeightKg: 0.500001, itemPriceCad: 20 });
+  assert.equal(above.billableWeightG, 501);
+  assert.equal(above.feeWeightG, 500);
+  closeTo(above.fee, 6.15825);
+  assert.equal(above.overweightCapped, true);
   assert.equal(CA_FBA_PEAK_ENVELOPE_RATES.length, 5);
 });
 
@@ -106,7 +116,7 @@ test('CA keeps the supplied peak policy and workbook traceability without switch
   assert.ok(result.sourceCells.includes('Sheet1!D4'));
   assert.ok(result.sourceCells.includes('Sheet1!D3'));
   assert.match(result.rateSource, /亚马逊加拿大站FBA配送费-旺季信封件/);
-  assert.match(PROFIT_FORMULA_VERSION, /au-ca-envelope-fba-v10$/);
+  assert.match(PROFIT_FORMULA_VERSION, /all-market-minimum-envelope-v12$/);
 });
 
 test('AU traceability selects the correct low or high price source cell', () => {
@@ -125,6 +135,8 @@ test('missing-weight AU and CA fees use the selling-price rules without fabricat
     closeTo(result.fee, expected);
     assert.equal(result.actualWeightKg, null);
     assert.equal(result.billableWeightG, null);
+    assert.equal(result.feeWeightG, null);
+    assert.equal(result.overweightCapped, false);
     assert.equal(result.assumption, 'missing_weight_minimum_fba_estimate');
     assert.equal(result.priceAssumption, null);
   }
@@ -153,4 +165,60 @@ test('Canadian surcharge precision survives profit calculation', () => {
   assert.equal(result.parts.fulfillment, estimate.fee);
   assert.notEqual(result.fulfillmentFee, 4.07);
   closeTo(result.profit - roundedResult.profit, 0.00245);
+});
+
+for (const [market, estimate, priceKey, cap, lowPrice, highPrice, lowFee, highFee] of [
+  ['AU', estimateAu2026FbaFeeByProductWeight, 'itemPriceAud', 475, 13, 13.01, 4.70, 5.61],
+  ['CA', estimateCa2026FbaFeeByProductWeight, 'itemPriceCad', 500, 13.99, 14, 5.33025, 6.15825],
+]) {
+  test(`${market} maximum fee tier caps only the fee and retains exact real weight for freight`, () => {
+    for (const actualWeightKg of [cap / 1000, cap / 1000 + 0.000001, 2.345]) {
+      for (const [price, expectedFee] of [[lowPrice, lowFee], [highPrice, highFee]]) {
+        const result = estimate({ actualWeightKg, [priceKey]: price });
+        closeTo(result.fee, expectedFee);
+        assert.equal(result.actualWeightKg, actualWeightKg);
+        assert.equal(result.billableWeightG, Math.ceil(actualWeightKg * 1000 - 1e-9));
+        assert.equal(result.feeWeightG, cap);
+        assert.equal(result.weightCapG, cap);
+        assert.equal(result.overweightCapped, actualWeightKg > cap / 1000);
+        if (result.overweightCapped) {
+          assert.equal(result.assumption, 'overweight_maximum_tier_capped');
+          assert.match(result.rateApplicability, /用户指定最高重量档封顶/);
+          assert.ok(result.ambiguity.includes('weight-exceeds-envelope-table'));
+          assert.equal(result.confidence, 'low');
+        }
+        const profit = calculateProductProfit({ salePrice: price, purchaseCostCny: 1, fulfillmentFee: result.fee,
+          exchangeRate: 5, fulfillmentMode: 'FBA', actualWeightKg: result.actualWeightKg,
+          airFreightActualWeightOnly: true, airFreightRateCnyPerKg: 10 });
+        assert.equal(profit.airFreight.actualWeightKg, actualWeightKg);
+        assert.equal(profit.airFreight.chargeableWeightKg, actualWeightKg);
+        closeTo(profit.airFreight.airFreightCny, actualWeightKg * 10);
+        assert.equal(profit.domesticFreightWeightKg, actualWeightKg);
+      }
+    }
+  });
+}
+
+test('overweight AU cap cannot certify a product that exceeds known envelope dimensions', () => {
+  const input = { actualWeightKg: 2, itemPriceAud: 13 };
+  const fitting = estimateAu2026FbaFeeByProductWeight({ ...input, dimensionsCm: [33, 23, 2.5] });
+  assert.equal(fitting.fee, 4.70);
+  assert.equal(fitting.assumption, 'overweight_maximum_tier_capped');
+  assert.equal(fitting.dimensionsAssumption, null);
+  assert.equal(fitting.confidence, 'low');
+  for (const dimensionsCm of [[34, 23, 2.5], [33, 24, 2.5], [33, 23, 3]]) {
+    assert.equal(estimateAu2026FbaFeeByProductWeight({ ...input, dimensionsCm }), null);
+  }
+});
+
+test('overweight cap keeps AU and CA top-row workbook traceability and CA surcharge precision', () => {
+  const au = estimateAu2026FbaFeeByProductWeight({ actualWeightKg: 2, itemPriceAud: 13.01 });
+  const ca = estimateCa2026FbaFeeByProductWeight({ actualWeightKg: 2, itemPriceCad: 13.99 });
+  assert.equal(au.sourceCell, '表格_20261009!E4');
+  assert.equal(ca.sourceCell, 'Sheet1!C8');
+  assert.ok(ca.sourceCells.includes('Sheet1!D8'));
+  assert.equal(ca.baseFee, 5.95);
+  assert.equal(ca.discount, 0.8);
+  assert.equal(ca.surchargeMultiplier, 1.035);
+  closeTo(ca.fee, (5.95 - 0.8) * 1.035);
 });

@@ -16,6 +16,12 @@ const snapshot = (products, ids = products.map(item => item.id), pipeline = {}) 
   runState: { id: RUN, errors: [], supplier1688Pipeline: { productIds: ids, status: 'paused', ...pipeline } }, products,
 });
 
+const directSnapshot = (products, ids, pipeline) => {
+  const saved = snapshot(products, ids, pipeline);
+  saved.runState.inputMode = 'asins';
+  return saved;
+};
+
 class MemoryStore {
   constructor(value) { this.records = new Map([[RUN, copy(value)]]); this.active = null; this.writes = []; this.queue = Promise.resolve(); }
   async readSnapshot(id) { return copy(this.records.get(id)); }
@@ -70,6 +76,78 @@ test('only the confirmed cohort runs and every successful result is applied to t
   assert.deepEqual(pipeline.productIds, ['A']); assert.equal(pipeline.owner, 'server');
   assert.deepEqual(mock.busy, [true, false]);
   assert.ok(mock.store.writes.some(state => state.products[0].supplierSearchStatus === 'searching'));
+});
+
+test('direct ASIN supplier scope excludes unknown and low sales without changing the confirmed cohort', async t => {
+  const items = [product('unknown', { sales30: null, sales30Evidence: null }),
+    product('low', { sales30: 30, sales30Evidence: { source: 'amazon_product_page', period: 'past_month',
+      value: 30, rawText: '30+ bought in past month', asin: 'B012345678', kind: 'lower_bound' } }),
+    product('unselected', { sales30Evidence: null }),
+    product('manual', { sales30Evidence: null, manualPurchaseCost: true, purchaseCost: 88 })];
+  const saved = directSnapshot(items, ['unknown', 'low', 'manual'], { selectionId: 'fixed-direct-selection' });
+  saved.runState.criteria = { monthlySalesBand: '100_plus' };
+  const mock = await setup(t, { snapshot: saved });
+  await mock.runner.tick(); await mock.runner.tick();
+  assert.deepEqual(mock.calls.map(call => call.item.id), []);
+  const latest = mock.store.read(), pipeline = latest.runState.supplier1688Pipeline;
+  assert.equal(pipeline.selectionId, 'fixed-direct-selection');
+  assert.deepEqual(pipeline.productIds, ['unknown', 'low', 'manual']);
+  assert.equal(pipeline.excludedMonthlySalesCount, 3);
+  assert.equal(pipeline.remaining, 0);
+  assert.equal(latest.products[0].sales30, null); assert.equal(latest.products[0].sales30Evidence, null);
+  assert.equal(latest.products[1].sales30, 30);
+  assert.equal(latest.products[2].supplierSearchStatus, 'not_started');
+  assert.equal(latest.products[3].purchaseCost, 88);
+});
+
+test('direct ASIN all append permits explicit unknown-sales additions while preserving saved results', async t => {
+  const old = product('old', { sales30Evidence: null, supplierSearchStatus: 'complete', purchaseCost: 77,
+    supplierProcurementTaskId: TASK });
+  const saved = directSnapshot([old, product('new', { sales30: null, sales30Evidence: null }), product('unselected')], ['old'], {
+    owner: 'server', status: 'complete', enabled: false, selectionId: 'same-selection',
+    tasks: { old: { status: 'complete', taskId: TASK, attempts: 1 } },
+  });
+  const mock = await setup(t, { snapshot: saved, start: false });
+  const status = await mock.runner.append(RUN, ['new']);
+  assert.deepEqual(status.productIds, ['old', 'new']);
+  assert.equal(status.selectionId, 'same-selection');
+  assert.equal(status.remaining, 1);
+  assert.equal(status.status, 'paused'); assert.equal(mock.calls.length, 0);
+  assert.deepEqual(mock.store.read().products[0], old);
+  assert.deepEqual(status.tasks.old, saved.runState.supplier1688Pipeline.tasks.old);
+});
+
+test('restored direct ASIN all queue retains unknown sales without releasing verification pauses or losing task IDs', async t => {
+  const saved = directSnapshot([product('unknown', { sales30: null, sales30Evidence: null, supplierSearchStatus: 'searching' })], ['unknown'], {
+    owner: 'server', status: 'running', enabled: true, activeProductId: 'unknown', selectionId: 'restored-selection',
+    tasks: { unknown: { status: 'running', taskId: TASK, attempts: 1, failureCount: 0 } },
+  });
+  // Earlier snapshots may retain mode on the saved input instead of runState.
+  delete saved.runState.inputMode; saved.storeList = { inputMode: 'asins' };
+  const store = new MemoryStore(JSON.parse(JSON.stringify(saved))); store.active = RUN;
+  const mock = await setup(t, { store, start: false });
+  await mock.runner.tick();
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.store.read().runState.supplier1688Pipeline.tasks.unknown.taskId, TASK);
+  assert.equal(mock.store.read().runState.supplier1688Pipeline.selectionId, 'restored-selection');
+  const paused = directSnapshot([product('unknown', { sales30: null, sales30Evidence: null })], ['unknown'], {
+    owner: 'server', status: 'needs_attention', enabled: false, causeCode: 'RISK_CONTROL', selectionId: 'paused-selection',
+  });
+  const blockedStore = new MemoryStore(paused); blockedStore.active = RUN;
+  const blocked = await setup(t, { store: blockedStore, start: false });
+  await blocked.runner.tick();
+  assert.equal(blocked.calls.length, 0);
+  assert.equal((await blocked.runner.status()).causeCode, 'RISK_CONTROL');
+});
+
+test('store supplier queues cannot bypass sales through product or criteria flags', async t => {
+  const saved = snapshot([product('unknown', { sales30: null, sales30Evidence: null, inputMode: 'asins' })]);
+  saved.runState.inputMode = 'stores'; saved.runState.criteria = { inputMode: 'asins', monthlySalesFilterApplied: false };
+  saved.storeList = { inputMode: 'asins' };
+  const mock = await setup(t, { snapshot: saved });
+  await mock.runner.tick();
+  assert.equal(mock.calls.length, 0);
+  assert.equal((await mock.runner.status()).excludedMonthlySalesCount, 1);
 });
 
 test('scope is required, same-run start is idempotent and a different active run is rejected', async t => {
@@ -878,3 +956,24 @@ test('confirmed supplier cohort accepts same-market API sales only while SellerS
   await disabled.runner.tick();
   assert.equal(disabled.calls.length, 0);
 });
+
+
+test('status uses lightweight pipeline metadata when the store supports it', async t => {
+  const mock = await setup(t);
+  const expected = await mock.runner.status();
+  mock.store.readPipeline = async id => copy(mock.store.records.get(id).runState.supplier1688Pipeline);
+  mock.store.readSnapshot = async () => { throw new Error('Status must not load product snapshots'); };
+  assert.deepEqual(await mock.runner.status(), expected);
+});
+
+for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED']) {
+  test(`${code} pauses with its actual cause without submitting or labelling it CAPTCHA`, async t => {
+    const mock = await setup(t, {getRuntime: async () => ({...ready(), queue: {ratePolicy: {manualResumeRequired: true, pausedReason: code}}})});
+    await mock.runner.tick();
+    const status = await mock.runner.status();
+    assert.equal(status.status, 'needs_attention');
+    assert.equal(status.causeCode, code);
+    assert.equal(status.enabled, false);
+    assert.equal(mock.calls.length, 0);
+  });
+}

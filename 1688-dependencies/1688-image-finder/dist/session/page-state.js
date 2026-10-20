@@ -10,6 +10,14 @@ export function classifyPageState(snapshot) {
     const text = snapshot.text ?? '';
     const haystack = `${title ?? ''}\n${text}`;
     const indicators = [];
+    // Edge uses Chromium's internal error URL even while its address bar
+    // displays the failed login destination. Do not treat that error page as
+    // an expired account or an unsupported image-search application.
+    if (/^(?:chrome|edge)-error:\/\/(?:chrome|edge)webdata\/(?:[?#].*)?$/i.test(url)) {
+        const errorCode = haystack.match(/\bERR_[A-Z0-9_]{1,80}\b/)?.[0] ?? null;
+        indicators.push('browser-network-error');
+        return { kind: 'network_error', url, title, indicators, errorCode };
+    }
     if (LOGIN_RE.test(url)) {
         indicators.push('login-url');
         return { kind: 'not_logged_in', url, title, indicators };
@@ -60,6 +68,8 @@ export async function detectPageState(page) {
 }
 export function recoverHintForPageState(kind) {
     switch (kind) {
+        case 'network_error':
+            return 'The browser could not load the page. Check the network connection or proxy before retrying; this alone does not establish an account failure.';
         case 'not_logged_in':
             return 'Session expired. Run `1688 login` and retry.';
         case 'risk_challenge':

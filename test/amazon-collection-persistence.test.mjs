@@ -98,6 +98,114 @@ test("missing offers clear automatic prices while failed visits preserve previou
   assert.equal(inconsistent.complete, false);
 });
 
+test("a successful Item Weight-only parse retires a known automatic package fallback without changing manual costs", () => {
+  const saved = product({ productWeightKg: 0.1, weightKg: 0.1, actualWeightKg: 0.1,
+    productWeightEvidence: { label: 'Package Weight', kind: 'package', value: 0.1 },
+    fieldSources: { currentPrice: 'amazon_product_page', productWeightKg: 'amazon_package_weight_fallback' },
+    weightSource: 'Amazon 包装重量回退', fbaFee: 5,
+    profitInputs: { actualWeightKg: 0.1, weightSource: 'Amazon 包装重量回退', commissionRate: 0.11 } });
+  const noItemWeight = result({ detailParserVersion: 11, productWeightKg: null, productWeightEvidence: null,
+    productInformation: { weightSelection: { policy: 'item_weight_only', version: 1, selected: null, alternatives: [] } } });
+  const before = structuredClone(saved);
+  const merged = mergeAmazonCollectionProduct(saved, noItemWeight);
+  for (const field of ['productWeight', 'productWeightKg', 'weightKg', 'billingWeight', 'actualWeightKg']) assert.equal(merged[field], null, field);
+  assert.equal(merged.profitInputs.actualWeightKg, null);
+  assert.equal(merged.profitInputs.commissionRate, 0.11);
+  assert.equal(merged.productWeightEvidence, undefined);
+  assert.equal(merged.fieldSources.productWeightKg, undefined);
+  assert.equal(merged.fbaWeight, 0.4, 'Package data can remain as separately named observations.');
+  assert.equal(merged.fbaFee, null);
+  assert.equal(merged.profitCalculation, null);
+  assert.equal(merged.purchaseCost, saved.purchaseCost);
+  assert.deepEqual(merged.suppliers, saved.suppliers);
+  assert.deepEqual(saved, before);
+});
+
+test("weight cleanup requires explicit fresh parser semantics and preserves all manual overrides and failed refreshes", () => {
+  const saved = product({ productWeightEvidence: { label: 'Load Capacity', value: 0.1 },
+    fieldSources: { productWeightKg: 'amazon_product_page' } });
+  const noItemWeight = result({ detailParserVersion: 11, productWeightKg: null, productWeightEvidence: null });
+  for (const change of [
+    { manualProductWeight: true }, { manualWeight: true }, { manualAmazonOverride: true }, { manualAmazonFields: { productWeightKg: true, currentPrice: true } },
+    { weightSource: '产品人工覆盖' }, { profitInputs: { actualWeightKg: 0.1, weightSource: 'manual' } },
+  ]) {
+    const input = { ...saved, ...change };
+    const merged = mergeAmazonCollectionProduct(input, noItemWeight);
+    assert.equal(merged.productWeight, input.productWeight);
+    assert.equal(merged.billingWeight, input.billingWeight);
+    assert.deepEqual(merged.productWeightEvidence, input.productWeightEvidence);
+    assert.equal(merged.purchaseCost, input.purchaseCost);
+    assert.deepEqual(merged.suppliers, input.suppliers);
+    if (input.manualAmazonFields?.currentPrice) assert.equal(merged.currentPrice, input.currentPrice);
+  }
+  for (const incoming of [
+    { ...noItemWeight, detailParserVersion: 10 },
+    { ...noItemWeight, detailStatus: 'failed', detailErrorCode: 'AMAZON_FETCH_TIMEOUT' },
+    { ...noItemWeight, lastCollectionError: { code: 'AMAZON_FETCH_TIMEOUT' } },
+  ]) {
+    const merged = mergeAmazonCollectionProduct(saved, incoming);
+    assert.equal(merged.productWeight, saved.productWeight);
+    assert.equal(merged.billingWeight, saved.billingWeight);
+  }
+  const legacy = product({ fieldSources: { productWeightKg: 'legacy_product_feed' } });
+  assert.equal(mergeAmazonCollectionProduct(legacy, noItemWeight).productWeight, legacy.productWeight,
+    'A legacy value with no contrary label/source evidence is not bulk-cleared.');
+});
+
+test("a replacement Item Weight with the same numeric value repairs old package provenance and derived fees", () => {
+  const saved = product({ productWeight: 0.3, productWeightKg: 0.2, weightKg: 0.2, billingWeight: 0.3, fbaFee: 8,
+    weightSource: 'Amazon 包装重量回退', fieldSources: { productWeightKg: 'amazon_package_weight_fallback' },
+    productWeightEvidence: { label: 'Shipping Weight', kind: 'package', value: 0.3 } });
+  const evidence = { label: 'item weight', kind: 'product', value: 0.3, unit: 'kg', source: 'amazon_product_page' };
+  const merged = mergeAmazonCollectionProduct(saved, result({ detailParserVersion: 11, productWeightEvidence: evidence }));
+  assert.equal(merged.productWeight, 0.3);
+  assert.equal(merged.productWeightKg, 0.3);
+  assert.equal(merged.weightKg, 0.3);
+  assert.equal(merged.billingWeight, 0.3);
+  assert.equal(merged.weightSource, 'Amazon 商品重量（Item Weight）');
+  assert.equal(merged.fieldSources.productWeightKg, 'amazon_product_page');
+  assert.deepEqual(merged.productWeightEvidence, evidence);
+  assert.equal(merged.fbaFee, null);
+  const forged = mergeAmazonCollectionProduct(product(), result({ detailParserVersion: 11,
+    productWeightEvidence: { ...evidence, label: 'Product Dimensions' } }));
+  assert.equal(forged.productWeight, 0.1, 'A non-Item Weight payload must not overwrite the previous product observation.');
+});
+
+test("a price-only manual field mask does not freeze an old automatic package weight", () => {
+  const saved = product({ manualAmazonOverride: true, manualAmazonFields: { currentPrice: true },
+    fieldSources: { currentPrice: 'manual', productWeightKg: 'amazon_package_weight_fallback' },
+    weightSource: 'Amazon 包装重量回退', productWeightEvidence: { label: 'Package Weight', kind: 'package', value: 0.1 } });
+  const missing = mergeAmazonCollectionProduct(saved, result({ detailParserVersion: 11,
+    productWeightKg: null, productWeightEvidence: null }));
+  assert.equal(missing.productWeight, null);
+  assert.equal(missing.billingWeight, null);
+  assert.equal(missing.currentPrice, saved.currentPrice);
+  assert.equal(missing.fieldSources.currentPrice, 'manual');
+  assert.equal(missing.purchaseCost, saved.purchaseCost);
+  assert.deepEqual(missing.suppliers, saved.suppliers);
+  const replaced = mergeAmazonCollectionProduct(saved, result({ detailParserVersion: 11,
+    productWeightKg: 0.17, productWeightEvidence: { label: 'Item Weight', kind: 'product', value: 0.17, unit: 'kg' } }));
+  assert.equal(replaced.productWeight, 0.17);
+  assert.equal(replaced.billingWeight, 0.17);
+  assert.equal(replaced.currentPrice, saved.currentPrice);
+  assert.deepEqual(replaced.manualAmazonFields, saved.manualAmazonFields);
+});
+
+test("collection recovery progress projects without changing manual values and clears stale retry messages", () => {
+  const saved = product({ manualAmazonFields: { currentPrice: true }, manualProductWeight: true });
+  const recovery = { status: "scheduled", attempts: 1, maxAttempts: 2,
+    reasonCode: "AMAZON_FETCH_TIMEOUT", message: "商品访问超时", nextRetryAt: "2026-10-14T07:00:00.000Z" };
+  const merged = mergeAmazonCollectionProduct(saved, result({ detailStatus: "failed", collectionRecovery: recovery }));
+  assert.deepEqual(merged.collectionRecovery, recovery);
+  assert.equal(merged.currentPrice, saved.currentPrice);
+  assert.equal(merged.productWeight, saved.productWeight);
+  assert.deepEqual(merged.suppliers, saved.suppliers);
+  merged.collectionRecovery.attempts = 99;
+  assert.equal(recovery.attempts, 1);
+  const completed = mergeAmazonCollectionProduct(merged, result());
+  assert.equal(completed.collectionRecovery, undefined);
+});
+
 test("manual Amazon fields, manual weights and sale prices, and handed-off products are protected", () => {
   const saved = product({
     manualAmazonFields: { title: true, currentPrice: true, reviews: true },
@@ -117,7 +225,7 @@ test("manual Amazon fields, manual weights and sale prices, and handed-off produ
   const archived = product({ analysisHandoff: { owner: "procurement", revision: "saved" } });
   assert.deepEqual(mergeAmazonCollectionProduct(archived, result()), archived);
   assert.deepEqual(mergeAmazonCollectionProduct(saved, result({ asin: otherAsin, sourceAsin: otherAsin })), saved);
-  const manualBilling = mergeAmazonCollectionProduct(product({ weightSource: "产品人工覆盖", profitInputs: { weightSource: "Amazon 商品重量" } }), result());
+  const manualBilling = mergeAmazonCollectionProduct(product({ weightSource: "产品人工覆盖", profitInputs: { weightSource: "Amazon 商品重量（Item Weight）" } }), result());
   assert.equal(manualBilling.billingWeight, 0.1);
   assert.equal(manualBilling.productWeight, 0.1);
   const wrongPriceEvidence = mergeAmazonCollectionProduct(product(), result({ priceEvidence: { asin: otherAsin, currency: "CAD" } }));
@@ -145,6 +253,32 @@ test("collection results and active pointer survive restart; reads are pure and 
   assert.equal((await restarted.getActiveAmazonCollection()).runId, runId);
   assert.equal((await restarted.getActiveAmazonCollection()).job.revision, 1);
   assert.equal((await restarted.getRunSnapshot(runId)).products[0].purchaseCost, 457);
+});
+
+test("historical cart-gate loss is repaired by projection and survives normal save/restart without changing raw results or budgets", async () => {
+  const runId = 'historical-cart-price';
+  const stamp = '2026-09-24T02:00:00.000Z';
+  const previous = { currentPrice: 14.99, collectedAt: stamp,
+    priceEvidence: { asin, currency: 'CAD', source: 'visible_main_price', selector: '#corePriceDisplay_desktop_feature_div', rawText: '$14.99' } };
+  const store = await storeWithSnapshot(runId, [product({ currentPrice: null, salePrice: null, priceEvidence: null,
+    lastKnownAmazonPrice: previous, collectedAt: '2026-09-24T03:00:00.000Z' })]);
+  const raw = result({ currentPrice: null, priceEvidence: null,
+    pageContextEvidence: { priceUnavailableReason: 'price_requires_cart' },
+    collectionRecovery: { attempts: 2, maxAttempts: 2, status: 'exhausted' } });
+  await store.updateAmazonCollection(runId, () => ({ job: { revision: 5, status: 'completed' }, items: { [asin]: raw } }));
+  const restored = await store.getRunSnapshot(runId);
+  assert.equal(restored.products[0].currentPrice, 14.99);
+  assert.equal(restored.products[0].priceVerifiedAt, stamp);
+  assert.equal(restored.products[0].currentPriceStatus, 'pending_revalidation');
+  await store.saveSnapshot(restored);
+  const restarted = new PersistenceStore({ directory: store.directory });
+  await restarted.ready();
+  const final = (await restarted.getRunSnapshot(runId)).products[0];
+  assert.equal(final.currentPrice, 14.99);
+  assert.equal(final.priceVerifiedAt, stamp);
+  assert.equal(final.purchaseCost, 457);
+  assert.equal(final.suppliers[0].unitPriceCny, 457);
+  assert.deepEqual((await restarted.getAmazonCollection(runId)).items[asin], raw);
 });
 
 test("same-parser stale pages cannot overwrite background results even when jobs are completed or paused", async () => {
@@ -443,4 +577,46 @@ test("a durable archive tombstone blocks restart recovery even if index cleanup 
   assert.equal((await restarted.getOverview()).latestRun, null);
   await restarted.archiveRun(runId);
   assert.equal((await restarted.getOverview()).runs[0].status, "cancelled");
+});
+
+
+test("incremental results recompute and notify legacy ASIN casing without changing product identity or manual inputs", async () => {
+  const variants = [
+    { asin: asin.toLowerCase(), sourceAsin: asin.toLowerCase() },
+    { asin: asin.toLowerCase(), sourceAsin: null },
+    { asin, sourceAsin: ` ${asin.toLowerCase()} ` },
+  ];
+  for (const [index, fields] of variants.entries()) {
+    const runId = `incremental-legacy-asin-${index}`;
+    const saved = product({ id: `CA:legacy-${index}`, ...fields });
+    const untouched = product({ id: `CA:${otherAsin}`, asin: otherAsin, sourceAsin: otherAsin });
+    const store = await storeWithSnapshot(runId, [saved, untouched]);
+    await store.updateAmazonCollection(runId, () => ({ job: { revision: 1, status: "running" }, items: {} }));
+    const before = (await store.readRunFile(runId)).snapshot.products;
+    assert.ok(before[0].profitCalculation);
+    const events = [];
+    store.onSnapshotUpdated(event => events.push(event));
+    await store.updateAmazonCollection(runId, current => ({
+      job: { ...current.job, revision: 2 }, items: { [asin]: result() },
+    }), { changedAsins: [asin] });
+    // Read the durable document: the public snapshot read also projects and
+    // could otherwise conceal a skipped incremental profit computation.
+    const after = (await store.readRunFile(runId)).snapshot.products;
+    assert.equal(after.length, 2);
+    assert.equal(after[0].id, saved.id);
+    assert.equal(after[0].asin, saved.asin);
+    assert.equal(after[0].sourceAsin, saved.sourceAsin);
+    assert.equal(after[0].currentPrice, 9.99);
+    assert.equal(after[0].profitCalculation.salePrice, 9.99);
+    assert.equal(after[0].profitCalculation.airFreight.actualWeightKg, 0.3);
+    assert.equal(after[0].manualPurchaseCost, true);
+    assert.equal(after[0].purchaseCost, saved.purchaseCost);
+    assert.deepEqual(after[0].suppliers, saved.suppliers);
+    assert.deepEqual(after[1], before[1]);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].kind, "amazon_product");
+    assert.equal(events[0].baseRevision, 1);
+    assert.equal(events[0].revision, 2);
+    assert.deepEqual(events[0].products, [after[0]]);
+  }
 });

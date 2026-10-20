@@ -33,7 +33,11 @@ function assertPersistedProduct(actual, submitted, context) {
   // Sale price is derived again from the current Amazon offer unless manually
   // overridden. Source evidence, manual costs and analysis history stay intact.
   for (const [field, value] of Object.entries(submitted)) {
-    if (field !== "salePrice") assert.deepEqual(actual[field], value, `Preserve submitted ${field}`);
+    if (field === 'fieldSources') {
+      for (const [sourceField, source] of Object.entries(value)) {
+        assert.deepEqual(actual.fieldSources[sourceField], source, `Preserve submitted ${field}.${sourceField}`);
+      }
+    } else if (field !== "salePrice") assert.deepEqual(actual[field], value, `Preserve submitted ${field}`);
   }
   assert.deepEqual(actual, recomputeProductProfit(submitted, context));
   if (submitted.currentPrice === null) {
@@ -42,13 +46,12 @@ function assertPersistedProduct(actual, submitted, context) {
     assert.ok(actual.profitPendingReasons.includes("售价"));
   } else {
     assert.equal(actual.salePrice, Math.round(submitted.currentPrice * 100) / 100);
-    // Refreshing price does not supply a missing weight or a local CA minimum-fee table.
-    assert.ok(actual.profitPendingReasons.includes('商品重量'));
+    // A verified price does not invent weight, dimensions or a minimum FBA
+    // tier. CA profit remains pending until at least one specification exists.
     assert.ok(actual.profitPendingReasons.includes('FBA 配送费'));
     assert.equal(actual.profitInputs.actualWeightKg, null);
     assert.equal(actual.billingWeight, null);
     assert.equal(actual.fbaFee, null);
-    assert.equal(actual.fbaEstimate, null);
     assert.equal(actual.margin, null);
     assert.equal(actual.profitCalculation, null);
   }

@@ -8,6 +8,12 @@ import { recomputeProductProfit } from '../lib/product-profit-state.mjs';
 
 const appSource = await readFile(new URL('../app.js', import.meta.url), 'utf8');
 const NOW = '2026-09-24T01:02:03.000Z';
+const noWeightInformation = () => ({ version: 1, asin: 'B000000001', status: 'complete', reason: null,
+  inspection: { version: 3, asin: 'B000000001', status: 'complete', stable: true, rowCount: 1,
+    parsedSections: [{ selector: '#productDetails', rowCount: 1 }],
+    sections: [{ selector: '#productDetails', status: 'complete', rowCount: 1 }] },
+  rowCount: 1, weightStatus: 'not_provided', sections: [{ selector: '#productDetails', heading: 'Product information',
+    rows: [{ label: 'Brand', value: 'Synthetic brand' }] }] });
 const functionNames = [
   'getDefaultProfitInputs', 'migrateLegacyProfitDefaults', 'numberOrNull', 'finiteOrNull', 'roundMoney',
   'isAnalysisReadOnly', 'normalizeFulfillmentMode', 'ensureFulfillmentState', 'fbaEstimationWeightKg',
@@ -104,6 +110,111 @@ function assertParity(product, context = {}) {
   return actual;
 }
 
+test('Item Weight policy excludes unproven package and stale weights without inventing AU estimates', () => {
+  const markers = [
+    { detailParserVersion: 11 },
+    { productInformation: { weightSelection: { policy: 'item_weight_only' } } },
+    { weightSelection: { policy: 'item_weight_only' } },
+  ];
+  const evidenceCases = [null, { label: 'Package Weight', kind: 'package', value: 0.3 },
+    { label: 'Item Weight', kind: 'product' }, { label: 'Item Weight', kind: 'product', value: 0.14 }];
+  for (const marker of markers) {
+    for (const productWeightEvidence of evidenceCases) {
+      const input = canonicalProduct({ ...marker, productWeight: 0.3, fbaWeight: 0.3,
+        billingWeight: 0.3, actualWeightKg: 0.3, productWeightEvidence,
+        profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.3, weightSource: 'Amazon 包装重量回退' } });
+      const result = assertParity(input);
+      assert.equal(result.billingWeight, null);
+      assert.equal(result.profitInputs.actualWeightKg, null);
+      assert.equal(result.profitCalculation, null);
+      assert.equal(result.margin, null);
+      assert.ok(result.profitPendingReasons.includes('商品重量或包裹重量'));
+      assert.equal(result.complete, false);
+      assert.equal(result.fbaWeight, 0.3, 'Separate logistics metadata is preserved.');
+      assert.equal(result.purchaseCost, 6);
+      assert.deepEqual(result.suppliers, input.suppliers);
+    }
+  }
+});
+
+test('Item Weight drives freight and automatic FBA instead of the heavier package in both runtimes', () => {
+  const result = assertParity(canonicalProduct({ detailParserVersion: 11, productWeight: 0.14,
+    productWeightEvidence: { label: 'Item Weight', kind: 'product', value: 0.14 },
+    billingWeight: 0.5, fbaWeight: 0.5, manualFbaFee: false, fbaFee: null,
+    profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.5 } }));
+  assert.equal(result.billingWeight, 0.14);
+  assert.equal(result.profitInputs.actualWeightKg, 0.14);
+  assert.equal(result.profitCalculation.domesticFreightWeightKg, 0.14);
+  assert.equal(result.profitCalculation.airFreight.actualWeightKg, 0.14);
+  assert.equal(result.fbaFee, 5.26);
+  assert.equal(result.fbaWeight, 0.5);
+  assert.ok(Number.isFinite(result.margin));
+  assert.equal(result.complete, true);
+});
+
+test('explicit invalid product or saved input weight stays pending through repeated recomputation', () => {
+  for (const invalid of [0, -1, false, 'invalid']) {
+    for (const source of ['product', 'saved_input']) {
+      const input = canonicalProduct({ detailParserVersion: 12, productWeight: source === 'product' ? invalid : null,
+        billingWeight: null, manualFbaFee: false, fbaFee: null, productWeightEvidence: null,
+        profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: source === 'saved_input' ? invalid : null } });
+      const first = assertParity(input);
+      const result = assertParity(first);
+      assert.equal(result.profitInputs.assumedWeightKg, undefined, `${source}: ${invalid}`);
+      assert.equal(result.profitCalculation, null);
+      assert.equal(result.fbaEstimate, null);
+      assert.ok(result.profitPendingReasons.includes('商品重量或包裹重量'));
+    }
+  }
+});
+
+test('real Item Weight clears stale minimum-tier metadata while retaining manual fees in every market', () => {
+  for (const marketplace of ['AU', 'CA', 'US', 'NL', 'UK', 'DE', 'FR', 'IT', 'ES', 'PL', 'MX', 'BR']) {
+    const assumed = assertParity(canonicalProduct({ marketplace, detailParserVersion: 12,
+      productWeight: null, billingWeight: null, manualFbaFee: false, fbaFee: null,
+      profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: null } }));
+    if (['AU', 'CA'].includes(marketplace)) assert.equal(assumed.fbaEstimate, null);
+    else assert.equal(assumed.fbaEstimate.assumption, 'missing_weight_minimum_fba_estimate');
+    const actual = assertParity({ ...assumed, productWeight: 0.2,
+      productWeightEvidence: { label: 'Item Weight', kind: 'product', value: 0.2 },
+      manualFbaFee: true, fbaFee: 8.88 });
+    assert.equal(actual.fbaFee, 8.88);
+    assert.equal(actual.profitInputs.actualWeightKg, 0.2);
+    assert.equal(actual.profitInputs.assumedWeightKg, undefined);
+    assert.notEqual(actual.fbaEstimate?.assumption, 'missing_weight_minimum_fba_estimate');
+    assert.equal(actual.fbaEstimate?.assumedWeightKg, undefined);
+    assert.equal(actual.profitCalculation.fulfillmentFee, 8.88);
+    assert.equal(actual.profitCalculation.isEstimate, undefined);
+  }
+});
+
+test('explicit manual weights remain usable under Item Weight policy without changing purchase inputs', () => {
+  for (const manual of [
+    { manualBillingWeight: true, billingWeight: 0.2 },
+    { manualProductWeight: true, productWeight: 0.2 },
+    { profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: 0.2, weightSource: 'product_manual' } },
+  ]) {
+    const input = canonicalProduct({ detailParserVersion: 11, productWeight: null,
+      productWeightEvidence: null, fbaWeight: 0.5, billingWeight: 0.5, ...manual });
+    const result = assertParity(input);
+    assert.equal(result.billingWeight, 0.2);
+    assert.equal(result.profitInputs.actualWeightKg, 0.2);
+    assert.equal(result.profitCalculation.airFreight.actualWeightKg, 0.2);
+    assert.ok(Number.isFinite(result.margin));
+    assert.equal(result.purchaseCost, input.purchaseCost);
+    assert.equal(result.purchaseUnitCostCny, input.purchaseUnitCostCny);
+    assert.deepEqual(result.suppliers, input.suppliers);
+  }
+});
+
+test('legacy automatic product weights without the new policy retain saved calculations', () => {
+  const result = assertParity(canonicalProduct({ detailParserVersion: 10, productWeight: 0.3,
+    productWeightEvidence: { label: 'Package Weight', kind: 'package', value: 0.3 }, fbaWeight: 0.5 }));
+  assert.equal(result.billingWeight, 0.3);
+  assert.equal(result.profitCalculation.airFreight.actualWeightKg, 0.3);
+  assert.ok(Number.isFinite(result.margin));
+});
+
 for (const [marketplace, exchangeRate] of Object.entries({
   AU: 4.8, US: 7.12, NL: 7.85, CA: 5.2, UK: 9.6, DE: 7.85,
   FR: 7.85, IT: 7.85, ES: 7.85, PL: 1.85, MX: 0.42, BR: 1.35,
@@ -124,6 +235,34 @@ test('canonical manual sale price, FBA fee, procurement cost and piece count sur
   assert.equal(result.purchaseCost, 6);
   assert.equal(result.pieceCount, 2);
   assert.equal(result.profitCalculation.purchaseCostAssumedZero, false);
+});
+
+test('listing-date absence and unfinished date verification do not change profit or completeness', () => {
+  const dated = assertParity(canonicalProduct({ amazonFirstAvailableDate: '2020-01-01', amazonFirstAvailableDateStatus: 'found' }));
+  for (const status of ['not_provided', 'unresolved']) {
+    const result = assertParity(canonicalProduct({ amazonFirstAvailableDate: null, amazonFirstAvailableDateStatus: status,
+      productInformation: { version: 1, asin: 'B000000001', status: status === 'unresolved' ? 'incomplete' : 'complete', reason: status === 'unresolved' ? 'inspection_timeout' : null },
+      missing: ['竞品上架时间'], amazonMissing: ['竞品上架时间'], complete: false,
+    }));
+    assert.equal(result.complete, true);
+    assert.deepEqual(result.missing, []);
+    assert.deepEqual(result.profitPendingReasons, []);
+    assert.deepEqual(result.profitCalculation, dated.profitCalculation);
+    assert.equal(result.margin, dated.margin);
+    assert.equal(result.amazonFirstAvailableDate, null);
+    assert.equal(result.amazonFirstAvailableDateStatus, status);
+  }
+});
+
+test('legacy provider listing dates remain optional metadata for normal analysis', () => {
+  const base = canonicalProduct({ analysisSourceMode: 'sellersprite', sales30: 100, sales60: 200, hasAPlus: false,
+    firstFba: '2020-02-01', productDimensions: '10 x 5 x 2 cm', listingAvailableAt: '2020-01-01' });
+  const dated = assertParity(base);
+  const undated = assertParity({ ...base, listingAvailableAt: null, amazonFirstAvailableDateStatus: 'not_provided' });
+  assert.equal(dated.complete, true);
+  assert.equal(undated.complete, true);
+  assert.deepEqual(undated.profitCalculation, dated.profitCalculation);
+  assert.ok(!undated.missing.some(value => /上架|日期/.test(value)));
 });
 
 test('manual FBM fees remain independent of automatic FBA estimation', () => {
@@ -230,6 +369,7 @@ test('FBA-only formula migrations preserve existing manual operating rates', () 
 test('missing price still blocks profit while a successful weightless page estimates only its minimum FBA fee', () => {
   const product = canonicalProduct({ currentPrice: null, salePrice: null, manualSalePrice: false, productWeight: null, billingWeight: null, fbaWeight: null, purchaseCost: null, purchaseUnitCostCny: null, manualPurchaseCost: false, suppliers: [], manualFbaFee: false, fbaFee: null });
   product.profitInputs.actualWeightKg = null;
+  product.productInformation = noWeightInformation();
   const result = assertParity(product);
   assert.equal(result.margin, null);
   assert.equal(result.purchaseCost, null);
@@ -237,8 +377,8 @@ test('missing price still blocks profit while a successful weightless page estim
   assert.ok(result.profitPendingReasons.includes('售价'));
   assert.equal(result.profitPendingReasons.includes('采购成本'), false);
   // A confirmed absent weight allows a minimum FBA estimate, not a fabricated weight.
-  assert.ok(Number.isFinite(result.fbaFee));
-  assert.equal(result.profitPendingReasons.includes('FBA 配送费'), false);
+  assert.equal(result.fbaFee, null);
+  assert.equal(result.profitPendingReasons.includes('FBA 配送费'), true);
 });
 
 for (const purchaseCost of [null, undefined, '']) {
@@ -260,25 +400,27 @@ for (const purchaseCost of [null, undefined, '']) {
   });
 }
 
-test('a confirmed weightless page keeps full profit pending and preserves manual rates until actual weight arrives', () => {
+test('a weightless page uses minimum-envelope profit and preserves manual rates until actual weight arrives', () => {
   const product = canonicalProduct({ manualSalePrice: false, salePrice: null, productWeight: null, fbaWeight: null, billingWeight: null, manualFbaFee: false, fbaFee: null });
   product.profitInputs = { ...product.profitInputs, actualWeightKg: null, commissionRate: 9, marketingRate: 7, airFreightRateCnyPerKg: 52, airFreightRateSource: 'product_manual' };
+  product.productInformation = noWeightInformation();
   const incomplete = assertParity(product);
   assert.equal(incomplete.salePrice, 9.99);
   assert.equal(incomplete.margin, null);
-  assert.equal(incomplete.fbaFee, 3.67);
-  assert.equal(incomplete.fbaEstimate.weightSource, '页面未提供重量 · FBA 配送费按最低档估算');
-  assert.equal(incomplete.fbaEstimate.actualWeightKg, null);
+  assert.equal(incomplete.fbaFee, null);
+  assert.equal(incomplete.fbaEstimate, null);
   assert.equal(incomplete.profitCalculation, null);
   assert.equal(incomplete.productWeight, null);
   assert.equal(incomplete.billingWeight, null);
   assert.equal(incomplete.profitInputs.actualWeightKg, null);
-  assert.deepEqual(incomplete.profitPendingReasons, ['商品重量']);
+  assert.ok(incomplete.profitPendingReasons.includes('商品重量或包裹重量'));
   const complete = assertParity({ ...incomplete, productWeight: 0.12, billingWeight: 0.12 });
   assert.equal(complete.profitInputs.commissionRate, 9);
   assert.equal(complete.profitInputs.marketingRate, 7);
   assert.equal(complete.profitInputs.airFreightRateCnyPerKg, 52);
   assert.ok(Number.isFinite(complete.margin));
+  assert.ok(complete.profitCalculation.assumedWeightKg == null);
+  assert.notEqual(complete.profitCalculation.isEstimate, true);
   assert.deepEqual(complete.profitPendingReasons, []);
 });
 
@@ -381,10 +523,10 @@ test('AU and CA approved envelope boundaries agree across frontend, backend and 
     ['AU', 13, 0.075, 3.67], ['AU', 13.01, 0.075, 4.58],
     ['AU', 13, 0.075001, 4.35], ['AU', 13.01, 0.225, 5.26],
     ['AU', 13, 0.225001, 4.70], ['AU', 13.01, 0.475, 5.61],
-    ['AU', 13, 0.475001, null],
+    ['AU', 13, 0.475001, 4.70], ['AU', 14, 2.345, 5.61],
     ['CA', 13.99, 0.1, (4.73 - 0.8) * 1.035], ['CA', 14, 0.1, 4.73 * 1.035],
     ['CA', 13.99, 0.100001, (4.99 - 0.8) * 1.035],
-    ['CA', 14, 0.5, 5.95 * 1.035], ['CA', 14, 0.500001, null],
+    ['CA', 14, 0.5, 5.95 * 1.035], ['CA', 14, 0.500001, 5.95 * 1.035], ['CA', 13, 2.345, (5.95 - 0.8) * 1.035],
   ];
   for (const [marketplace, salePrice, weight, fee] of cases) {
     const input = canonicalProduct({ marketplace, sourceMarketplace: marketplace, currentPrice: salePrice,
@@ -398,10 +540,11 @@ test('AU and CA approved envelope boundaries agree across frontend, backend and 
   }
 });
 
-test('v9 fee migration preserves all manually saved operating inputs and frozen records', () => {
+for (const formulaVersion of ['profit-workbook-au-weight-only-fba-v9', 'profit-workbook-au-ca-envelope-fba-v10', 'profit-workbook-au-ca-envelope-capped-fba-v11']) {
+test(`${formulaVersion} migration preserves all manually saved operating inputs and frozen records`, () => {
   for (const marketplace of ['AU', 'CA']) {
     const input = canonicalProduct({ marketplace, manualFbaFee: false, fbaFee: 3.64 });
-    input.profitInputs = { ...input.profitInputs, formulaVersion: 'profit-workbook-au-weight-only-fba-v9',
+    input.profitInputs = { ...input.profitInputs, formulaVersion,
       purchaseTaxRate: 6, domesticFreightRateCnyPerKg: 4, airFreightRateCnyPerKg: 60,
       commissionRate: 15, managementRate: 5, returnsRate: 8,
       purchaseTaxRateSource: 'product_manual', domesticFreightSource: 'product_manual' };
@@ -416,3 +559,5 @@ test('v9 fee migration preserves all manually saved operating inputs and frozen 
     assert.deepEqual(recomputeProductProfit(frozen), frozen);
   }
 });
+
+}

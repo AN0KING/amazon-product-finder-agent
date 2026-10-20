@@ -1,3 +1,5 @@
+import * as reviewRange from "../lib/review-range.mjs";
+import * as listingDate from "../lib/amazon-listing-date.mjs";
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
@@ -46,7 +48,7 @@ function harness({ marketplace = 'US', enabled = false } = {}) {
   };
   const calls = [], toasts = [], errors = [], intervals = [];
   let respond = async url => { throw new Error(`Unexpected API request: ${url}`); };
-  const context = vm.createContext({ ...salesPolicy, ...priceState, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+  const context = vm.createContext({ ...reviewRange, ...salesPolicy, ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
     structuredClone, AbortController, DOMException, URL,
     document: { addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
     window: { setTimeout() {}, clearTimeout() {}, setInterval(callback, ms) { intervals.push({ callback, ms }); }, clearInterval() {} },
@@ -69,6 +71,11 @@ function harness({ marketplace = 'US', enabled = false } = {}) {
       filter: singleStoreFilterExclusionReasons, coverage: renderAsinCoverageSummary,
       drawer: populateDrawer, reasons: currentFilterExclusionReasons,
       setProducts: (items, criteria = {}) => { products = items; activeRunCriteria = criteria; },
+      setTask: ({ inputMode, storedInputMode, draftMode = 'stores' } = {}) => {
+        if (inputMode) runState.inputMode = inputMode; else delete runState.inputMode;
+        storeList = storedInputMode ? { inputMode: storedInputMode, stores: [] } : null;
+        importMode = draftMode;
+      },
       state: () => ({ sellerSpriteStatus, sellerSpriteCheckPromise, sellerSpriteCallCount, localMonitorState }),
     };
   })();`);
@@ -158,6 +165,79 @@ test('rendered coverage separates unknown reasons and counts each actual data so
   assert.match(reasons, /月销量未知或未核验（不等于低于 50）：3/);
   assert.match(reasons, /已取得的月销量低于 50：1/);
   assert.equal(fixture.calls.length, 0);
+});
+
+test('persisted ASIN task applies explicit monthly bands and agrees with backend across sources', () => {
+  const fixture = harness();
+  fixture.app.setTask({ inputMode: 'asins', draftMode: 'stores' });
+  const rows = [amazon(null), amazon(0), amazon(49), amazon(50), amazon(200), apiProduct(),
+    amazon(100, { sales30Evidence: null }), amazon(0, { reviews: 4, reviewCount: 4, rating: 2 }),
+    amazon(null, { reviews: 1000, reviewCount: 1000 }), amazon(null, { reviews: null, reviewCount: null })];
+  for (const useSellerSprite of [false, true]) {
+    for (const monthlySalesBand of ['all', '50_plus', '50_to_100', '100_plus']) {
+      const criteria = { useSellerSprite, monthlySalesBand, minReviews: 10, maxReviews: 200, minRating: 4 };
+      for (const row of rows) {
+        const reasons = Array.from(fixture.app.filter(row, criteria));
+        assert.deepEqual([...reasons].sort(), candidateFilterExclusionReasons(row, criteria, { inputMode: 'asins' }).sort());
+        const expected = candidateFilterExclusionReasons(row, criteria, { inputMode: 'stores' })
+          .filter(reason => monthlySalesBand !== 'all' || !reason.startsWith('MONTHLY_SALES_'));
+        assert.deepEqual([...reasons].sort(), expected.sort());
+      }
+    }
+  }
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(0), { monthlySalesBand: '100_plus' })), ['MONTHLY_SALES_BELOW_50']);
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(null, { reviews: 1000 }), { maxReviews: 200 })), ['REVIEWS_ABOVE_MAXIMUM']);
+  assert.equal(fixture.calls.length, 0);
+});
+
+test('ASIN and store admission both enforce monthly sales regardless of draft and legacy bypass flags', () => {
+  const fixture = harness();
+  const product = amazon(null, { inputMode: 'asins' });
+  const criteria = { inputMode: 'asins', skipMonthlySales: true, monthlySalesBand: '100_plus' };
+  fixture.app.setTask({ inputMode: 'stores', storedInputMode: 'asins', draftMode: 'asins' });
+  assert.deepEqual(Array.from(fixture.app.filter(product, criteria)), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+  fixture.app.setTask({ inputMode: 'asins', storedInputMode: 'stores', draftMode: 'stores' });
+  assert.deepEqual(Array.from(fixture.app.filter(product, criteria)), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+  fixture.app.setTask({ storedInputMode: 'asins' });
+  assert.deepEqual(Array.from(fixture.app.filter(product, criteria)), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+  fixture.app.setTask({ draftMode: 'asins' });
+  assert.deepEqual(Array.from(fixture.app.filter(product, criteria)), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+});
+
+test('ASIN all shows low and unknown sales while explicit monthly bands and store defaults still filter', () => {
+  const fixture = harness();
+  fixture.app.setTask({ inputMode: 'asins' });
+  for (const value of [null, 0, 30, 50, 100]) {
+    assert.deepEqual(Array.from(fixture.app.filter(amazon(value), { monthlySalesBand: 'all' })), []);
+    assert.deepEqual(candidateFilterExclusionReasons(amazon(value), { monthlySalesBand: 'all' }, { inputMode: 'asins' }), []);
+  }
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(30), { monthlySalesBand: '50_plus' })), ['MONTHLY_SALES_BELOW_50']);
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(null), { monthlySalesBand: '100_plus' })), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+  fixture.app.setTask({ inputMode: 'stores' });
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(null), { monthlySalesBand: 'all' })), ['MONTHLY_SALES_EVIDENCE_MISSING']);
+  assert.deepEqual(Array.from(fixture.app.filter(amazon(30), { monthlySalesBand: 'all' })), ['MONTHLY_SALES_BELOW_50']);
+});
+
+test('ASIN sales controls stay visible and enabled after restoring either import mode', () => {
+  const fixture = harness();
+  fixture.app.setTask({ inputMode: 'asins' });
+  fixture.app.setProducts([amazon(50), amazon(0), amazon(null)], { monthlySalesBand: '100_plus' });
+  fixture.app.restoreCriteria({ monthlySalesBand: '100_plus' });
+  fixture.app.coverage();
+  assert.equal(fixture.element('monthlySalesFilter').hidden, false);
+  assert.equal(fixture.element('monthlySalesBand').disabled, false);
+  assert.equal(fixture.element('monthlySalesBand').value, '100_plus');
+  assert.match(fixture.element('monthlySalesAdmissionNote').textContent, /ASIN.*默认显示全部商品/);
+  assert.equal(fixture.element('monthlySalesAllOption').textContent, '全部商品（不限月销量）');
+  assert.equal(fixture.element('monthlySales50PlusOption').hidden, false);
+  assert.match(fixture.element('monthlySalesCoverage').textContent, /已取得 2 \/ 3.*达到 50：1.*低于 50：1.*未知：1/);
+  assert.equal(Array.from(fixture.app.reasons()).length, 3);
+  fixture.app.setTask({ inputMode: 'stores', draftMode: 'asins' });
+  fixture.app.restoreCriteria({ monthlySalesBand: '100_plus' });
+  assert.equal(fixture.element('monthlySalesFilter').hidden, false);
+  assert.equal(fixture.element('monthlySalesBand').disabled, false);
+  assert.equal(fixture.element('monthlySalesBand').value, '100_plus');
+  assert.match(fixture.element('monthlySalesAdmissionNote').textContent, /店铺导入.*≥50/);
 });
 
 test('detail drawer displays estimates and Amazon lower bounds with the correct source and preserves unknown', () => {
