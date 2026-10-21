@@ -15,7 +15,7 @@ import {
   resolveManualWeightOverride,
   usesItemWeightOnly,
   automaticProfitWeightKg,
-  resolveProductDimensionsCm, parseProductDimensionsCm, hasAnyProductShippingSpecification, estimateFbaByAvailableSpecifications, canadaDimensionalWeightKg,
+  resolveProductDimensionsCm, parseProductDimensionsCm, hasAnyProductShippingSpecification, estimateFbaByAvailableSpecifications, marketDimensionalWeightKg, fbaSelectionExplanation,
   automaticProductWeightKg,
   automaticPackageWeightKg,
   profitWeightSourceLabel,
@@ -49,7 +49,7 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.67";
+  const APP_VERSION = "0.9.68";
   const EXPORT_DIRECTORY_LABEL = "本机导出目录";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "standard";
@@ -2162,6 +2162,12 @@ import {
           showToast("1688 身份有效；当前候选仍需完成图片搜索验证，请点击连接状态旁的「打开 1688 图片搜索验证」按钮。", "info", 6200);
           return true;
         }
+        if (supplier1688Queue?.ratePolicy?.pausedReason) {
+          showToast(supplier1688Queue.ratePolicy.manualResumeRequired
+            ? "1688 账号已登录，但搜图队列仍暂停；未找到可用于验证的原任务，请检查任务记录。"
+            : "1688 账号已登录；搜图队列正在冷却，请等待现有等待时间结束。", "info", 6200);
+          return true;
+        }
         const pendingCount = getPending1688ResumeProducts().length;
         if (!pendingCount) {
           const imageBlocked = Number(supplier1688Queue?.riskBlocked || 0) > 0;
@@ -2223,6 +2229,15 @@ import {
     const runtimeActiveTasks = Array.isArray(queue?.activeTasks)
       ? queue.activeTasks.map((task) => ({ ...task }))
       : [];
+    // AUTH_REQUIRED tasks are stored as failed and omitted from activeTasks.
+    // The persisted manual pause still identifies the task needed for verification.
+    const pausedTaskId = validProcurementTaskId(queue?.ratePolicy?.blockedTaskId);
+    if (queue?.ratePolicy?.manualResumeRequired === true && pausedTaskId
+      && ['AUTH_REQUIRED', 'RISK_VERIFICATION_REQUIRED'].includes(queue.ratePolicy.pausedReason)
+      && !runtimeActiveTasks.some(task => task.id === pausedTaskId)) {
+      runtimeActiveTasks.push({ id: pausedTaskId, status: 'risk_blocked',
+        message: '1688 搜图队列仍暂停，请完成原任务的图片搜索验证。' });
+    }
     const activeTasks = runtimeActiveTasks.length
       ? runtimeActiveTasks
         .filter((task) => currentTaskIds.has(validProcurementTaskId(task?.id)))
@@ -2344,7 +2359,9 @@ import {
       resumeButton.disabled = Boolean(supplier1688SessionPromise);
     }
     setText("supplier1688RateText", ratePolicy?.minGapMs
-      ? `搜图间隔 ≥ ${Math.ceil(ratePolicy.minGapMs / 1000)} 秒 · 每 ${ratePolicy.cooldownEvery} 次休息 ${Math.ceil(ratePolicy.cooldownMs / 60000)} 分钟`
+      ? ratePolicy.cooldownEvery > 0 && ratePolicy.cooldownMs > 0
+        ? `搜图间隔 ≥ ${Math.ceil(ratePolicy.minGapMs / 1000)} 秒 · 每 ${ratePolicy.cooldownEvery} 次休息 ${Math.ceil(ratePolicy.cooldownMs / 60000)} 分钟`
+        : `每 60 分钟最多 ${Math.ceil(3_600_000 / ratePolicy.minGapMs)} 次 · 间隔 ≥ ${Math.ceil(ratePolicy.minGapMs / 10) / 100} 秒`
       : "");
     if (loginButton) {
       const unavailable = reason === "service_unavailable";
@@ -5150,7 +5167,7 @@ import {
       missing.push(fulfillmentFeeMissingLabel(product.fulfillmentMode));
     }
     if ((!Number.isFinite(profitInputs.actualWeightKg) || profitInputs.actualWeightKg <= 0)
-      && !(String(product.marketplace || activeMarket.code).toUpperCase() === "CA" && canadaDimensionalWeightKg(resolveProductDimensionsCm(product)) !== null)) missing.push("计费重量");
+      && !(marketDimensionalWeightKg(resolveProductDimensionsCm(product), product.marketplace || activeMarket.code) !== null)) missing.push("计费重量");
     if (!Number.isFinite(profitInputs.airFreightRateCnyPerKg) || profitInputs.airFreightRateCnyPerKg < 0) missing.push("空运单价");
     product.amazonMissing = [...new Set(amazonMissing)];
     product.missing = [...new Set(missing)];
@@ -7650,11 +7667,19 @@ import {
     if (productWeightKg === null && isAmazonWeightUnavailable(product)) values.push("<span>页面未提供重量 · 可初审</span>");
     else if (productWeightKg === null) values.push("<span>商品及包裹重量待采集</span>");
     if (product.profitCalculation?.weightAssumption) values.push("<span>利润按最低档暂估 · 实际重量未知</span>");
+    const estimate = product.fbaEstimate;
+    if (estimate?.dimensionalWeightKg) {
+      const divisor = product.marketplace === 'AU' ? 6000 : 5021.69;
+      const dimensionalFee = estimate.feeCandidates?.find(candidate => candidate.source === 'dimensional')?.fee;
+      values.push(`<span class="candidate-fba-explanation">体积重 ${formatWeightKg(estimate.dimensionalWeightKg)} kg（${escapeHtml(estimate.dimensionsCm.join(' × '))} cm ÷ ${divisor}）${Number.isFinite(dimensionalFee) ? ` · 对应FBA费用 ${escapeHtml(formatCurrencyWithCnyText(dimensionalFee, product.marketplace))}` : ''}</span>`);
+    }
     if (product.fulfillmentMode === "FBA" && fbaFee !== null) {
       const feeLabel = !product.manualFbaFee && product.fbaEstimate?.overweightCapped ? "FBA 封顶估算"
         : product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee ? "FBA 最低档估算" : "FBA 配送费";
       values.push(`<span class="candidate-fba-cost"><b>${feeLabel}</b>${currencyPairHtml(fbaFee, product.marketplace, { compact: true })}</span>`);
     }
+    const explanation = !product.manualFbaFee && product.fulfillmentMode === 'FBA' ? fbaSelectionExplanation(estimate) : '';
+    if (explanation) values.push(`<span class="candidate-fba-explanation">${escapeHtml(explanation)}</span>`);
     return values.length ? `<div class="candidate-logistics is-calculated">${values.join("")}</div>` : "";
   }
 
@@ -7713,9 +7738,10 @@ import {
           ? "图片相似度最高 6 家 · 低置信度"
         : escapeHtml(product.supplierSearchError || "待手动匹配 · 点击「匹配当前筛选」发起");
     const displayedMargin = recommendationMargin(product);
-    const margin = displayedMargin === null
+    let margin = displayedMargin === null
       ? `<span class="margin-value">待计算</span><small>缺少：${escapeHtml(profitCalculationMissingReasons(product).join('、') || '有效计算参数')}；补齐后自动计算</small>`
       : `<span class="margin-value ${marginClass(displayedMargin)}">${formatPercent(displayedMargin)}</span>${currencyPairHtml(calculation?.profit, product.marketplace, { suffix: " / 件", compact: true })}${calculation?.dimensionalWeightEstimateKg ? "<small>体积重暂估 · 实际重量未知</small>" : calculation?.weightAssumption ? "<small>最低档暂估 · 实际重量未知</small>" : ""}${calculation?.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : isLowConfidenceSupplierEstimate(product) ? "<small>初步利润 · 1688 低置信度参考</small>" : "<small>初步经营利润估算</small>"}`;
+    if (displayedMargin !== null && !product.manualFbaFee && product.fbaEstimate?.selectionStatus === 'single_source_estimate') margin += '<small>利润率暂估 · FBA缺少交叉核验</small>';
     const targetCost = Number.isFinite(product.targetCostCny)
       ? `${cnyCurrencyPairHtml(product.targetCostCny, product.marketplace, { compact: true })}${Number.isFinite(product.thresholdCostCny) ? `<small>盈利线</small>${cnyCurrencyPairHtml(product.thresholdCostCny, product.marketplace, { label: "≤ ", compact: true, secondary: true })}` : ""}`
       : "";
@@ -7751,7 +7777,7 @@ import {
         <td class="numeric-cell price-cell">${currencyPairHtml(product.currentPrice, product.marketplace)}${amazonPriceStatusLabel(product) ? `<small>${escapeHtml(amazonPriceStatusLabel(product))}</small>` : ""}${currencyPairHtml(product.salePrice, product.marketplace, { label: "我们的售价 ", secondary: true })}</td>
         <td class="numeric-cell">${targetCost}</td>
         <td class="numeric-cell"><strong>${purchase}</strong>${purchaseNote ? `<small>${purchaseNote}</small>` : ""}</td>
-        <td class="numeric-cell">${margin}</td>
+        <td class="numeric-cell profit-cell">${margin}</td>
         <td><span class="completeness-stack">${completeness}${fulfillmentNote}</span></td>
         <td><span class="review-status is-${product.reviewStatus}">${product.analysisHandoff?.owner === "procurement" ? "已交接采购" : REVIEW_LABELS[product.reviewStatus]}</span></td>
         <td><button class="icon-button row-open-button" type="button" data-open-product="${product.id}" aria-label="查看 ${escapeHtml(product.name)}"><i data-lucide="chevron-right" aria-hidden="true"></i></button></td>
@@ -8489,7 +8515,7 @@ import {
         type: "info",
       };
     }
-    if (product.profitCalculation?.dimensionalWeightEstimateKg) return { message: `${prefix}；实重未知，当前按加拿大体积重估算利润，取得实重后重新比较 FBA 费用。`, type: "info" };
+    if (product.profitCalculation?.dimensionalWeightEstimateKg) return { message: `${prefix}；实重未知，当前按体积重估算利润，取得实重后重新比较 FBA 费用。`, type: "info" };
     if (product.profitCalculation?.weightAssumption || (product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" && !product.manualFbaFee)) return { message: `${prefix}；实际重量${isAmazonWeightUnavailable(product) ? "页面未提供" : "待核验"}，利润按最低档估算；真实重量保持未知，取得 Item Weight 后自动重算。`, type: "info" };
     if (!product.profitCalculation || product.profitCalculation.purchaseCostAssumedZero) return { message: `${prefix}；利润参数可后续补充，当前尚无完整利润。`, type: "info" };
     if (isLowConfidenceSupplierEstimate(product)) {
@@ -8944,8 +8970,8 @@ import {
       ["页面包裹重量", automaticPackageWeightKg(product) !== null ? `${formatWeightKg(automaticPackageWeightKg(product))} kg` : null],
       ["利润计算重量", displayedProductWeight !== null ? `${formatWeightKg(displayedProductWeight)} kg · ${productWeightBandLabel(displayedProductWeight)} · ${profitWeightSourceLabel(product)}` : isFba && product.fbaEstimate?.assumption === "missing_weight_minimum_fba_estimate" ? `${isAmazonWeightUnavailable(product) ? "页面未提供" : "Item Weight 待核验"} · 利润按最低档暂估` : amazonOnly ? amazonFieldIssue(product, "weight") : null],
       ["商品尺寸（cm）", resolveProductDimensionsCm(product)?.map(value => formatNumber(value)).join(" × ") || null],
-      ["加拿大体积重", product.marketplace === "CA" && product.fbaEstimate?.dimensionalWeightKg ? `${formatWeightKg(product.fbaEstimate.dimensionalWeightKg)} kg（长×宽×高 cm ÷ 5021.69）` : null],
-      ["FBA 费用采用依据", product.fbaEstimate?.selectionPolicy === "highest_available_fba_fee" ? `${product.manualFbaFee ? "人工费用覆盖；自动比较参考：" : ""}${product.fbaEstimate.weightSource} · ${formatWeightKg(product.fbaEstimate.calculationWeightKg)} kg · 已有信息取最高 FBA 费用` : null],
+      ["体积重", product.fbaEstimate?.dimensionalWeightKg ? `${formatWeightKg(product.fbaEstimate.dimensionalWeightKg)} kg（长×宽×高 cm ÷ ${product.marketplace === 'AU' ? 6000 : 5021.69}）` : null],
+      ["FBA 费用采用依据", product.manualFbaFee ? "人工费用覆盖" : fbaSelectionExplanation(product.fbaEstimate) || null],
       [isAu ? "FBA 配送费（澳洲重量档）" : "FBA 配送费（按所选重量）", fbaFeeMetric],
       ["FBA 封顶估费重量", !product.manualFbaFee && product.fbaEstimate?.overweightCapped ? `${product.fbaEstimate.feeWeightG} g · 国内运费与空运头程按实际重量` : null],
       ...(!isAu ? [
@@ -9932,7 +9958,7 @@ import {
     if ((weight === null || weight <= 0) && !weightAssumption.weightAssumption && !weightAssumption.dimensionalWeightEstimateKg) reasons.push('商品重量或包裹重量');
     if (!mode) reasons.push('履约方式');
     const fee = product.fulfillmentFee ?? (mode === 'FBM' ? product.fbmFee : mode === 'FBA' ? product.fbaFee : null);
-    if (!Number.isFinite(fee) || fee < 0) reasons.push(mode === 'FBA' ? 'FBA 配送费' : '配送费');
+    if (!Number.isFinite(fee) || fee < 0) reasons.push(mode === 'FBA' ? product.fbaEstimate?.selectionStatus === 'fee_conflict' ? 'FBA费用差异过大，需核验规格' : 'FBA 配送费' : '配送费');
     if (!Number.isFinite(inputs.exchangeRate) || inputs.exchangeRate <= 0) reasons.push('汇率');
     return reasons;
   }
@@ -9985,7 +10011,7 @@ import {
     const estimate = estimateWeightOnlyFbaFee(product);
     product.fbaEstimate = estimate;
     product.fieldSources = { ...(product.fieldSources || {}) };
-    if (estimate) {
+    if (Number.isFinite(estimate?.fee)) {
       product.fbaFee = estimate.fee;
       product.fbaFeeSource = automaticFbaFeeSource(product);
       product.fieldSources.fbaFee = automaticFbaFeeSource(product);

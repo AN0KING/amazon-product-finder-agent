@@ -171,7 +171,7 @@ test('explicit resume refuses missing proof, then requeues only after confirmati
   assert.equal(result.queue.ratePolicy.manualResumeRequired, false);
   assert.equal(h.tasks.get('risk').status, 'queued');
   assert.equal(h.counts().calls, 0);
-  assert.equal(h.searchPolicy.waitMs(), 60_000);
+  assert.equal(h.searchPolicy.waitMs(), 51_429);
 });
 
 test('429 enters a shared persisted cooldown and bounded retry instead of a manual pause', async t => {

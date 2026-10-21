@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canadaDimensionalWeightKg, parseProductDimensionsCm, resolveProductDimensionsCm,
-  estimateFbaByAvailableSpecifications, hasAnyProductShippingSpecification } from '../lib/profit-model.mjs';
+  estimateFbaByAvailableSpecifications, hasAnyProductShippingSpecification, marketDimensionalWeightKg, selectCorroboratedFbaFee, fbaSelectionExplanation } from '../lib/profit-model.mjs';
 import { recomputeProductProfit } from '../lib/product-profit-state.mjs';
 import { resolveAnalysisProfitInputs, evaluateAnalysisProduct } from '../lib/analysis-handoff.mjs';
 
@@ -81,16 +81,20 @@ test('one valid mass suffices without dimensions; all three absent remain incomp
   }
 });
 
-test('AU excludes volumetric mass; dimensions alone do not estimate FBA or profit', () => {
+test('AU includes dimensional FBA mass, preserving real-mass freight rules', () => {
   const product = base(.05, .12, '20 x 10 x 2 cm', 'AU');
   const result = recomputeProductProfit(product);
   assert.equal(result.fbaEstimate.selectedWeightSource, 'package');
-  assert.equal(result.fbaEstimate.dimensionalWeightKg, null);
+  assert.equal(result.fbaEstimate.dimensionalWeightKg, 400 / 6000);
   assert.equal(result.profitCalculation.airFreight.volumetricWeightKg, null);
   const dimensionsOnly = recomputeProductProfit(base(null, null, '20 x 10 x 2 cm', 'AU'));
   assert.equal(hasAnyProductShippingSpecification(dimensionsOnly), true);
-  assert.equal(dimensionsOnly.fbaFee, null);
-  assert.equal(dimensionsOnly.margin, null);
+  assert.ok(Number.isFinite(dimensionsOnly.fbaFee));
+  assert.ok(Number.isFinite(dimensionsOnly.margin));
+  assert.equal(dimensionsOnly.productWeight, null);
+  assert.equal(dimensionsOnly.profitInputs.actualWeightKg, null);
+  assert.equal(dimensionsOnly.profitCalculation.domesticFreightWeightKg, 400 / 6000);
+  assert.equal(dimensionsOnly.profitCalculation.airFreight.chargeableWeightKg, 400 / 6000);
 });
 
 test('manual weights and FBA fees retain priority and original values', () => {
@@ -113,4 +117,27 @@ test('existing single-page Product information rows supply dimensions without ex
   assert.equal(recomputeProductProfit(product).fbaEstimate.selectedWeightSource, 'dimensional');
   product.productInformation.sections[0].rows = [{ label: 'Load Capacity', value: '20 x 10 x 5 cm' }];
   assert.equal(resolveProductDimensionsCm(product), null);
+});
+
+test('fee corroboration selects highest supported fee and rejects isolated values', () => {
+  for (const [fees, expected, status] of [
+    [[12,10,5],12,'corroborated'], [[20,10,8],10,'outlier_excluded'],
+    [[20,10,6],null,'fee_conflict'], [[10,7],10,'corroborated'],
+    [[10.0001,7],null,'fee_conflict'], [[10],10,'single_source_estimate'],
+    [[10,10,10],10,'corroborated'], [[],null,'missing'],
+  ]) {
+    const result=selectCorroboratedFbaFee(fees.map((fee,i)=>({fee,source:i})));
+    assert.equal(result.selected?.fee ?? null,expected);
+    assert.equal(result.status,status);
+  }
+  assert.equal(selectCorroboratedFbaFee([{fee:10,source:'item'},{fee:10,source:'package'}]).selected.source,'item');
+});
+test('single-source explanations and AU dimensional units are explicit', () => {
+  assert.equal(marketDimensionalWeightKg([20,10,5],'AU'),1000/6000);
+  for (const market of ['AU','CA']) {
+    const result=recomputeProductProfit(base(null,.04,null,market));
+    assert.equal(result.fbaEstimate.selectionStatus,'single_source_estimate');
+    assert.match(fbaSelectionExplanation(result.fbaEstimate),/仅有包裹重量依据，缺少交叉核验/);
+    assert.ok(Number.isFinite(result.margin));
+  }
 });

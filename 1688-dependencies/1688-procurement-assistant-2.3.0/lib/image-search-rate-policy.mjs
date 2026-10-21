@@ -1,11 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-// Ordinary queues use a conservative fixed cadence. Explicit rate trials keep
+// Ordinary queues start at most 70 searches per hour with uniform spacing. Explicit rate trials keep
 // their separately authorized pacing, history and manual verification pauses.
-export const SEARCH_MIN_GAP_MS = 60_000;
-export const SEARCH_COOLDOWN_EVERY = 10;
-export const SEARCH_COOLDOWN_MS = 120_000;
+export const SEARCH_MIN_GAP_MS = Math.ceil(3_600_000 / 70);
+export const SEARCH_COOLDOWN_EVERY = 0;
+export const SEARCH_COOLDOWN_MS = 0;
 // Platform backoff is independent of the trial's ordinary pacing.
 export const SEARCH_RATE_LIMIT_COOLDOWN_MS = 300_000;
 export const isSearchExecutionPause = code => ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STOP_FAILED', 'SEARCH_INTERRUPTED'].includes(code);
@@ -95,7 +95,7 @@ export class ImageSearchRatePolicy {
     this.state.lastStartedAt = Math.max(this.state.lastStartedAt, latestTask);
     if (this.state.lastStartedAt) {
       const rest = !this.trialPacingActive() && this.state.searchCount > 0
-        && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0;
+        && SEARCH_COOLDOWN_EVERY > 0 && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0;
       this.state.nextAllowedAt = Math.max(this.state.nextAllowedAt, this.state.lastStartedAt + this.effectiveGapMs() + rest);
     }
     await this.persist();
@@ -108,7 +108,7 @@ export class ImageSearchRatePolicy {
     return {
       minGapMs: this.effectiveGapMs(), maxConcurrent: 1,
       cooldownEvery: this.trialPacingActive() ? 0 : SEARCH_COOLDOWN_EVERY,
-      cooldownMs: this.trialPacingActive() ? 0 : this.cooldownMs,
+      cooldownMs: this.trialPacingActive() || SEARCH_COOLDOWN_EVERY === 0 ? 0 : this.cooldownMs,
       nextAllowedAt: next ? new Date(next).toISOString() : null,
       pausedReason: this.state.manualResumeRequired ? this.state.pausedReason : cooling ? 'RATE_LIMITED' : null,
       manualResumeRequired: this.state.manualResumeRequired,
@@ -222,7 +222,7 @@ export class ImageSearchRatePolicy {
       this.state.searchCount += 1;
       this.state.lastStartedAt = this.now();
       this.state.nextAllowedAt = this.now() + this.effectiveGapMs()
-        + (!this.trialPacingActive() && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0);
+        + (!this.trialPacingActive() && SEARCH_COOLDOWN_EVERY > 0 && this.state.searchCount % SEARCH_COOLDOWN_EVERY === 0 ? this.cooldownMs : 0);
       const trial = this.state.rateTrial;
       if (this.trialPacingActive()) {
         const stage = trial.currentStage;

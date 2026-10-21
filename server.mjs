@@ -86,7 +86,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.67";
+const APP_VERSION = "0.9.68";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;

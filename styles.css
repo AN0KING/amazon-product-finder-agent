@@ -2864,6 +2864,7 @@ input[type="checkbox"]:checked {
 
 .candidate-logistics {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 5px 12px;
   min-width: 0;
@@ -2887,6 +2888,16 @@ input[type="checkbox"]:checked {
 .candidate-logistics > span:last-child {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.candidate-logistics > .candidate-fba-explanation {
+  flex-basis: 100%;
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.5;
 }
 
 .candidate-logistics b {
@@ -3097,6 +3108,14 @@ input[type="checkbox"]:checked {
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.numeric-cell.profit-cell > small {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
 }
 
 .currency-pair {

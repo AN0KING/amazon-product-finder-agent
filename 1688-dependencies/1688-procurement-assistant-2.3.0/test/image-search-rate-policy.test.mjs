@@ -17,27 +17,27 @@ async function fixture(t, options = {}) {
 
 test('configuration can only slow conservative task frequency; Infinity uses defaults', async t => {
   const { policy, file } = await fixture(t, { minGapMs: 1, cooldownMs: 1 });
-  assert.equal(policy.view().minGapMs, 60_000);
+  assert.equal(policy.view().minGapMs, 51_429);
   assert.equal(policy.view().maxConcurrent, 1);
-  assert.equal(policy.view().cooldownMs, 120_000);
+  assert.equal(policy.view().cooldownMs, 0);
   const slow = new ImageSearchRatePolicy({ file, minGapMs: 120_000, cooldownMs: 600_000 });
   assert.equal(slow.view().minGapMs, 120_000);
-  assert.equal(slow.view().cooldownMs, 600_000);
-  assert.equal(new ImageSearchRatePolicy({ file, minGapMs: Infinity }).view().minGapMs, 60_000);
+  assert.equal(slow.view().cooldownMs, 0);
+  assert.equal(new ImageSearchRatePolicy({ file, minGapMs: Infinity }).view().minGapMs, 51_429);
 });
 
-test('reservation persists before dispatch and tenth search adds a short pacing rest', async t => {
+test('reservation persists before dispatch with uniform pacing including the tenth search', async t => {
   const f = await fixture(t);
   for (let i = 1; i <= 10; i++) {
     assert.equal(await f.policy.beginSearch(), true);
     assert.equal(await f.policy.beginSearch(), false);
     assert.equal(JSON.parse(await fs.readFile(f.file)).searchCount, i);
-    assert.equal(f.policy.waitMs(), i === 10 ? 180_000 : 60_000);
-    if (i < 10) f.advance(60_000);
+    assert.equal(f.policy.waitMs(), 51_429);
+    if (i < 10) f.advance(51_429);
   }
-  f.advance(60_000);
+  f.advance(51_428);
   assert.equal(await f.policy.beginSearch(), false);
-  f.advance(120_000);
+  f.advance(1);
   assert.equal(await f.policy.beginSearch(), true);
 });
 
@@ -46,13 +46,13 @@ test('simultaneous reservation requests allow one search only', async t => {
   assert.equal((await Promise.all(Array.from({ length: 12 }, () => policy.beginSearch()))).filter(Boolean).length, 1);
 });
 
-test('timestamps and count survive restart, including tenth-search cooldown', async t => {
+test('timestamps and count survive restart, including the reserved interval', async t => {
   const f = await fixture(t);
-  for (let i = 0; i < 10; i++) { await f.policy.beginSearch(); if (i < 9) f.advance(60_000); }
+  for (let i = 0; i < 10; i++) { await f.policy.beginSearch(); if (i < 9) f.advance(51_429); }
   const restarted = new ImageSearchRatePolicy({ file: f.file, now: f.now });
   await restarted.initialize();
   assert.equal(restarted.state.searchCount, 10);
-  assert.equal(restarted.waitMs(), 180_000);
+  assert.equal(restarted.waitMs(), 51_429);
   assert.equal(await restarted.beginSearch(), false);
 });
 
@@ -348,7 +348,7 @@ test('first slider freezes its measured rate and queue resume never restarts the
   assert.equal(trial.targetPerHour, 100);
   assert.deepEqual(trial.trigger, frozen);
   assert.equal(trial.history.length, 1);
-  assert.equal(f.policy.waitMs(), 60_000);
+  assert.equal(f.policy.waitMs(), 51_429);
 });
 
 test('enabling the trial during a manual pause cannot clear that pause or verification proof', async t => {

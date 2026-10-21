@@ -4277,13 +4277,18 @@ test('CA dimensions-only profit reaches drawer, editor and handoff with a volume
   assert.ok(exported.preliminary_profit.result);
 });
 
-test('AU dimensions alone retain missing real-weight status without a volumetric FBA fee', () => {
+test('AU dimensions alone estimate FBA and profit while real weight stays unknown', () => {
   const { app, element } = harness();
   app.restore(snapshot(job('completed'), [{ ...pageWithoutWeight(), productDimensions: '20 x 10 x 2 cm' }]));
   app.openLocalDrawer(productId);
   const product = app.state().products[0];
-  assert.equal(product.fbaFee, null);
-  assert.equal(product.margin, null);
+  assert.ok(Number.isFinite(product.fbaFee));
+  assert.ok(Number.isFinite(product.margin));
+  assert.equal(product.fbaEstimate.dimensionalWeightKg, 400 / 6000);
+  assert.equal(product.profitInputs.actualWeightKg, null);
+  assert.equal(product.fbaEstimate.selectionStatus, 'single_source_estimate');
   assert.ok(!product.amazonMissing.includes('商品重量、包裹重量及尺寸均缺失'));
   assert.doesNotMatch(element('amazonMetrics').innerHTML, /加拿大体积重/);
+  assert.match(element('amazonMetrics').innerHTML, /6000/);
+  assert.match(element('amazonMetrics').innerHTML, /缺少交叉核验/);
 });

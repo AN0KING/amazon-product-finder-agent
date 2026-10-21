@@ -1,6 +1,6 @@
 {
   "name": "scout-amazon-agent",
-  "version": "0.9.67",
+  "version": "0.9.68",
   "private": true,
   "type": "module",
   "description": "Local Amazon NL, AU, and US product discovery agent with SellerSprite and 1688 integration.",

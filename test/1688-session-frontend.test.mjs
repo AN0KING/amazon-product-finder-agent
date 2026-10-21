@@ -58,7 +58,7 @@ function harness() {
       imageUrl: 'https://m.media-amazon.com/images/I/fixture.jpg', supplierSearchStatus: 'queue_waiting',
       supplierProcurementTaskId: '${taskId}', manualPurchaseCost: false, reviewStatus: 'pending' }];
     globalThis.scout = {
-      start: start1688Session, load: load1688SessionStatus, poll: poll1688Status,
+      start: start1688Session, check: check1688Session, load: load1688SessionStatus, poll: poll1688Status,
       apply: (value) => apply1688SessionStatus(value.auth, value.queue, value.imageSearchRecovery),
       renderMessage: render1688SessionStatusMessage, schedule: schedule1688StatusPolling,
       resumeAfterVerification: (...args) => resume1688AfterVerification(...args),
@@ -69,6 +69,48 @@ function harness() {
   vm.runInContext(source, context, { filename: "app.js" });
   return { app: context.scout, calls, toasts, element, intervals, timeouts, resumes: () => resumeCount, respond(fn) { respond = fn; } };
 }
+
+for (const systemRisk of [false, true]) {
+  test(`persisted AUTH_REQUIRED pause exposes ${systemRisk ? "system" : "current"} verification even when failed task is absent from activeTasks`, async () => {
+    const fixture = harness();
+    const blockedTaskId = systemRisk ? '91b66734-f894-438a-a93e-7bb6f186afcd' : taskId;
+    const blocked = runtime({ queue: { ratePolicy: ratePolicy({
+      pausedReason: 'AUTH_REQUIRED', manualResumeRequired: true, blockedTaskId,
+      minGapMs: 60000, cooldownEvery: 10, cooldownMs: 120000,
+    }) } });
+    fixture.app.apply(blocked);
+    assert.equal(fixture.app.state().riskTask?.id, blockedTaskId);
+    assert.equal(fixture.app.state().riskScope, systemRisk ? 'system' : 'current');
+    assert.equal(fixture.element('login1688Button').hidden, false);
+    assert.equal(fixture.element('resume1688Button').hidden, true);
+    fixture.respond(async path => {
+      if (path.startsWith('/api/v1/runtime')) return blocked;
+      if (path === '/api/v1/auth/open-login') return { edgeReady: true };
+      throw new Error(`Unexpected request ${path}`);
+    });
+    await fixture.app.check();
+    assert.match(fixture.toasts.at(-1)[0], /验证/);
+    assert.doesNotMatch(fixture.toasts.at(-1)[0], /在线身份验证通过|没有因断联/);
+    await fixture.app.start();
+    assert.deepEqual(fixture.calls.find(call => call.path === '/api/v1/auth/open-login').body,
+      { purpose: 'image_search', restart: false, taskId: blockedTaskId });
+    assert.equal(fixture.calls.some(call => call.path === '/api/v1/queue/resume'), false);
+    assert.equal(fixture.resumes(), 0);
+    assert.equal(fixture.app.state().queue.ratePolicy.minGapMs, 60000);
+  });
+}
+
+test('manual pause without a usable blocked task never announces matching is ready', async () => {
+  const fixture = harness();
+  const blocked = runtime({ queue: { ratePolicy: ratePolicy({
+    pausedReason: 'AUTH_REQUIRED', manualResumeRequired: true, blockedTaskId: null,
+  }) } });
+  fixture.respond(async () => blocked);
+  await fixture.app.check();
+  assert.match(fixture.toasts.at(-1)[0], /暂停/);
+  assert.doesNotMatch(fixture.toasts.at(-1)[0], /在线身份验证通过|没有因断联/);
+  assert.equal(fixture.resumes(), 0);
+});
 
 for (const systemRisk of [false, true]) {
   test(`cached logged-out state still opens ${systemRisk ? "system" : "current"} image verification without restarting login`, async () => {
