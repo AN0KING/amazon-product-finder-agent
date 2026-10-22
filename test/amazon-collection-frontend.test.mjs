@@ -4292,3 +4292,24 @@ test('AU dimensions alone estimate FBA and profit while real weight stays unknow
   assert.match(element('amazonMetrics').innerHTML, /6000/);
   assert.match(element('amazonMetrics').innerHTML, /缺少交叉核验/);
 });
+
+test('AU and CA restore two-weight estimates with dimensional fee and provisional margin labels', () => {
+  for (const marketplace of ['AU', 'CA']) {
+    const { app, element } = harness();
+    const original = { ...canonicalProduct(), marketplace, sourceMarketplace: marketplace, detailParserVersion: 13,
+      productWeight: 1.2, productWeightEvidence: { kind: 'product', label: 'Item Weight', value: 1.2 },
+      fbaWeight: null, billingWeight: null, manualFbaFee: false, fbaFee: null,
+      productDimensions: '20 x 10 x 2 cm', profitInputs: { ...canonicalProduct().profitInputs, actualWeightKg: null } };
+    app.restore(snapshot(job('completed'), [original]), { persistMigrations: false });
+    app.openLocalDrawer(productId);
+    const product = app.state().products[0];
+    assert.equal(product.fbaEstimate.selectionStatus, 'two_weight_lower_estimate');
+    assert.equal(product.fbaEstimate.selectedWeightSource, 'dimensional');
+    assert.ok(Number.isFinite(product.margin));
+    assert.equal(product.productWeight, 1.2);
+    assert.match(element('amazonMetrics').innerHTML, /重量差超过1 kg/);
+    const row = app.row(productId);
+    assert.match(row, /体积重/);
+    assert.match(row, /利润率暂估 · 两项重量差超过1 kg/);
+  }
+});

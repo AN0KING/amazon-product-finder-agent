@@ -141,3 +141,66 @@ test('single-source explanations and AU dimensional units are explicit', () => {
     assert.ok(Number.isFinite(result.margin));
   }
 });
+
+test('two-weight exception precedes fee comparison and uses unrounded kg, not cheaper fee', () => {
+  const candidate = (source, calculationWeightKg, fee) => ({ source, calculationWeightKg, fee });
+  for (const sources of [['item', 'package'], ['item', 'dimensional'], ['package', 'dimensional']]) {
+    const light = candidate(sources[0], .1, 20);
+    const heavy = candidate(sources[1], 1.100001, 5);
+    for (const pair of [[light, heavy], [heavy, light]]) {
+      const result = selectCorroboratedFbaFee(pair);
+      assert.equal(result.selected, light);
+      assert.equal(result.status, 'two_weight_lower_estimate');
+    }
+    for (const weight of [1, 1.1]) {
+      const result = selectCorroboratedFbaFee([light, candidate(sources[1], weight, 5)]);
+      assert.equal(result.selected, null);
+      assert.equal(result.status, 'fee_conflict');
+    }
+    const boundary = selectCorroboratedFbaFee([candidate(sources[0], .1, 7), candidate(sources[1], 1.1, 10)]);
+    assert.equal(boundary.selected.fee, 10);
+    assert.equal(boundary.status, 'corroborated');
+  }
+  const tie = selectCorroboratedFbaFee([candidate('item', 2, 10), candidate('package', .5, 10)]);
+  assert.equal(tie.selected.source, 'package');
+  const three = selectCorroboratedFbaFee([candidate('item', .1, 5), candidate('package', 2, 10), candidate('dimensional', 4, 12)]);
+  assert.equal(three.selected.source, 'dimensional');
+  assert.equal(three.status, 'corroborated');
+  for (const invalid of [null, NaN, Infinity, -1, 0]) {
+    const result = selectCorroboratedFbaFee([candidate('item', invalid, 5), candidate('package', 2, 10)]);
+    assert.equal(result.status, 'fee_conflict');
+  }
+});
+
+test('AU and CA use the lighter of any two sources without changing real weights or freight', () => {
+  for (const market of ['AU', 'CA']) {
+    for (const [item, packed, dimensions, source] of [
+      [.05, 1.2, null, 'item'], [1.2, .05, null, 'package'],
+      [1.2, null, '20 x 10 x 2 cm', 'dimensional'],
+      [null, 1.2, '20 x 10 x 2 cm', 'dimensional'],
+    ]) {
+      const original = base(item, packed, dimensions, market);
+      const result = recomputeProductProfit(original);
+      const estimate = result.fbaEstimate;
+      assert.equal(estimate.selectionStatus, 'two_weight_lower_estimate');
+      assert.equal(estimate.selectedWeightSource, source);
+      assert.equal(estimate.feeCandidates.length, 2);
+      assert.equal(result.fbaFee, estimate.feeCandidates.find(value => value.source === source).fee);
+      assert.match(estimate.selectionExplanation, /重量差超过1 kg.*较小值.*利润率为暂估/);
+      assert.ok(Number.isFinite(result.margin));
+      assert.equal(result.productWeight, item);
+      assert.equal(result.fbaWeight, packed);
+      assert.equal(result.billingWeight, 1.2);
+      assert.equal(result.profitCalculation.domesticFreightWeightKg, 1.2);
+      assert.equal(recomputeProductProfit(result).fbaFee, result.fbaFee);
+      const manual = recomputeProductProfit({ ...original, manualFbaFee: true, fbaFee: 9.99 });
+      assert.equal(manual.fbaFee, 9.99);
+      const manualWeight = recomputeProductProfit({ ...original, manualBillingWeight: true, billingWeight: .3 });
+      assert.equal(manualWeight.fbaEstimate.selectionStatus, 'manual_weight');
+      assert.equal(manualWeight.fbaEstimate.calculationWeightKg, .3);
+    }
+  }
+  const largerDimensional = recomputeProductProfit(base(.05, null, '30 x 30 x 30 cm'));
+  assert.equal(largerDimensional.fbaEstimate.selectedWeightSource, 'item');
+  assert.equal(largerDimensional.fbaEstimate.selectionStatus, 'two_weight_lower_estimate');
+});

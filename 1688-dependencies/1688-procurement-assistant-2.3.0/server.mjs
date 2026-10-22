@@ -610,7 +610,7 @@ async function cancelLoginChild({ reason = "new login request" } = {}) {
   await cleanupHandshake(current).catch(() => undefined);
 }
 
-function spawnLoginChild({ purpose, taskId = null }) {
+function spawnLoginChild({ purpose, taskId = null, freshLogin = false }) {
   const token = crypto.randomBytes(32).toString("hex");
   const attemptId = `${Date.now()}-${crypto.randomUUID()}`;
   const readyPath = path.join(HANDSHAKE_DIR, `launch-${attemptId}.ready`);
@@ -622,6 +622,7 @@ function spawnLoginChild({ purpose, taskId = null }) {
     BB1688_LOGIN_TOKEN: token,
     BB1688_LOGIN_READY: readyPath,
     BB1688_LOGIN_CANCEL: cancelPath,
+    BB1688_FRESH_LOGIN: freshLogin === true ? "1" : "0",
   };
   const args = [CLI_ENTRY, "login", "--open-browser", "--purpose", purpose, "--json", "--timeout", "900"];
   if (purpose === "image_search") {
@@ -732,7 +733,14 @@ function childHasExited(child) {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-async function openLogin({ restart, purpose, taskId }) {
+async function openLogin({ restart, purpose, taskId, freshLogin = false }) {
+  if (freshLogin && purpose !== "login") {
+    throw new ApiError(422, "INVALID_LOGIN_REQUEST", "重新扫码登陆不能用于图片验证。");
+  }
+  if (freshLogin && loginLaunchPending) {
+    throw new ApiError(409, "SESSION_BUSY", "登录窗口正在启动，请稍后重新扫码登陆。");
+  }
+  restart = restart === true || freshLogin;
   if (hasActiveSearchProcess() && !runningTaskId) {
     throw new ApiError(409, "SEARCH_WORKER_STOP_FAILED", "搜图工作进程尚未确认退出，请先检查服务。");
   }
@@ -750,7 +758,13 @@ async function openLogin({ restart, purpose, taskId }) {
   }
   // 等待正在进行的浏览器操作（在线校验/搜索）释放会话锁，避免子进程 LOCK_BUSY
   if (!loginLaunchPending) {
-    const pending = runBrowserOp(() => spawnLoginChild({ purpose, taskId }));
+    const pending = runBrowserOp(() => {
+      if (freshLogin) {
+        lastVerifyOkAt = 0;
+        Object.assign(auth, { ready: false, reason: "waiting_login", message: "等待重新扫码登陆" });
+      }
+      return spawnLoginChild({ purpose, taskId, freshLogin });
+    });
     loginLaunchPending = pending;
     void pending.finally(() => { if (loginLaunchPending === pending) loginLaunchPending = null; }).catch(() => {});
   }
@@ -1066,6 +1080,10 @@ async function handleRequest(request, response) {
     const body = await readJsonBody(request, 64 * 1024);
     const purpose = body?.purpose === "image_search" ? "image_search" : body?.purpose === "login" ? "login" : null;
     if (!purpose) throw new ApiError(422, "LOGIN_PURPOSE_INVALID", "1688 登录窗口用途必须是 login 或 image_search。");
+    if ((body?.freshLogin !== undefined && typeof body.freshLogin !== "boolean")
+      || (body?.freshLogin === true && purpose !== "login")) {
+      throw new ApiError(422, "INVALID_LOGIN_REQUEST", "重新扫码登陆仅适用于普通账号登录。");
+    }
     let taskId = null;
     if (purpose === "image_search") {
       taskId = String(body?.taskId || "");
@@ -1073,7 +1091,7 @@ async function handleRequest(request, response) {
     } else if (body?.taskId) {
       throw new ApiError(422, "LOGIN_TASK_NOT_ALLOWED", "普通 1688 登录不能携带图片搜索任务。");
     }
-    const data = await openLogin({ restart: body?.restart === true, purpose, taskId });
+    const data = await openLogin({ restart: body?.restart === true, freshLogin: body?.freshLogin === true, purpose, taskId });
     sendJson(response, 202, data);
     return;
   }

@@ -45,6 +45,7 @@ export async function run(opts) {
     const brokerMode = Boolean(process.env.BB1688_LOGIN_ATTEMPT
         && process.env.BB1688_LOGIN_TOKEN);
     const brokerControl = brokerMode ? requireBrokerLoginControl() : null;
+    const freshLogin = brokerMode && purpose === 'login' && process.env.BB1688_FRESH_LOGIN === '1';
     const managedImageSearchUpload = purpose === 'image_search' && brokerMode
         ? await readBrokerManagedImageSearchUpload()
         : null;
@@ -122,6 +123,7 @@ export async function run(opts) {
                 openBrowser: true,
                 brokerMode,
                 reuseExistingPage: true,
+                freshLogin,
                 purpose,
                 managedImageSearchUpload,
                 supplierStrengthVerification,
@@ -145,6 +147,7 @@ export async function run(opts) {
                 openBrowser: false,
                 brokerMode,
                 reuseExistingPage: false,
+                freshLogin,
                 purpose,
                 managedImageSearchUpload,
                 supplierStrengthVerification,
@@ -205,8 +208,11 @@ async function completeLoginInContext(ctx, options) {
             return persisted;
         });
     }
+    // Only an explicit account-switch request clears this dedicated browser's
+    // cookies. Verification windows must preserve their bound identity.
+    if (options.freshLogin === true) await ctx.clearCookies();
     const initialCookies = await ctx.cookies();
-    const visibleIdentity = options.openBrowser
+    const visibleIdentity = options.openBrowser && !options.freshLogin
         ? await verifiedIdentityFromContext(ctx, initialCookies)
         : null;
     if (visibleIdentity) {

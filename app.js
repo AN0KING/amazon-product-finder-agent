@@ -49,7 +49,7 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.68";
+  const APP_VERSION = "0.9.69";
   const EXPORT_DIRECTORY_LABEL = "本机导出目录";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "standard";
@@ -1964,6 +1964,9 @@ import {
   }
 
   function bind1688Session() {
+    byId("relogin1688Button")?.addEventListener("click", () => {
+      void start1688Session({ restart: true, freshLogin: true });
+    });
     byId("login1688Button")?.addEventListener("click", () => {
       void start1688Session();
     });
@@ -2023,12 +2026,12 @@ import {
     return true;
   }
 
-  async function start1688Session({ restart = false } = {}) {
+  async function start1688Session({ restart = false, freshLogin = false } = {}) {
     if (supplier1688SessionPromise) return supplier1688SessionPromise;
     await load1688SessionStatus();
     if (supplier1688SessionPromise) return supplier1688SessionPromise;
     supplier1688StatusRequestId += 1;
-    const imageSearchVerification = Boolean(supplier1688RiskTask?.id);
+    const imageSearchVerification = !freshLogin && Boolean(supplier1688RiskTask?.id);
     const purpose = imageSearchVerification ? "image_search" : "login";
     const waitingReason = imageSearchVerification ? "waiting_image_verification" : "waiting_login";
     const pending = Promise.resolve().then(async () => {
@@ -2061,7 +2064,8 @@ import {
           body: JSON.stringify({
             purpose,
             // Reuse an active login/verification window, preserving the user's progress.
-            restart: restart === true,
+            restart: restart === true || freshLogin === true,
+            ...(freshLogin ? { freshLogin: true } : {}),
             ...(imageSearchVerification ? { taskId: supplier1688RiskTask.id } : {}),
           }),
           timeout: 50000,
@@ -2087,14 +2091,15 @@ import {
         showToast(
           imageSearchVerification
             ? "已打开专用 Edge，系统将提交一次商品图片；如出现验证码请手动完成。验证通过后点击“验证完成，继续搜图”。"
-            : "请在专用 Edge 中完成 1688 登录；完成后点击“在线验证”。",
+            : freshLogin ? "请使用新的 1688 或淘宝账号扫码登陆；完成后点击“刷新状态”。原有图片验证暂停仍需单独处理。"
+            : "请在专用 Edge 中完成 1688 登录；完成后点击“刷新状态”。",
           "info",
           6200,
         );
         return false;
       } catch (error) {
         await load1688SessionStatus();
-        showToast(`1688 ${imageSearchVerification ? "图片验证" : "登录"}窗口未就绪：${error.message}${supplier1688LoggedIn ? "；已有登录身份仍保留。" : ""}`, "error", 6200);
+        showToast(`1688 ${imageSearchVerification ? "图片验证" : "登录"}窗口未就绪：${error.message}${supplier1688LoggedIn && !freshLogin ? "；已有登录身份仍保留。" : ""}`, "error", 6200);
         return false;
       }
     });
@@ -2369,10 +2374,10 @@ import {
       const openLabel = imageSearchVerification
         ? supplier1688RiskTaskScope === "system" ? "处理 1688 系统队列验证" : "打开 1688 图片搜索验证"
         : unavailable ? "启动并打开 1688 专用 Edge" : "打开 1688 专用 Edge";
-      loginButton.hidden = (technicalPause && supplier1688LoggedIn) || verifiedForResume || (supplier1688LoggedIn && !imageSearchVerification) || data.checking === true || supplier1688WindowOpen || reason === "identity_mismatch";
+      loginButton.hidden = false;
       loginButton.disabled = Boolean(supplier1688SessionPromise);
-      loginButton.setAttribute("aria-label", openLabel);
-      loginButton.title = openLabel;
+      loginButton.setAttribute("aria-label", "连接账号");
+      loginButton.title = `连接账号：${openLabel}`;
     }
     if (checkButton) {
       checkButton.hidden = false;
@@ -3439,7 +3444,7 @@ import {
     if (login1688Button) {
       login1688Button.disabled = Boolean(supplier1688SessionPromise);
     }
-    for (const id of ["resume1688Button", "restart1688Button"]) {
+    for (const id of ["resume1688Button", "restart1688Button", "relogin1688Button"]) {
       const button = byId(id);
       if (button) button.disabled = Boolean(supplier1688SessionPromise);
     }
@@ -3451,8 +3456,8 @@ import {
         ? `在线验证并自动补做 ${pendingResumeCount} 个未完成候选`
         : "在线验证 1688 身份";
       check1688Button.disabled = Boolean(supplier1688SessionPromise);
-      check1688Button.setAttribute("aria-label", checkLabel);
-      check1688Button.title = checkLabel;
+      check1688Button.setAttribute("aria-label", "刷新状态");
+      check1688Button.title = `刷新状态：${checkLabel}`;
     }
     if (!supplier1688ResumePromise) render1688SessionStatusMessage();
     renderSupplier1688Stage();
@@ -7742,6 +7747,7 @@ import {
       ? `<span class="margin-value">待计算</span><small>缺少：${escapeHtml(profitCalculationMissingReasons(product).join('、') || '有效计算参数')}；补齐后自动计算</small>`
       : `<span class="margin-value ${marginClass(displayedMargin)}">${formatPercent(displayedMargin)}</span>${currencyPairHtml(calculation?.profit, product.marketplace, { suffix: " / 件", compact: true })}${calculation?.dimensionalWeightEstimateKg ? "<small>体积重暂估 · 实际重量未知</small>" : calculation?.weightAssumption ? "<small>最低档暂估 · 实际重量未知</small>" : ""}${calculation?.purchaseCostAssumedZero ? "<small>预估利润率（未扣采购成本）</small>" : isLowConfidenceSupplierEstimate(product) ? "<small>初步利润 · 1688 低置信度参考</small>" : "<small>初步经营利润估算</small>"}`;
     if (displayedMargin !== null && !product.manualFbaFee && product.fbaEstimate?.selectionStatus === 'single_source_estimate') margin += '<small>利润率暂估 · FBA缺少交叉核验</small>';
+    if (displayedMargin !== null && !product.manualFbaFee && product.fbaEstimate?.selectionStatus === 'two_weight_lower_estimate') margin += '<small>利润率暂估 · 两项重量差超过1 kg，按较小重量估费</small>';
     const targetCost = Number.isFinite(product.targetCostCny)
       ? `${cnyCurrencyPairHtml(product.targetCostCny, product.marketplace, { compact: true })}${Number.isFinite(product.thresholdCostCny) ? `<small>盈利线</small>${cnyCurrencyPairHtml(product.thresholdCostCny, product.marketplace, { label: "≤ ", compact: true, secondary: true })}` : ""}`
       : "";

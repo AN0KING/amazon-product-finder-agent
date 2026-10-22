@@ -42,9 +42,10 @@ async function harness(t) {
     SEARCH_EXECUTION_TIMEOUT_MS: 180_000,
     runImageSearchProcess: async (...args) => { calls++; return dispatchImpl(...args); },
     CliError: Error, detectProcurementImageType: () => null,
-    spawn: () => {
+    spawn: (_command, _args, options) => {
       spawns++;
       const child = new EventEmitter();
+      child.spawnEnv = options.env;
       child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
       child.exitCode = null; child.signalCode = null;
       child.kill = () => { child.signalCode = 'SIGTERM'; child.emit('exit', null, 'SIGTERM'); };
@@ -677,3 +678,16 @@ for (const code of ['SEARCH_TIMEOUT', 'SEARCH_WORKER_EXITED', 'SEARCH_WORKER_STO
     assert.equal(h.counts().calls, 0); // no timer, no implicit user action
   });
 }
+
+test('fresh account login forwards the explicit flag and preserves manual risk pause', async t => {
+  const h = await harness(t);
+  await h.searchPolicy.pauseForManual('RISK_VERIFICATION_REQUIRED', 'blocked');
+  const before = h.searchPolicy.view();
+  await h.openLogin({ purpose: 'login', freshLogin: true });
+  assert.equal(h.spawned[0].spawnEnv.BB1688_FRESH_LOGIN, '1');
+  assert.equal(h.publicAuth().ready, false);
+  assert.equal(h.searchPolicy.view().pausedReason, before.pausedReason);
+  assert.equal(h.searchPolicy.view().blockedTaskId, before.blockedTaskId);
+  assert.equal(h.counts().calls, 0);
+  await assert.rejects(h.openLogin({ purpose: 'image_search', taskId: 'blocked', freshLogin: true }), { code: 'INVALID_LOGIN_REQUEST' });
+});

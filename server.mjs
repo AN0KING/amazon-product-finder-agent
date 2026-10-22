@@ -86,7 +86,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.68";
+const APP_VERSION = "0.9.69";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -650,15 +650,17 @@ async function routeRequest(request, response, url, signal) {
       : validateProcurementTaskId(body.taskId);
     if (
       !isPlainObject(body)
-      || Object.keys(body).some((key) => !["restart", "purpose", "taskId"].includes(key))
+      || Object.keys(body).some((key) => !["restart", "purpose", "taskId", "freshLogin"].includes(key))
       || (body.restart !== undefined && typeof body.restart !== "boolean")
+      || (body.freshLogin !== undefined && typeof body.freshLogin !== "boolean")
+      || (body.freshLogin === true && purpose !== "login")
       || !["login", "image_search"].includes(purpose)
       || (purpose === "image_search" && !taskId)
       || (purpose === "login" && taskId)
     ) {
       throw new HttpError(422, "INVALID_LOGIN_REQUEST", "The 1688 login request is invalid.");
     }
-    const data = await supplier1688Client.openLogin({ restart: body.restart === true, purpose, taskId, signal });
+    const data = await supplier1688Client.openLogin({ restart: body.restart === true, freshLogin: body.freshLogin === true, purpose, taskId, signal });
     sendJson(response, 202, { ok: true, data });
     return;
   }

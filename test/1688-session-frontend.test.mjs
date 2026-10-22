@@ -157,6 +157,35 @@ for (const imageSearch of [false, true]) {
   });
 }
 
+for (const blocked of [false, true]) {
+  test(`fresh QR login switches accounts without resuming ${blocked ? 'blocked' : 'ordinary'} matching`, async () => {
+    const fixture = harness();
+    const current = runtime({ queue: blocked ? {
+      riskBlocked: 1, activeTasks: [{ id: taskId, status: 'risk_blocked' }],
+      ratePolicy: ratePolicy({ pausedReason: 'RISK_VERIFICATION_REQUIRED', manualResumeRequired: true }),
+    } : {} });
+    fixture.app.apply(current);
+    for (const id of ['relogin1688Button', 'login1688Button', 'check1688Button']) {
+      assert.equal(fixture.element(id).hidden, false);
+    }
+    fixture.respond(async path => {
+      if (path === '/api/v1/runtime') return current;
+      if (path === '/api/v1/auth/open-login') {
+        assert.equal(fixture.element('relogin1688Button').disabled, true);
+        return { edgeReady: true };
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    await fixture.app.start({ freshLogin: true });
+    assert.deepEqual(fixture.calls.find(call => call.path === '/api/v1/auth/open-login').body,
+      { purpose: 'login', restart: true, freshLogin: true });
+    assert.equal(fixture.calls.some(call => call.path.includes('/queue/resume')), false);
+    assert.equal(fixture.resumes(), 0);
+    assert.equal(fixture.element('relogin1688Button').disabled, false);
+    assert.match(fixture.toasts.at(-1)[0], /新的 1688/);
+  });
+}
+
 test("ordinary login defaults to reusing its window without restart", async () => {
   const fixture = harness();
   fixture.respond(async (path) => {

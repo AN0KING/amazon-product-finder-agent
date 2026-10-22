@@ -74,22 +74,27 @@
               <small id="supplier1688StatusText" aria-live="polite">未登录</small>
               <small id="supplier1688RateText"></small>
             </div>
-            <div class="connection-actions">
+            <div class="connection-actions supplier-account-actions">
+              <button class="icon-button connection-retry account-relogin" type="button" id="relogin1688Button" aria-label="重新扫码登陆" title="重新扫码登陆，切换 1688 账号">
+                <i data-lucide="qr-code" aria-hidden="true"></i><span>重新扫码登陆</span>
+              </button>
+              <button class="icon-button connection-retry" type="button" id="login1688Button" aria-label="连接账号" title="连接账号">
+                <i data-lucide="log-in" aria-hidden="true"></i><span>连接账号</span>
+              </button>
+              <button class="icon-button connection-retry" type="button" id="check1688Button" aria-label="刷新状态" title="刷新状态">
+                <i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新状态</span>
+              </button>
+            </div>
+            <div class="connection-actions supplier-recovery-actions">
               <button class="icon-button connection-retry" type="button" id="resume1688Button" aria-label="验证完成，继续搜图" title="验证完成，继续搜图" hidden>
                 <i data-lucide="play" aria-hidden="true"></i>
               </button>
               <button class="icon-button connection-retry" type="button" id="restart1688Button" aria-label="重新打开 1688 验证窗口" title="重新打开卡住的验证窗口，保留登录身份" hidden>
                 <i data-lucide="rotate-cw" aria-hidden="true"></i>
               </button>
-              <button class="icon-button connection-retry" type="button" id="login1688Button" aria-label="打开 1688 专用 Edge" title="打开 1688 专用 Edge">
-                <i data-lucide="log-in" aria-hidden="true"></i>
-              </button>
-              <button class="icon-button connection-retry" type="button" id="check1688Button" aria-label="在线验证 1688 身份" title="在线验证 1688 身份" hidden>
-                <i data-lucide="refresh-cw" aria-hidden="true"></i>
-              </button>
             </div>
           </div>
-          <p id="sidebarVersion" data-market-version>NL v0.9.68 · 单次任务</p>
+          <p id="sidebarVersion" data-market-version>NL v0.9.69 · 单次任务</p>
         </div>
       </aside>
 

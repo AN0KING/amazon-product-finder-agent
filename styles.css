@@ -399,6 +399,37 @@ svg {
   gap: 4px;
 }
 
+#supplier1688Connection {
+  grid-template-columns: 8px minmax(0, 1fr);
+}
+
+.supplier-account-actions {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+}
+
+.supplier-account-actions .connection-retry {
+  width: 100%;
+  gap: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.supplier-account-actions .account-relogin {
+  grid-column: 1 / -1;
+}
+
+.supplier-recovery-actions:has(> button:not([hidden])) {
+  grid-column: 2;
+  width: 100%;
+}
+
+.supplier-recovery-actions:not(:has(> button:not([hidden]))) {
+  display: none;
+}
+
 .sidebar-footer > p {
   margin: 8px 0 0;
   color: #718078;
