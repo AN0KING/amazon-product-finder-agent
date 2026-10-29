@@ -6,7 +6,7 @@ import path from "node:path";
 import { normalizeExportFileName, saveExportWorkbook, saveExportHandoff } from "../lib/export-file-store.mjs";
 
 const MARKETS = ["AU", "US", "NL", "CA", "UK", "DE", "FR", "IT", "ES", "PL", "MX", "BR"];
-const WORKBOOK_LABELS = ["全部候选产品", "已初审产品", "合格初筛产品"];
+const WORKBOOK_LABELS = ["全部候选产品", "已初审产品", "合格初筛产品", "当前筛选候选产品", "当前筛选已初审产品"];
 const HANDOFF_LABELS = ["初筛交接包", "已初审产品交接包", "已初审产品交接草稿"];
 const STAMP = "20260924_123456";
 const workbookName = (market = "CA", label = "已初审产品") => `Scout_${market}_${label}_${STAMP}.xlsx`;
@@ -41,7 +41,7 @@ function handoffDocument(market = "CA", { draft = false, marker = "fixture" } = 
   };
 }
 
-test("XLSX file names accept all twelve supported markets and all three workbook labels", () => {
+test("XLSX file names accept all twelve supported markets and current and legacy workbook labels", () => {
   for (const market of MARKETS) {
     for (const label of WORKBOOK_LABELS) {
       const fileName = workbookName(market, label);

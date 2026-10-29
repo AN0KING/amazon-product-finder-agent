@@ -14,6 +14,7 @@ import * as detailRetry from "../lib/amazon-detail-retry.mjs";
 import { buildSupplierSearchResult } from "../lib/1688-supplier-policy.mjs";
 import { recomputeProductProfit } from "../lib/product-profit-state.mjs";
 import { applySupplierProfitResult } from "../lib/supplier-profit-result.mjs";
+import { normalizeExportFileName } from "../lib/export-file-store.mjs";
 
 const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const runId = "synthetic-server-run";
@@ -135,7 +136,7 @@ function harness() {
       filtered: getFilteredProducts, matching: getAmazonFilteredProductsFor1688, pending: getPending1688ResumeProducts,
       dateFilters: bindSetupFilters, applyDate: applyAmazonListingDateFilter, dateCoverage: renderAmazonListingDateCoverage,
       exportRows: getExportProducts, exportAll: () => exportProducts("all"), exportApproved: () => exportProducts("approved"),
-      exportCounts: syncExportMenuCounts, handoffSummary: renderAnalysisHandoffSummary,
+      exportCounts: syncExportMenuCounts, handoffSummary: renderAnalysisHandoffSummary, exportHandoff: exportAnalysisHandoff, newVersion: createNewAnalysisVersion,
       renderResults: originalResults, handoffInput: buildAnalysisHandoffInput, taskMode: currentTaskInputMode,
       mergeRecords: mergeCandidateRecords, setupCriteria: () => ({ useSellerSprite: false }),
       startMatching: startFiltered1688Matching, renderSupplier: renderSupplier1688Stage,
@@ -2113,6 +2114,102 @@ const profitEditCases = [
   { id: "editFbaFee", raw: "7.35", field: "fbaFee", value: 7.35, marker: "manualFbaFee" },
   { id: "editWeight", raw: "0.25", field: "billingWeight", value: 0.25, marker: "manualBillingWeight" },
 ];
+
+for (const route of ['drawer', 'manual']) test(`archived history can edit, approve and export through ${route} without restarting collection`, async () => {
+  const fixture = harness();
+  const { app, element, calls, exports } = fixture;
+  const saved = snapshot({ ...job('cancelled'), enabled: false });
+  saved.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  saved.runState.status = 'cancelled';
+  saved.products[0].supplierSearchStatus = 'searching'; // A legacy cancelled match is no longer busy.
+  let persisted;
+  fixture.respond(async (path, options) => {
+    assert.equal(path, '/api/runs');
+    persisted = JSON.parse(options.body);
+    return { runs: [] };
+  });
+  app.restore(saved, { autoResume: true, persistMigrations: false });
+  assert.equal(app.locked(), false);
+  assert.equal(app.state().products[0].supplierSearchStatus, 'searching', 'opening history preserves stored diagnostics');
+  app.openLocalDrawer(productId);
+  app.bindEditor();
+  assert.equal(element('editSalePrice').disabled, false);
+  assert.equal(element('rematchProductButton').disabled, true);
+  if (route === 'drawer') {
+    element('editSalePrice').value = '25.5';
+    await fixture.fire('editSalePrice', 'input');
+    assert.equal(await app.saveEditorToDisk(), true);
+    app.approve();
+  } else {
+    app.openManual();
+    element('manualPurchaseCost').value = '7';
+    app.approveManual();
+  }
+  await app.settleSaves();
+  assert.equal(persisted.products[0].reviewStatus, 'approved', JSON.stringify(fixture.toasts));
+  assert.equal(persisted.runState.archivedAt, saved.runState.archivedAt);
+  if (route === 'drawer') assert.equal(persisted.products[0].salePrice, 25.5);
+  else assert.equal(persisted.products[0].manualPurchaseCost, true);
+  app.restore(persisted, { autoResume: true, persistMigrations: false });
+  app.handoffSummary();
+  assert.equal(element('exportAnalysisHandoffButton').disabled, false);
+  await app.exportAll();
+  await app.exportApproved();
+  assert.equal(exports.length, 2, JSON.stringify(fixture.toasts));
+  for (const payload of exports) {
+    assert.equal(normalizeExportFileName(payload.fileName), payload.fileName, 'actual frontend filename must pass the backend validator');
+    assert.equal(payload.rows.length, 1);
+  }
+  assert.ok(calls.every(call => call.path === '/api/runs'));
+});
+
+test('archived approved products can export a handoff and create an editable version while retaining their previous receipt', async () => {
+  const fixture = harness();
+  const { app, element } = fixture;
+  const saved = snapshot({ ...job('cancelled'), enabled: false }, [{ ...canonicalProduct(), reviewStatus: 'approved' }]);
+  saved.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  let persisted, exported;
+  fixture.respond(async (path, options) => {
+    const body = JSON.parse(options.body);
+    if (path === '/api/runs') { persisted = body; return { runs: [] }; }
+    assert.equal(path, '/api/exports/analysis-handoff');
+    exported = handoff.createAnalysisHandoffPackage({ ...body, createdAt: '2026-10-29T02:30:00.000Z' });
+    return { savedFilePath: 'synthetic-handoff.json', packageId: exported.package_id, createdAt: exported.created_at,
+      products: exported.products.map(record => ({ product_id: record.product_id, revision: record.revision,
+        facts_revision: record.facts_revision, screening_revision: record.screening_revision, source_version: record.source_version })),
+      workbook: { savedFilePath: 'synthetic-handoff.xlsx' }, readiness: exported.readiness };
+  });
+  app.restore(saved, { persistMigrations: false });
+  await app.exportHandoff();
+  assert.equal(exported.products.length, 1, JSON.stringify(fixture.toasts));
+  assert.equal(persisted.products[0].analysisHandoff.owner, 'procurement');
+  const receipt = structuredClone(persisted.products[0].analysisHandoff);
+  app.restore(persisted, { persistMigrations: false });
+  app.openLocalDrawer(productId);
+  assert.equal(element('editSalePrice').disabled, true);
+  assert.equal(element('newAnalysisVersionButton').disabled, false);
+  await app.newVersion();
+  assert.equal(persisted.products[0].analysisDraft.version, 2);
+  assert.equal(persisted.products[0].reviewStatus, 'pending');
+  assert.deepEqual(persisted.products[0].analysisHistory[0].product.analysisHandoff, receipt);
+  app.openLocalDrawer(productId);
+  assert.equal(element('editSalePrice').disabled, false);
+  assert.equal(persisted.runState.archivedAt, saved.runState.archivedAt);
+});
+
+test('opening archived history preserves approvals and ignores late collected or supplier results', () => {
+  const { app, calls } = harness();
+  const saved = snapshot({ ...job('cancelled'), enabled: false }, [{ ...canonicalProduct(), reviewStatus: 'approved', manualPurchaseCost: false }]);
+  saved.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  saved.products[0].profitInputs.formulaVersion = 'old-historical-formula';
+  const before = JSON.stringify(saved.products);
+  app.restore(saved);
+  assert.equal(JSON.stringify(app.state().products), before);
+  app.mergeCandidates([{ asin: 'B000000002', marketplace: 'AU' }]);
+  app.applySupplierResult(app.state().products[0], { procurementTaskId: 'late-result', quotes: [] });
+  assert.equal(JSON.stringify(app.state().products), before);
+  assert.equal(calls.length, 0);
+});
 
 test("the six profit fields are editable markup with an explicit non-submit save button", async () => {
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");

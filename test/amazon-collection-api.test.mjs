@@ -10,6 +10,7 @@ import os from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { auditAmazonProductFields } from "../lib/amazon-detail-quality.mjs";
 import { AMAZON_PRODUCT_DETAIL_PARSER_VERSION } from "../lib/amazon-store-client.mjs";
+import { unzipSync, strFromU8 } from "fflate";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 const serverPath = path.join(projectRoot, "server.mjs");
@@ -180,7 +181,7 @@ syncBuiltinESMExports();
     const origin = `http://127.0.0.1:${port}`;
     const child = spawn(process.execPath, ["--import", pathToFileURL(guardPath).href, serverPath], {
       cwd: projectRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, SCOUT_MONITOR_ENABLED: "0", SCOUT_DATA_DIR: dataDirectory, SCOUT_PORT: String(port), SCOUT_TEST_DENIED_LOG: deniedLog },
+      env: { ...process.env, SCOUT_MONITOR_ENABLED: "0", SCOUT_DATA_DIR: dataDirectory, SCOUT_PORT: String(port), SCOUT_TEST_DENIED_LOG: deniedLog, SCOUT_EXPORT_DIRECTORY: path.join(temporaryRoot, 'exports') },
     });
     let output = "";
     child.stdout.on("data", chunk => { output = (output + chunk).slice(-4_000); });
@@ -394,5 +395,46 @@ syncBuiltinESMExports();
   assert.equal(replacementSnapshot.products[0].currentPrice, 9.99);
   assert.notEqual(replacementSnapshot.products[0].purchaseCost, 457, "The new run must not inherit manual values from the archived run.");
   assert.deepEqual((await callApi(afterArchiveRestart.origin, `/api/runs/${runId}`)).body.data, archiveSnapshot);
+  const manualReview = structuredClone(archiveSnapshot);
+  Object.assign(manualReview.products[0], { name: 'Historical edited product', englishName: 'Historical edited product', salePrice: 31.5, manualSalePrice: true, billingWeight: 0.75, manualBillingWeight: true, reviewStatus: 'approved' });
+  const saveReview = await callApi(afterArchiveRestart.origin, '/api/runs', { method: 'POST', body: manualReview });
+  assert.equal(saveReview.status, 200);
+  assert.equal(saveReview.body.data.summary.approvedCount, 1);
+  const reviewedSnapshot = (await callApi(afterArchiveRestart.origin, `/api/runs/${runId}`)).body.data;
+  assert.deepEqual(reviewedSnapshot.products, manualReview.products);
+  assert.deepEqual(reviewedSnapshot.runState, archiveSnapshot.runState);
+  assert.equal((await callApi(afterArchiveRestart.origin, '/api/amazon/collection')).body.data.runId, replacementRunId);
+  const reviewed = reviewedSnapshot.products[0];
+  const worksheet = { headers: ['商品 ID', '商品名称', '我们的售价', '商品重量', '竞品图片'],
+    rows: [[reviewed.id, reviewed.name, reviewed.salePrice, reviewed.billingWeight, '']], images: [null], imageColumnIndex: 4 };
+  for (const label of ['当前筛选候选产品', '当前筛选已初审产品']) {
+    const exported = await callApi(afterArchiveRestart.origin, '/api/exports/xlsx', { method: 'POST', body: {
+      ...worksheet, fileName: `Scout_CA_${label}_20261029_123456.xlsx`,
+    } });
+    assert.equal(exported.status, 200, JSON.stringify(exported.body));
+    assert.equal(path.dirname(exported.body.data.savedFilePath), path.join(temporaryRoot, 'exports'));
+    const files = unzipSync(await readFile(exported.body.data.savedFilePath));
+    const sheet = strFromU8(files['xl/worksheets/sheet1.xml']);
+    assert.match(sheet, /Historical edited product/);
+    assert.match(sheet, /31\.5/);
+    assert.match(sheet, /0\.75/);
+  }
+  const handoff = await callApi(afterArchiveRestart.origin, '/api/exports/analysis-handoff', { method: 'POST', body: { ...reviewedSnapshot, worksheet } });
+  assert.equal(handoff.status, 200, JSON.stringify(handoff.body));
+  assert.equal(handoff.body.data.workbookError, null);
+  assert.ok(handoff.body.data.workbook.savedFilePath);
+  assert.equal(path.dirname(handoff.body.data.savedFilePath), path.join(temporaryRoot, 'exports'));
+  const handoffFile = JSON.parse(await readFile(handoff.body.data.savedFilePath, 'utf8'));
+  assert.equal(handoffFile.products[0].title, 'Historical edited product');
+  assert.equal(handoffFile.products[0].preliminary_profit.inputs.salePrice, 31.5);
+  const receipt = handoff.body.data.products[0];
+  reviewedSnapshot.products[0].analysisHandoff = { owner: 'procurement', packageId: handoff.body.data.packageId, revision: receipt.revision, exportedAt: handoff.body.data.createdAt };
+  assert.equal((await callApi(afterArchiveRestart.origin, '/api/runs', { method: 'POST', body: reviewedSnapshot })).status, 200);
   await stopServer(afterArchiveRestart);
+  const reviewedRestart = await startServer();
+  const persistedReview = (await callApi(reviewedRestart.origin, `/api/runs/${runId}`)).body.data;
+  assert.deepEqual(persistedReview.products, reviewedSnapshot.products);
+  assert.deepEqual(persistedReview.runState, archiveSnapshot.runState);
+  assert.equal((await callApi(reviewedRestart.origin, '/api/state')).body.data.latestRunId, replacementRunId);
+  await stopServer(reviewedRestart);
 });

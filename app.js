@@ -49,7 +49,7 @@ import {
   "use strict";
 
   const COMPETITOR_PRICE_RATIO = 1;
-  const APP_VERSION = "0.9.69";
+  const APP_VERSION = "0.9.70";
   const EXPORT_DIRECTORY_LABEL = "本机导出目录";
   const FBA_WEIGHT_STANDARD_SIZE_POLICY = "large";
   const AU_FBA_ENVELOPE_SIZE_POLICY = "standard";
@@ -808,7 +808,8 @@ import {
   }
 
   function isCollectionWriteLocked() {
-    if (taskReplacementPending || runState.archivedAt) return true;
+    if (taskReplacementPending) return true;
+    if (runState.archivedAt) return false;
     if (runState.supplier1688Pipeline?.owner === 'server'
       && ['queued', 'running', 'cooldown'].includes(runState.supplier1688Pipeline.status)) return true;
     const job = currentAmazonCollectionJob();
@@ -1005,7 +1006,7 @@ import {
     const activeProduct = products.find((product) => product.id === activeProductId);
     PROFIT_EDITOR_INPUT_IDS.forEach((id) => {
       const input = byId(id);
-      if (input) input.disabled = editingLocked || isAnalysisReadOnly(activeProduct) || activeProduct?.supplierSearchStatus === "searching";
+      if (input) input.disabled = editingLocked || isAnalysisReadOnly(activeProduct) || isProductSupplierBusy(activeProduct);
     });
     syncProfitEditorSaveButton(activeProduct);
     if (editingLocked) {
@@ -2541,7 +2542,7 @@ import {
     let profitFormulaMigrated = profitFormulaRequiresMigration;
     let amazonPriceMigrated = false;
     products.forEach((product) => {
-      if (isAnalysisReadOnly(product)) return;
+      if (runState.archivedAt || isAnalysisReadOnly(product)) return;
       if (!product.supplierSource && typeof product.alibabaSource === "string") product.supplierSource = product.alibabaSource;
       delete product.alibabaSource;
       amazonPriceMigrated = invalidateLegacyAmazonPrice(product, { analysisSourceMode: runState.analysisSourceMode }) || amazonPriceMigrated;
@@ -2609,7 +2610,7 @@ import {
     updateStartAvailability();
     initIcons();
     renderAmazonCollection();
-    if (persistMigrations && !currentAmazonCollectionJob() && (products.length > savedProductCount || profitFormulaMigrated || amazonPriceMigrated || supplierPipelineMigrated || recoveredAmazonErrorsReconciled)) {
+    if (persistMigrations && !runState.archivedAt && !currentAmazonCollectionJob() && (products.length > savedProductCount || profitFormulaMigrated || amazonPriceMigrated || supplierPipelineMigrated || recoveredAmazonErrorsReconciled)) {
       setTimeout(() => void persistCurrentRun({ notify: true }), 0);
     }
     if (autoResume && !runState.archivedAt) scheduleAmazonRunResume();
@@ -3488,7 +3489,7 @@ import {
     if (uploading || runState.archivedAt) {
       button.disabled = true;
       button.innerHTML = uploading ? "正在载入新文件…" : "已归档，请上传新文件";
-      setText("analysisRequirementText", uploading ? "新文件确认可用后，旧任务将取消并归档。" : "当前为归档记录，可查看结果；上传新文件后开始新任务。");
+      setText("analysisRequirementText", uploading ? "新文件确认可用后，旧任务将取消并归档。" : "当前为归档记录，采集已停止，可继续编辑商品、初审和导出。");
       return;
     }
     if (collectionLocked) {
@@ -4788,6 +4789,7 @@ import {
   }
 
   function mergeAnalyzedCandidateProducts(items) {
+    if (runState.archivedAt) return;
     const byId = new Map(products.map((product) => [product.id, product]));
     (items || []).map(mapCandidateProduct).forEach((incoming) => {
       const existing = byId.get(incoming.id);
@@ -6136,6 +6138,7 @@ import {
   }
 
   async function request1688ImageSearch(product, signal) {
+    if (runState.archivedAt) throw createRunError("RUN_ARCHIVED", "归档任务的采集已停止，可手工编辑、初审和导出。");
     if (isAnalysisReadOnly(product)) throw createRunError("ANALYSIS_ALREADY_HANDED_OFF", "初筛资料已交接，后续厂家匹配请在采购端进行。");
     const request = () => apiRequest("/api/1688/image-search", {
       method: "POST",
@@ -6172,7 +6175,7 @@ import {
   }
 
   function apply1688SearchResult(product, data = {}) {
-    if (isAnalysisReadOnly(product) || isManualCostProduct(product)) return;
+    if (runState.archivedAt || isAnalysisReadOnly(product) || isManualCostProduct(product)) return;
     const procurementTaskId = validProcurementTaskId(data.procurementTaskId || data.audit?.procurementTaskId);
     if (procurementTaskId) product.supplierProcurementTaskId = procurementTaskId;
     const rawQuotes = Array.isArray(data.quotes) ? data.quotes : Array.isArray(data.items) ? data.items : [];
@@ -8002,7 +8005,7 @@ import {
     const dialog = byId("manualCostDialog");
     if (!product || !dialog) return;
     if (isAnalysisReadOnly(product)) { showToast("该商品已交接采购，请在采购端修改详细成本。", "info", 4800); return; }
-    if (product.supplierSearchStatus === "searching") {
+    if (isProductSupplierBusy(product)) {
       showToast("这个商品正在匹配 1688，完成后即可修改。", "info", 4200);
       return;
     }
@@ -8312,7 +8315,7 @@ import {
 
   function syncManualCostReadOnlyState() {
     const product = products.find((item) => item.id === (manualCostDraft?.productId || activeProductId));
-    const productBusy = product?.supplierSearchStatus === "searching" || isAnalysisReadOnly(product) || isCollectionWriteLocked();
+    const productBusy = isProductSupplierBusy(product) || isAnalysisReadOnly(product) || isCollectionWriteLocked();
     const openButton = byId("openManualCostButton");
     if (openButton) openButton.disabled = Boolean(productBusy);
     ["manualCostFbaMode", "manualCostFbmMode", "manualPurchaseCost", "manualPieceCount", "manualFulfillmentFee", "saveManualCostButton", "manualCostApproveButton"].forEach((id) => {
@@ -8344,7 +8347,7 @@ import {
     if (approveButton) {
       const product = products.find(item => item.id === manualCostDraft?.productId);
       const reason = preliminaryReviewBlockingReason(product, manualCostDraft?.profitInputs?.actualWeightKg, manualCostDraft?.activeMode);
-      approveButton.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || product.supplierSearchStatus === "searching" || Boolean(reason);
+      approveButton.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || isProductSupplierBusy(product) || Boolean(reason);
       approveButton.title = reason || "保存并初审；完整利润可后续计算";
     }
   }
@@ -8485,7 +8488,7 @@ import {
     const approveButton = byId("manualCostApproveButton");
     if (approveButton) {
       const reason = preliminaryReviewBlockingReason(product, manualCostDraft.profitInputs.actualWeightKg, manualCostDraft.activeMode);
-      approveButton.disabled = product.supplierSearchStatus === "searching" || Boolean(reason);
+      approveButton.disabled = isProductSupplierBusy(product) || Boolean(reason);
       approveButton.title = reason || "保存当前成本并初审通过";
     }
     const confidence = byId("manualCostConfidenceNote");
@@ -8553,7 +8556,7 @@ import {
       return;
     }
     syncManualDraftAutomaticFbaFee(product);
-    if (product.supplierSearchStatus === "searching") {
+    if (isProductSupplierBusy(product)) {
       setManualCostError("这个商品正在匹配 1688，完成后即可保存。其他商品仍可补填。");
       return;
     }
@@ -9048,16 +9051,16 @@ import {
     const handedOff = isAnalysisReadOnly(product);
     const editingLocked = handedOff || isCollectionWriteLocked();
     byId("rejectProductButton").disabled = editingLocked || product.reviewStatus === "rejected";
-    byId("rematchProductButton").disabled = editingLocked || analysisRunning || product.supplierSearchStatus === "searching";
-    if (byId("openManualCostButton")) byId("openManualCostButton").disabled = editingLocked || product.supplierSearchStatus === "searching";
-    PROFIT_EDITOR_INPUT_IDS.forEach((id) => { if (byId(id)) byId(id).disabled = editingLocked || product.supplierSearchStatus === "searching"; });
+    byId("rematchProductButton").disabled = Boolean(runState.archivedAt) || editingLocked || analysisRunning || isProductSupplierBusy(product);
+    if (byId("openManualCostButton")) byId("openManualCostButton").disabled = editingLocked || isProductSupplierBusy(product);
+    PROFIT_EDITOR_INPUT_IDS.forEach((id) => { if (byId(id)) byId(id).disabled = editingLocked || isProductSupplierBusy(product); });
     syncProfitEditorSaveButton(product);
     const handoffNotice = byId("drawerAnalysisHandoffNote");
     if (handoffNotice) handoffNotice.hidden = !handedOff;
     renderAnalysisVersionActions(product);
     const editReason = isCollectionWriteLocked() ? "采集管理期间可查看和筛选，完成后可编辑。" : handedOff ? "已交接快照受保护；点击“创建新的分析版本”后可继续编辑和匹配。" : "手工补齐Amazon信息与采购成本，并实时重算本次初步利润。";
-    byId("openManualCostButton").title = product.supplierSearchStatus === "searching" ? "当前商品正在匹配，完成后可手工编辑。" : editReason;
-    byId("rematchProductButton").title = editingLocked ? editReason : analysisRunning || product.supplierSearchStatus === "searching" ? "当前分析或匹配进行中，完成后可重新匹配。" : "使用原共享1688服务，为当前商品重新匹配参考厂家。";
+    byId("openManualCostButton").title = isProductSupplierBusy(product) ? "当前商品正在匹配，完成后可手工编辑。" : editReason;
+    byId("rematchProductButton").title = runState.archivedAt ? "归档任务的采集已停止，可手工编辑、初审和导出。" : editingLocked ? editReason : analysisRunning || isProductSupplierBusy(product) ? "当前分析或匹配进行中，完成后可重新匹配。" : "使用原共享1688服务，为当前商品重新匹配参考厂家。";
     initIcons();
   }
 
@@ -9077,7 +9080,7 @@ import {
     const supplierSummary = byId("supplierSummary");
     if (supplierSummary) {
       supplierSummary.innerHTML = waitingForSupplier
-        ? escapeHtml(product.supplierSearchStatus === "searching" ? "匹配中" : "待处理")
+        ? escapeHtml(isProductSupplierBusy(product) ? "匹配中" : "待处理")
         : ["complete", "fallback_estimate"].includes(product.supplierSearchStatus) && Number.isFinite(product.supplierAverageCny)
           ? cnyCurrencyPairHtml(product.supplierAverageCny, product.marketplace, { compact: true })
           : escapeHtml(`${availableSupplierCount} / ${INCLUDED_1688_QUOTES} 家`);
@@ -9208,10 +9211,10 @@ import {
 
   function syncProfitEditorSaveButton(product) {
     const button = byId("saveProfitEditsButton");
-    if (button) button.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || product.supplierSearchStatus === "searching";
+    if (button) button.disabled = !product || isCollectionWriteLocked() || isAnalysisReadOnly(product) || isProductSupplierBusy(product);
     if (isCollectionWriteLocked()) setProfitEditorStatus("后台任务执行中；暂停并等待当前请求结束后可编辑。");
     else if (isAnalysisReadOnly(product)) setProfitEditorStatus("已交接资料受保护；创建新的分析版本后可编辑。");
-    else if (product?.supplierSearchStatus === "searching") setProfitEditorStatus("当前商品正在匹配，完成后可编辑。");
+    else if (isProductSupplierBusy(product)) setProfitEditorStatus("当前商品正在匹配，完成后可编辑。");
   }
 
   function profitEditorInputValues() {
@@ -9483,7 +9486,7 @@ import {
       || changed(product.billingWeight, values.billingWeight)
     );
     const alreadyApproved = product.reviewStatus === "approved" && !decisionInputsChanged;
-    const productBusy = product.supplierSearchStatus === "searching";
+    const productBusy = isProductSupplierBusy(product);
     const validationMessage = editorValidationMessage(product, values, true);
     button.disabled = productBusy || Boolean(validationMessage) || alreadyApproved;
     button.title = productBusy
@@ -9500,7 +9503,7 @@ import {
     const product = products.find((item) => item.id === activeProductId);
     if (!product) return false;
     if (isAnalysisReadOnly(product)) return false;
-    if (product.supplierSearchStatus === "searching") {
+    if (isProductSupplierBusy(product)) {
       if (!silentInvalid) showToast("这个商品正在匹配 1688，完成后即可修改。", "info", 4200);
       return false;
     }
@@ -9625,7 +9628,7 @@ import {
     const product = products.find((item) => item.id === activeProductId);
     if (!product) return;
     if (isAnalysisReadOnly(product)) return;
-    if (product.supplierSearchStatus === "searching") {
+    if (isProductSupplierBusy(product)) {
       showToast("这个商品正在匹配 1688，完成后即可初审。", "info", 4200);
       return;
     }
@@ -9652,6 +9655,7 @@ import {
   }
 
   async function rematchActiveProduct() {
+    if (runState.archivedAt) return;
     if (collectionWriteBlocked()) return;
     const product = products.find((item) => item.id === activeProductId);
     if (!product) return;
@@ -10206,7 +10210,7 @@ import {
       const dateLabel = validTime ? time.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" }) : "--";
       const timeLabel = validTime ? time.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "--:--";
       const statusLabel = summary.archivedAt || summary.status === "cancelled"
-        ? "已取消并归档" : summary.status === "paused" ? "已暂停" : summary.status === "running" ? "采集中" : summary.status === "failed"
+        ? "已归档 · 可编辑初审" : summary.status === "paused" ? "已暂停" : summary.status === "running" ? "采集中" : summary.status === "failed"
         ? "未完成"
         : summary.status === "collecting" ? "已采集" : summary.mode === "mock" ? "模拟数据" : summary.mode === "mixed" ? "混合估算" : "已完成";
       const statusState = summary.status === "failed" ? "error" : summary.mode || "live";
@@ -10285,8 +10289,12 @@ import {
     };
   }
 
+  function isProductSupplierBusy(product) {
+    return !runState.archivedAt && product?.supplierSearchStatus === "searching";
+  }
+
   function isAnalysisReadOnly(product) {
-    return Boolean(runState.archivedAt) || product?.analysisHandoff?.owner === "procurement" || analysisHandoffPendingIds.has(product?.id) || analysisVersionPendingIds.has(product?.id);
+    return product?.analysisHandoff?.owner === "procurement" || analysisHandoffPendingIds.has(product?.id) || analysisVersionPendingIds.has(product?.id);
   }
 
   function analysisVersionBlockedReason(product) {
@@ -10419,7 +10427,7 @@ import {
     const button = byId("exportAnalysisHandoffButton");
     if (button) {
       const reviewed = getExportProducts("approved", candidates);
-      const updating = reviewed.some((product) => product.supplierSearchStatus === "searching");
+      const updating = reviewed.some((product) => isProductSupplierBusy(product));
       const disabledReason = isCollectionWriteLocked() ? "后台采集完成后可编辑、初审和导出。" : exportRunning ? "导出正在保存，请等待完成。" : analysisVersionPendingIds.size ? "新的分析版本正在保存，请等待完成。" : !runState.id ? "请先导入店铺或 ASIN 并开始分析任务。" : runState.mode === "mock" ? "演示数据仅用于体验，不能导出采购交接资料。" : !reviewed.length ? "请先人工初审通过需要导出的商品。" : updating ? "已初审商品的报价正在更新，结束后即可导出。" : "";
       button.disabled = Boolean(disabledReason);
       button.title = disabledReason || "可选：仅将您已人工初审的商品保存为Excel及JSON；资料缺项保留并标记草稿。";
@@ -10445,7 +10453,7 @@ import {
     const exportRows = getExportProducts("approved");
     if (!exportRows.length) { showToast(isMonthlySalesFilterRequired(currentTaskInputMode(), activeRunCriteria.monthlySalesBand) ? "暂无具备有效月销量至少 50 且已初审通过的商品。" : "暂无已初审通过的商品。", "info", 4800); return; }
     if (!market || exportRows.some((product) => product.marketplace !== market.code)) { showToast("已初审商品存在站点不一致，未导出。", "error", 4800); return; }
-    if (exportRows.some((product) => product.supplierSearchStatus === "searching")) { showToast("已初审商品的报价正在更新，结束后即可导出。", "info", 4800); return; }
+    if (exportRows.some((product) => isProductSupplierBusy(product))) { showToast("已初审商品的报价正在更新，结束后即可导出。", "info", 4800); return; }
     // Freeze the user's manual selection once; workbook and JSON share this same snapshot.
     const selectedSnapshot = exportRows.map((product) => structuredClone(product));
     const worksheet = createSpreadsheetExportPayload(selectedSnapshot, market, "已初审产品");

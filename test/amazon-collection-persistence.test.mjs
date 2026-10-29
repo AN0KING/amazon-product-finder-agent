@@ -520,6 +520,53 @@ test("replacement archives preserve manual values, quotes, collected results and
   assert.equal((await restarted.getOverview()).runs[0].archiveReason, "USER_REPLACED");
 });
 
+test("archived manual edits and approval survive restart while task state and other active pointers stay frozen", async () => {
+  const runId = 'archived-review-edits';
+  const store = await storeWithSnapshot(runId);
+  await store.updateAmazonCollection(runId, () => ({ job: { owner: 'server', runId, revision: 1, status: 'paused', enabled: false }, items: { [asin]: result() } }), { activate: true });
+  await store.updateSupplierSnapshot(runId, snapshot => {
+    snapshot.runState.supplier1688Pipeline = { owner: 'server', status: 'paused', enabled: false, revision: 1 };
+  });
+  await store.archiveRun(runId);
+  const frozen = await store.getRunSnapshot(runId);
+  const other = 'active-review-neighbour';
+  await store.saveSnapshot({ runState: { id: other, marketplace: 'CA', mode: 'live' }, products: [] });
+  await store.updateAmazonCollection(other, () => ({ job: { owner: 'server', runId: other, revision: 1, status: 'paused', enabled: false }, items: {} }), { activate: true });
+  await store.setActiveSupplierRunId(other);
+  const otherBytes = await readFile(store.runPath(other), 'utf8');
+  const edited = structuredClone(frozen);
+  Object.assign(edited.products[0], { name: 'Edited historical title', manualSalePrice: true, salePrice: 33, manualBillingWeight: true, billingWeight: 0.75, purchaseCost: 17, reviewStatus: 'approved' });
+  // UI state cannot revive the archived collectors or change the original import.
+  edited.runState.status = 'running';
+  edited.runState.marketplace = 'AU';
+  edited.runState.amazonCollectionJob.enabled = true;
+  edited.runState.supplier1688Pipeline.status = 'running';
+  edited.storeList = { stores: [{ asins: [otherAsin] }] };
+  const saved = await store.saveSnapshot(edited);
+  assert.equal(saved.summary.status, 'cancelled');
+  assert.equal(saved.summary.approvedCount, 1);
+  const restarted = new PersistenceStore({ directory: store.directory });
+  const reloaded = await restarted.getRunSnapshot(runId);
+  assert.deepEqual(reloaded.products, edited.products);
+  assert.deepEqual(reloaded.runState, frozen.runState);
+  assert.deepEqual(reloaded.storeList, frozen.storeList);
+  assert.deepEqual(reloaded.amazonCollection, frozen.amazonCollection);
+  assert.equal((await restarted.getOverview()).latestRunId, other);
+  assert.equal((await restarted.getActiveAmazonCollection()).runId, other);
+  assert.equal(await restarted.getActiveSupplierRunId(), other);
+  assert.equal(await readFile(store.runPath(other), 'utf8'), otherBytes);
+  for (const change of [
+    draft => { delete draft.runState.archivedAt; },
+    draft => { draft.products.push(product({ id: `CA:${otherAsin}`, asin: otherAsin })); },
+    draft => { draft.products[0].asin = otherAsin; },
+  ]) {
+    const draft = structuredClone(reloaded);
+    change(draft);
+    await assert.rejects(restarted.saveSnapshot(draft), error => ['RUN_ARCHIVED', 'ARCHIVED_PRODUCT_SCOPE_CHANGED'].includes(error.code));
+    assert.deepEqual(await restarted.getRunSnapshot(runId), reloaded);
+  }
+});
+
 test("late writes and pointer activation cannot mutate or reopen an archived run", async () => {
   const runId = "archive-write-barrier";
   const store = await storeWithSnapshot(runId);

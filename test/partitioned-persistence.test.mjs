@@ -144,6 +144,15 @@ test("archived partitioned runs cannot be reactivated or lose historical manual 
   const snapshot = await store.getRunSnapshot("archive");
   assert.deepEqual(snapshot.products, document.snapshot.products);
   assert.equal((await store.getAmazonCollectionJob("archive")).enabled, false);
+  snapshot.products[0].purchaseCost = 27;
+  snapshot.products[0].reviewStatus = 'approved';
+  await store.saveSnapshot(snapshot);
+  const restarted = new PersistenceStore({ directory: store.directory });
+  const edited = await restarted.getRunSnapshot('archive');
+  assert.equal(edited.products[0].purchaseCost, 27);
+  assert.equal(edited.products[0].reviewStatus, 'approved');
+  assert.equal(edited.runState.archivedAt, snapshot.runState.archivedAt);
+  assert.equal((await restarted.getAmazonCollectionJob('archive')).enabled, false);
 });
 
 
