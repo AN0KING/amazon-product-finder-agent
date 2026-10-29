@@ -7,6 +7,7 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import * as priceState from "../lib/amazon-price-state.mjs";
 import * as profitModel from "../lib/profit-model.mjs";
+import * as operationsExport from "../lib/operations-export.mjs";
 import * as pieceCount from "../lib/title-piece-count.mjs";
 import * as handoff from "../lib/analysis-handoff.mjs";
 import * as coverage from "../lib/analysis-coverage.mjs";
@@ -17,6 +18,125 @@ import { applySupplierProfitResult } from "../lib/supplier-profit-result.mjs";
 import { normalizeExportFileName } from "../lib/export-file-store.mjs";
 
 const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
+
+const selectedFactory = 'https://detail.1688.com/offer/100000001.html';
+const manualFactory = 'https://detail.1688.com/offer/100000002.html';
+function supplierChoiceFixture(archived = false) {
+  const f = harness();
+  const saved = snapshot({ ...job(archived ? 'cancelled' : 'completed'), enabled: false });
+  if (archived) saved.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  saved.products[0].suppliers[0].url = selectedFactory;
+  saved.products[0].reviewStatus = 'approved';
+  f.app.restore(saved, { persistMigrations: false }); f.app.bindEditor(); f.app.view(productId, 1, {});
+  f.app.renderSupplierList(f.app.state().products[0]);
+  f.respond(async path => { assert.equal(path, '/api/runs'); return { runs: [] }; });
+  return f;
+}
+async function chooseFactory(f, value = selectedFactory) {
+  const radio = { value, closest: () => radio };
+  for (const listener of f.element('supplierList').listeners.change) await listener({ target: radio });
+}
+async function typeFactory(f, value) {
+  f.element('supplierManualUrl').value = value;
+  await f.fire('supplierManualUrl', 'input');
+}
+
+for (const archived of [false, true]) test(`supplier choice persists and exports without changing financial data, archived=${archived}`, async () => {
+  const f = supplierChoiceFixture(archived);
+  const before = structuredClone(f.app.state().products[0]);
+  assert.match(f.element('supplierList').innerHTML, /type="radio"/);
+  await chooseFactory(f);
+  const saved = f.calls.at(-1).body;
+  assert.equal(saved.products[0].supplierChoice.selectedUrl, selectedFactory);
+  assert.deepEqual({ ...saved.products[0], supplierChoice: undefined }, { ...before, supplierChoice: undefined });
+  await typeFactory(f, manualFactory);
+  await chooseFactory(f, 'https://detail.1688.com/offer/100000003.html');
+  assert.equal(operationsExport.chosenSupplierUrl(f.app.state().products[0]), manualFactory);
+  const persisted = f.calls.at(-1).body;
+  const reloaded = harness(); reloaded.app.restore(persisted, { persistMigrations: false });
+  assert.equal(operationsExport.chosenSupplierUrl(reloaded.app.state().products[0]), manualFactory);
+  const payload = reloaded.app.spreadsheet(reloaded.app.state().products);
+  assert.equal(payload.rows[0][payload.headers.indexOf('1688厂家链接')], manualFactory);
+  await typeFactory(f, ''); await f.fire('saveSupplierChoiceButton', 'click');
+  assert.equal(operationsExport.chosenSupplierUrl(f.app.state().products[0]), 'https://detail.1688.com/offer/100000003.html');
+});
+
+test('operations export flushes unsaved link, preserves saved amounts and performs no profit recalculation', async () => {
+  const f = supplierChoiceFixture(true);
+  const product = f.app.state().products[0];
+  product.profitCalculation = { totalCost: 77, profit: -59, margin: -327.7,
+    domesticFreightCny: 6, parts: { purchase: 7, commission: 8, fxLoss: 9, marketing: 10, management: 0, returns: 11, freight: 12 } };
+  const before = JSON.stringify(product.profitCalculation);
+  await typeFactory(f, manualFactory);
+  f.app.forbidExportRecalculation();
+  await f.app.exportApproved();
+  assert.equal(f.exports.length, 1, JSON.stringify(f.toasts));
+  const payload = f.exports[0], row = payload.rows[0];
+  for (const [header, value] of [['1688厂家链接', manualFactory], ['佣金占比（AUD）', 8], ['汇率折损费（AUD）', 9],
+    ['Marketing（AUD）', 10], ['管理费（AUD）', 0], ['退货率损失（AUD）', 11], ['总成本（AUD）', 77],
+    ['总利润额（AUD）', -59], ['VAT（AUD）', operationsExport.OPERATIONS_MISSING]]) {
+    assert.equal(row[payload.headers.indexOf(header)], value, header);
+  }
+  assert.equal(JSON.stringify(product.profitCalculation), before);
+  assert.equal(f.calls.at(-1).body.products[0].supplierChoice.manualUrl, manualFactory);
+});
+
+test('invalid or failed manual supplier saves block export and retain the draft for retry', async () => {
+  const f = supplierChoiceFixture();
+  await chooseFactory(f);
+  await typeFactory(f, 'https://1688.com.evil.example/wrong');
+  await f.app.exportAll();
+  assert.equal(f.exports.length, 0); assert.equal(f.calls.length, 1);
+  await typeFactory(f, manualFactory);
+  f.respond(async () => { throw new Error('Synthetic disk failure'); });
+  await f.app.exportAll();
+  assert.equal(f.exports.length, 0);
+  assert.equal(f.app.state().products[0].supplierChoice.selectedUrl, selectedFactory);
+  assert.equal(f.app.state().products[0].supplierChoice.manualUrl, '');
+  assert.equal(f.element('supplierManualUrl').value, manualFactory);
+  f.respond(async () => ({ runs: [] }));
+  await f.app.exportAll();
+  assert.equal(f.exports.length, 1);
+  assert.equal(f.app.state().products[0].supplierChoice.manualUrl, manualFactory);
+});
+
+test('a newer supplier draft waits for its in-flight save before export', async () => {
+  const f = supplierChoiceFixture();
+  let release, started;
+  const began = new Promise(resolve => { started = resolve; });
+  const deferred = new Promise(resolve => { release = resolve; });
+  let requests = 0;
+  f.respond(async () => { if (++requests === 1) { started(); await deferred; } return { runs: [] }; });
+  await typeFactory(f, selectedFactory);
+  const saving = f.app.saveSupplierChoice(); await began;
+  await typeFactory(f, manualFactory);
+  const exporting = f.app.exportAll();
+  release(); await saving; await exporting;
+  assert.equal(requests, 2);
+  assert.equal(f.calls.at(-1).body.products[0].supplierChoice.manualUrl, manualFactory);
+  assert.equal(f.exports.length, 1);
+  assert.equal(f.exports[0].rows[0][35], manualFactory);
+});
+
+test('actual supplier result updates retain the saved manual and radio links', () => {
+  const product = { ...canonicalProduct(), manualPurchaseCost: false, supplierChoice: { selectedUrl: selectedFactory, manualUrl: manualFactory } };
+  const updated = applySupplierProfitResult(product, { quotes: [], status: 'no_quotes' }, snapshot(job('completed'), [product]));
+  assert.notEqual(updated, product);
+  assert.deepEqual(updated.supplierChoice, product.supplierChoice);
+});
+
+test('supplier editing respects active collection and procurement ownership locks', async () => {
+  for (const protection of ['collection', 'procurement']) {
+    const f = supplierChoiceFixture();
+    await typeFactory(f, manualFactory);
+    if (protection === 'collection') f.app.apply(job('running', 2));
+    else f.app.state().products[0].analysisHandoff = { owner: 'procurement' };
+    f.app.renderSupplierList(f.app.state().products[0]);
+    assert.equal(f.element('supplierManualUrl').disabled, true);
+    assert.equal(await f.app.saveSupplierChoice(), false);
+    assert.equal(f.calls.length, 0);
+  }
+});
 const runId = "synthetic-server-run";
 const productId = "AU:B000000001";
 const job = (status = "running", revision = 1) => ({ owner: "server", runId, status, revision, enabled: !["paused", "needs_attention", "completed"].includes(status), workerActive: status === "running", counts: { total: 1, processed: 0, pending: 1 } });
@@ -67,7 +187,7 @@ function harness() {
   let today = "2026-10-13";
   let respond = async (path) => { throw new Error(`Unexpected API request: ${path}`); };
   const context = vm.createContext({
-    ...reviewRange, ...salesPolicy, ...priceState, ...listingDate, ...profitModel, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
+    ...reviewRange, ...salesPolicy, ...priceState, ...listingDate, ...profitModel, ...operationsExport, ...pieceCount, ...handoff, ...coverage, ...detailRetry,
     todayDateOnly: () => today,
     document: { body: element("body"), documentElement: element("html"), addEventListener() {}, getElementById: element, querySelector: element, querySelectorAll() { return []; } },
     window: { sessionStorage: { getItem: key => preferences.has(key) ? preferences.get(key) : null, setItem: (key, value) => preferences.set(key, value) },
@@ -125,6 +245,8 @@ function harness() {
       applySession: (auth, queue) => apply1688SessionStatus(auth, queue),
       applySupplierResult: apply1688SearchResult, row: (id) => renderProductRow(products.find(product => product.id === id)),
       spreadsheet: (items, market = activeMarket.code) => createSpreadsheetExportPayload(items, MARKET_CONFIGS[market]),
+      saveSupplierChoice, renderSupplierList, flushSupplierChoices,
+      forbidExportRecalculation: () => { calculateProfit = ensureProductPurchasePricing = ensureProductProfitInputs = ensureFulfillmentState = () => { throw new Error('Export must not recalculate'); }; },
       fetchLegacy: () => fetchProductCandidates(storeList.stores, runState.criteria, new AbortController().signal, () => {}),
       fetchProvider: () => fetchProductCandidates(storeList.stores, runState.criteria, new AbortController().signal, () => {}, { allowSellerSprite: true }),
       mutate: () => { approveActiveProduct(); rejectActiveProduct(); rematchActiveProduct(); saveManualCost(); commitProfitEdits(false); exportProducts(); exportAnalysisHandoff(); },
@@ -139,7 +261,7 @@ function harness() {
       exportCounts: syncExportMenuCounts, handoffSummary: renderAnalysisHandoffSummary, exportHandoff: exportAnalysisHandoff, newVersion: createNewAnalysisVersion,
       renderResults: originalResults, handoffInput: buildAnalysisHandoffInput, taskMode: currentTaskInputMode,
       mergeRecords: mergeCandidateRecords, setupCriteria: () => ({ useSellerSprite: false }),
-      startMatching: startFiltered1688Matching, renderSupplier: renderSupplier1688Stage,
+      startMatching: startFiltered1688Matching, rematch: rematchActiveProduct, renderSupplier: renderSupplier1688Stage,
       batch: (items) => run1688ImageSearchBatch(items, new AbortController().signal),
       prepareSupplier: (...args) => prepareAmazonCollectionForSupplier(...args),
       releaseSupplier: (...args) => releaseAmazonCollectionAfterSupplier(...args),
@@ -2197,6 +2319,46 @@ test('archived approved products can export a handoff and create an editable ver
   assert.equal(persisted.runState.archivedAt, saved.runState.archivedAt);
 });
 
+for (const route of ['filtered', 'single']) test(`archived ${route} matching saves its selection and resumes only the supplier queue`, async () => {
+  const fixture = harness();
+  const { app, calls } = fixture;
+  const saved = snapshot({ ...job('cancelled'), enabled: false }, [imageCandidate(1), imageCandidate(2)]);
+  saved.runState.archivedAt = '2026-10-12T03:30:00.000Z';
+  let stored = structuredClone(saved);
+  fixture.respond(async (path, options) => {
+    if (path === '/api/runs') { stored = JSON.parse(options.body); return { runs: [] }; }
+    if (path === `/api/runs/${runId}`) return structuredClone(stored);
+    assert.equal(path, '/api/1688/pipeline/control', 'history must not pause/adopt/start the Amazon collector');
+    const command = JSON.parse(options.body);
+    if (command.action === 'select_archived') {
+      assert.equal(command.archivedAt, saved.runState.archivedAt);
+      assert.equal(command.rematch, route === 'single');
+      assert.deepEqual(command.productIds, route === 'single' ? [productId] : saved.products.map(product => product.id));
+      stored.runState.supplier1688Pipeline = { runId, owner: 'server', status: 'paused', enabled: false,
+        authorizedArchivedAt: command.archivedAt, productIds: command.productIds, remaining: command.productIds.length, revision: 1 };
+    } else {
+      assert.equal(command.action, 'resume');
+      Object.assign(stored.runState.supplier1688Pipeline, { status: 'queued', enabled: true, revision: 2 });
+    }
+    return structuredClone(stored.runState.supplier1688Pipeline);
+  });
+  app.restore(saved, { persistMigrations: false });
+  app.setSupplierLoggedIn(true);
+  app.openLocalDrawer(productId);
+  assert.equal(fixture.element('rematchProductButton').disabled, false);
+  assert.equal(await (route === 'single' ? app.rematch() : app.startMatching()), true, JSON.stringify(fixture.toasts));
+  assert.equal(app.locked(), true, 'an active historical supplier queue locks manual editing');
+  assert.equal(app.state().runState.archivedAt, saved.runState.archivedAt);
+  assert.equal(app.state().runState.amazonCollectionJob.status, 'cancelled');
+  assert.equal(calls.filter(call => call.path === '/api/1688/pipeline/control').length, 2);
+  stored.products[0].supplierSearchStatus = 'complete';
+  stored.products[0].purchaseCost = 13;
+  Object.assign(stored.runState.supplier1688Pipeline, { status: 'complete', enabled: false, remaining: 0, revision: 3 });
+  await app.refresh();
+  assert.equal(app.state().products[0].purchaseCost, 13);
+  assert.equal(app.locked(), false);
+});
+
 test('opening archived history preserves approvals and ignores late collected or supplier results', () => {
   const { app, calls } = harness();
   const saved = snapshot({ ...job('cancelled'), enabled: false }, [{ ...canonicalProduct(), reviewStatus: 'approved', manualPurchaseCost: false }]);
@@ -3541,12 +3703,12 @@ for (const [marketplace, currency] of [["AU", "AUD"], ["CA", "CAD"]]) {
       "履约方式", `FBA 配送费 (${currency})`, "FBA 配送费 (CNY)", "空运单价 (CNY/kg)", "单件空运头程 (CNY)",
       "Amazon 佣金率 (%)", "汇损率 (%)", "营销费率 (%)", "管理费率 (%)", "退货预留率 (%)",
       `预估总成本 (${currency})`, "预估总成本 (CNY)", `预估单件利润 (${currency})`, "预估单件利润 (CNY)", "预估经营利润率 (%)", "数据采集时间", "重量来源"];
-    assert.deepEqual(Array.from(payload.headers), expected);
+    assert.deepEqual(Array.from(payload.headers), [...expected, ...operationsExport.operationsColumnHeaders(currency)]);
     assert.equal(payload.layout, "reviewed-products-v1");
     assert.equal(payload.imageColumnIndex, 1);
     assert.equal(payload.columnFormats[13], "yyyy-mm-dd");
-    assert.equal(payload.columnFormats.length, 35);
-    assert.deepEqual(Array.from(payload.rows, row => row.length), [35, 35, 35]);
+    assert.equal(payload.columnFormats.length, 55);
+    assert.deepEqual(Array.from(payload.rows, row => row.length), [55, 55, 55]);
     assert.equal(payload.rows[0][13], 45351, "2024-02-29 is a numeric Excel date, independent of local timezone");
     assert.equal(payload.rows[1][13], "", "unknown Amazon date never falls back to SellerSprite");
     assert.equal(payload.rows[2][13], "");

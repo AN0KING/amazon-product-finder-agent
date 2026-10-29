@@ -35,7 +35,7 @@ test('reviewed-product layout keeps template widths, fonts, borders, rows, froze
   assert.equal(sheet('pane').attr('ySplit'), '1');
   assert.equal(sheet('sheetView').attr('showGridLines'), '0');
   assert.equal(sheet('sheetFormatPr').attr('defaultRowHeight'), '12.75');
-  assert.equal(sheet('row[r="1"]').attr('ht'), '24');
+  assert.equal(sheet('row[r="1"]').attr('ht'), '48');
   assert.equal(sheet('row[r="2"]').attr('ht'), '80');
   assert.deepEqual(sheet('row[r="1"] c').toArray().map(node => sheet(node).text()), headers);
   assert.equal(styles('fonts font').first().find('name').attr('val'), 'Arial');
@@ -68,6 +68,18 @@ test('dates and financial values remain numeric while percentages keep template 
   assert.equal(styles('cellXfs xf').eq(Number(sheet('c[r="P2"]').attr('s'))).attr('numFmtId'), '0');
   assert.equal(sheet('c[r="N3"] v').length, 0);
   assert.equal(sheet('c[r="N3"]').attr('s'), '5');
+});
+
+for (const date of [false, true]) test(`decimal display preserves saved precision and numeric zeros, date=${date}`, async () => {
+  const { buffer } = await createEmbeddedImageWorkbook(base({ headers: ['图片', '费用（CAD）', '利润率（%）', '日期'],
+    rows: [['', 13.345678, 0, date ? 45351 : null]], columnFormats: ['General', '0.00', '0.00', date ? 'yyyy-mm-dd' : 'General'],
+    imageColumnIndex: 0 }));
+  const { sheet, styles } = contents(buffer);
+  assert.equal(sheet('c[r="B2"] v').text(), '13.345678');
+  assert.equal(sheet('c[r="C2"] v').text(), '0');
+  const cellStyle = Number(sheet('c[r="B2"]').attr('s'));
+  assert.equal(styles('cellXfs xf').eq(cellStyle).attr('numFmtId'), '2');
+  assert.equal(sheet('f').length, 0);
 });
 
 test('sparse cells and image entries retain row alignment and formula-looking source strings remain literal', async () => {

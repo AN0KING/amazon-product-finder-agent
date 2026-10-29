@@ -223,6 +223,17 @@ syncBuiltinESMExports();
   await store.setActiveSupplierRunId(supplierRunId);
 
   const first = await startServer();
+  const appAsset = await fetch(`${first.origin}/app.js`);
+  assert.equal(appAsset.status, 200);
+  const appText = await appAsset.text();
+  const browserModules = [...appText.matchAll(/from\s+["'](\.\/lib\/[^"']+)["']/g)].map(match => match[1]);
+  assert.ok(browserModules.includes('./lib/operations-export.mjs'));
+  for (const modulePath of browserModules) {
+    const response = await fetch(new URL(modulePath, first.origin));
+    assert.equal(response.status, 200, `Browser module must be served: ${modulePath}`);
+    assert.match(response.headers.get('content-type'), /javascript/);
+    assert.ok((await response.text()).trim());
+  }
   const policyAsset = await fetch(first.origin + "/lib/amazon-sales-policy.mjs");
   assert.equal(policyAsset.status, 200);
   assert.match(await policyAsset.text(), /hasQualifyingAmazonMonthlySales/);
@@ -396,6 +407,7 @@ syncBuiltinESMExports();
   assert.notEqual(replacementSnapshot.products[0].purchaseCost, 457, "The new run must not inherit manual values from the archived run.");
   assert.deepEqual((await callApi(afterArchiveRestart.origin, `/api/runs/${runId}`)).body.data, archiveSnapshot);
   const manualReview = structuredClone(archiveSnapshot);
+  manualReview.products[0].supplierChoice = { selectedUrl: 'https://detail.1688.com/offer/100000001.html', manualUrl: 'https://detail.1688.com/offer/100000002.html' };
   Object.assign(manualReview.products[0], { name: 'Historical edited product', englishName: 'Historical edited product', salePrice: 31.5, manualSalePrice: true, billingWeight: 0.75, manualBillingWeight: true, reviewStatus: 'approved' });
   const saveReview = await callApi(afterArchiveRestart.origin, '/api/runs', { method: 'POST', body: manualReview });
   assert.equal(saveReview.status, 200);
@@ -436,5 +448,28 @@ syncBuiltinESMExports();
   assert.deepEqual(persistedReview.products, reviewedSnapshot.products);
   assert.deepEqual(persistedReview.runState, archiveSnapshot.runState);
   assert.equal((await callApi(reviewedRestart.origin, '/api/state')).body.data.latestRunId, replacementRunId);
+  const historicalSelection = await callApi(reviewedRestart.origin, '/api/1688/pipeline/control', { method: 'POST', body: {
+    runId: supplierRunId, action: 'select_archived', archivedAt: archivedSupplierSnapshot.runState.archivedAt, productIds: [newId],
+  } });
+  assert.equal(historicalSelection.status, 200, JSON.stringify(historicalSelection.body));
+  assert.equal(historicalSelection.body.data.status, 'paused');
+  assert.equal(historicalSelection.body.data.enabled, false);
+  assert.equal(historicalSelection.body.data.authorizedArchivedAt, archivedSupplierSnapshot.runState.archivedAt);
+  assert.deepEqual(historicalSelection.body.data.tasks[matchedId], originalTask);
+  assert.equal((await callApi(reviewedRestart.origin, '/api/state')).body.data.latestRunId, replacementRunId);
+  const invalidHistoryScope = await callApi(reviewedRestart.origin, '/api/1688/pipeline/control', { method: 'POST', body: {
+    runId: supplierRunId, action: 'select_archived', archivedAt: archivedSupplierSnapshot.runState.archivedAt, productIds: ['CA:B000009999'],
+  } });
+  assert.equal(invalidHistoryScope.status, 422);
   await stopServer(reviewedRestart);
+  const historicalRestart = await startServer();
+  const resumedHistory = (await callApi(historicalRestart.origin, '/api/1688/pipeline')).body.data;
+  assert.equal(resumedHistory.runId, supplierRunId);
+  assert.equal(resumedHistory.status, 'paused');
+  const recancelled = await callApi(historicalRestart.origin, `/api/runs/${supplierRunId}/archive`, { method: 'POST', body: { reason: 'file_upload' } });
+  assert.equal(recancelled.status, 200);
+  assert.equal((await callApi(historicalRestart.origin, '/api/1688/pipeline')).body.data, null);
+  const lateResume = await callApi(historicalRestart.origin, '/api/1688/pipeline/control', { method: 'POST', body: { runId: supplierRunId, action: 'resume' } });
+  assert.equal(lateResume.body.error.code, 'RUN_ARCHIVED');
+  await stopServer(historicalRestart);
 });

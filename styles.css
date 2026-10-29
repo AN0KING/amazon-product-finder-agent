@@ -3965,6 +3965,16 @@ input[type="checkbox"]:checked {
   display: grid;
 }
 
+.supplier-choice-editor { display: grid; gap: 8px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.supplier-choice-editor > label { font-size: 12px; font-weight: 700; }
+.supplier-choice-input { display: flex; gap: 8px; }
+.supplier-choice-input input { min-width: 0; flex: 1; padding: 9px; border: 1px solid var(--line); border-radius: 4px; }
+.supplier-choice-input button { flex-shrink: 0; }
+.supplier-choice-editor p { margin: 0; font-size: 11px; color: var(--ink-faint); overflow-wrap: anywhere; }
+.supplier-offer-actions { grid-column: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.supplier-choice-radio { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer; }
+.supplier-choice-radio input { margin: 0; accent-color: var(--accent); }
+
 .supplier-item,
 .supplier-row,
 .supplier-card {

@@ -86,7 +86,7 @@ import {
 const HOST = "127.0.0.1";
 const PORT = parsePort(process.env.SCOUT_PORT || "4173");
 const ORIGIN = `http://${HOST}:${PORT}`;
-const APP_VERSION = "0.9.70";
+const APP_VERSION = "0.9.72";
 const EXPECTED_HOST = `${HOST}:${PORT}`;
 const ROOT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const JSON_BODY_LIMIT = 256 * 1024;
@@ -131,6 +131,7 @@ const STATIC_FILES = new Map([
   ["/lib/review-range.mjs", { file: "lib/review-range.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/monthly-sales-policy.mjs", { file: "lib/monthly-sales-policy.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/profit-model.mjs", { file: "lib/profit-model.mjs", type: "text/javascript; charset=utf-8" }],
+  ["/lib/operations-export.mjs", { file: "lib/operations-export.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-handoff.mjs", { file: "lib/analysis-handoff.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/analysis-coverage.mjs", { file: "lib/analysis-coverage.mjs", type: "text/javascript; charset=utf-8" }],
   ["/lib/amazon-price-state.mjs", { file: "lib/amazon-price-state.mjs", type: "text/javascript; charset=utf-8" }],
@@ -199,7 +200,7 @@ const supplierPipeline = new SupplierPipelineRunner({
   store: {
     readSnapshot: (runId) => persistenceStore.getRunSnapshot(runId),
     readPipeline: (runId) => persistenceStore.getSupplierPipelineStatus(runId),
-    updateSnapshot: (runId, updater) => persistenceStore.updateSupplierSnapshot(runId, updater),
+    updateSnapshot: (runId, updater, options) => persistenceStore.updateSupplierSnapshot(runId, updater, options),
     getActiveRunId: () => persistenceStore.getActiveSupplierRunId(),
     setActiveRunId: (runId) => persistenceStore.setActiveSupplierRunId(runId),
   },
@@ -379,14 +380,15 @@ async function routeRequest(request, response, url, signal) {
     requireMethod(request, ["POST"]);
     requireContentType(request, ["application/json"]);
     if (draining || shuttingDown) throw new HttpError(503, "SERVICE_DRAINING", "服务正在更新，请稍后继续。");
-    const { runId, action, productIds } = await readJsonBody(request);
-    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(String(runId || "")) || !["start", "resume", "pause", "discard", "append"].includes(action)) {
+    const { runId, action, productIds, archivedAt, rematch, criteria } = await readJsonBody(request);
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(String(runId || "")) || !["start", "resume", "pause", "discard", "append", "select_archived"].includes(action)) {
       throw new HttpError(422, "INVALID_SUPPLIER_CONTROL", "请指定已保存的匹配批次和有效操作。");
     }
     await supplierPipelineReady;
     const state = action === "pause" ? await supplierPipeline.pause(runId)
       : action === "discard" ? await supplierPipeline.discard(runId)
       : action === "append" ? await supplierPipeline.append(runId, productIds)
+      : action === "select_archived" ? await supplierPipeline.selectArchived(runId, { productIds, archivedAt, rematch: rematch === true, criteria })
       : await supplierPipeline.start(runId, { resume: true });
     sendJson(response, 200, { ok: true, data: state });
     if (action === "start" || action === "resume") void supplierPipeline.tick().catch(error => process.stderr.write(`Supplier pipeline: ${error.code || error.message}\n`));
@@ -591,8 +593,8 @@ async function routeRequest(request, response, url, signal) {
       await Promise.all([collectorReady, supplierPipelineReady]);
       const snapshot = await persistenceStore.getRunSnapshot(runId);
       if (!snapshot) throw new HttpError(404, "RUN_NOT_FOUND", "未找到要归档的旧任务，尚未切换文件。");
+      await supplierPipeline.cancelForReplacement(runId);
       if (!snapshot.runState.archivedAt) {
-        await supplierPipeline.cancelForReplacement(runId);
         await amazonCollector.cancelForReplacement(runId);
       }
       const data = await persistenceStore.archiveRun(runId);

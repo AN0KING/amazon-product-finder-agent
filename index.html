@@ -94,7 +94,7 @@
               </button>
             </div>
           </div>
-          <p id="sidebarVersion" data-market-version>NL v0.9.70 · 单次任务</p>
+          <p id="sidebarVersion" data-market-version>NL v0.9.72 · 单次任务</p>
         </div>
       </aside>
 
@@ -652,6 +652,11 @@
           </section>
 
           <section class="detail-tab-panel" id="suppliersPanel" role="tabpanel" aria-labelledby="suppliersTab" aria-hidden="true" data-detail-panel="suppliers">
+            <div class="supplier-choice-editor">
+              <label for="supplierManualUrl">手动填写 1688 厂家链接</label>
+              <div class="supplier-choice-input"><input id="supplierManualUrl" type="url" inputmode="url" maxlength="8192" placeholder="https://detail.1688.com/offer/…" aria-describedby="supplierChoiceStatus" /><button class="secondary-button" id="saveSupplierChoiceButton" type="button">保存链接</button></div>
+              <p id="supplierChoiceStatus" role="status" aria-live="polite">可选择下方厂家，或粘贴 1688 链接；手动输入优先。</p>
+            </div>
             <div class="supplier-summary" id="supplierSummaryBox" data-confidence="standard"><span id="supplierSummaryLabel">中间 6 家均价</span><strong id="supplierSummary">等待搜索</strong><small id="supplierSummaryNote">标准不足时，取图片相似度最高的 6 家真实有效报价并计算低置信度利润率</small></div>
             <div class="supplier-list" id="supplierList"></div>
           </section>
